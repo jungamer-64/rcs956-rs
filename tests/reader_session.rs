@@ -581,3 +581,234 @@ fn rf_error_0b_settles_before_a_following_exchange() -> Result<(), Box<dyn Error
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
 }
+
+fn ab_config_image() -> [u8; 256] {
+    let mut image = config_image();
+    image[0x10..=0x1a].copy_from_slice(&[10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
+    image[0x23..=0x25].copy_from_slice(&[0x31, 0x32, 0x33]);
+    image[0xc0..=0xc2].copy_from_slice(&[0x41, 0x42, 0x43]);
+    image[0x3f] = image[0x10..0x3f]
+        .iter()
+        .fold(0u8, |sum, byte| sum.wrapping_add(*byte))
+        .wrapping_neg();
+    image
+}
+
+fn ab_mode(type_b: bool) -> Vec<Step> {
+    let mut steps = vec![
+        command(0x1c, &[0x80, 0x63, 0], &[]),
+        command(0x32, &[5, 0, 0, 4], &[]),
+        command(0x32, &[0x81, 0x8f], &[]),
+    ];
+    if type_b {
+        steps.push(command(
+            0x32,
+            &[0x0a, 0x41, 0x31, 0x42, 0x32, 0x43, 0x33, 16, 17, 18, 19, 20],
+            &[],
+        ));
+        steps.push(command(0x32, &[0x0c, 0x31, 0x32, 0x33], &[]));
+    } else {
+        steps.push(command(
+            0x32,
+            &[0x0a, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
+            &[],
+        ));
+    }
+    steps.push(command(8, &[0x63, 0x0d, 0], &[0]));
+    steps
+}
+
+fn type_b_response() -> Vec<u8> {
+    vec![1, 9, 0x50, 1, 2, 3, 4, 0, 0, 0, 0, 0, 0x51, 0x40, 1, 0]
+}
+
+#[test]
+fn type_a_exchange_uses_selected_target_and_preserves_status() -> Result<(), Box<dyn Error>> {
+    let mut steps = initialization(&ab_config_image());
+    steps.extend(ab_mode(false));
+    steps.push(command(
+        0x4a,
+        &[1, 0],
+        &[1, 7, 4, 0, 0x20, 4, 1, 2, 3, 4, 3, 0x20, 0x40],
+    ));
+    steps.push(command(0x40, &[7, 0, 0xa4, 4, 0], &[0x40, 0x90, 0]));
+    steps.push(command(0x40, &[7, 0x30, 0], &[0x0d]));
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut card = reader
+        .poll_type_a(timeout()?)?
+        .ok_or("expected NFC-A card")?;
+    assert_eq!(card.observation().uid(), &[1, 2, 3, 4]);
+    assert_eq!(card.target(), 7);
+    let before = journal.borrow().requests.len();
+    assert!(matches!(
+        card.exchange(&vec![0; 263]),
+        Err(ReaderError::InputLength {
+            maximum: 262,
+            actual: 263
+        })
+    ));
+    assert_eq!(journal.borrow().requests.len(), before);
+    let reply = card.exchange(&[0, 0xa4, 4, 0])?;
+    assert_eq!(reply.status, 0x40);
+    assert_eq!(reply.data, [0x90, 0]);
+    assert!(matches!(
+        card.exchange(&[0x30, 0]),
+        Err(ReaderError::RfStatus(0x0d))
+    ));
+    let before = journal.borrow().requests.len();
+    assert!(matches!(
+        card.exchange(&[0x30, 0]),
+        Err(ReaderError::NotInitialized)
+    ));
+    assert_eq!(journal.borrow().requests.len(), before);
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn type_b_apdu_uses_software_blocks_without_felica_mode() -> Result<(), Box<dyn Error>> {
+    let mut steps = initialization(&ab_config_image());
+    steps.extend(ab_mode(true));
+    steps.push(command(0x4a, &[1, 3, 0, 1], &type_b_response()));
+    steps.push(command(8, &[0x63, 3, 0x8b], &[0]));
+    steps.push(command(0xa0, &[11, 0, 2, 0, 0xa4, 4, 0], &[0, 2, 0x90, 0]));
+    steps.push(command(
+        0xa0,
+        &[11, 0, 3, 0, 0xb0, 0, 0],
+        &[0, 3, 0xab, 0x90, 0],
+    ));
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut card = reader
+        .poll_type_b(timeout()?)?
+        .ok_or("expected NFC-B card")?;
+    assert_eq!(card.observation().pupi(), [1, 2, 3, 4]);
+    assert_eq!(card.target(), 9);
+    assert_eq!(card.exchange_apdu(&[0, 0xa4, 4, 0])?, [0x90, 0]);
+    assert_eq!(card.exchange_apdu(&[0, 0xb0, 0, 0])?, [0xab, 0x90, 0]);
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn protocol_changes_reapply_rf_settings_and_absence_is_not_activation() -> Result<(), Box<dyn Error>>
+{
+    let mut steps = initialization(&ab_config_image());
+    steps.extend(ab_mode(false));
+    steps.push(command(0x4a, &[1, 0], &[0]));
+    steps.extend(ab_mode(true));
+    steps.push(command(0x4a, &[1, 3, 0, 1], &[0]));
+    steps.extend(mode_configuration());
+    steps.push(command(0x4a, &[1, 1, 0, 0x12, 0x34, 1, 0], &[0]));
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    assert!(reader.poll_type_a(timeout()?)?.is_none());
+    assert!(reader.poll_type_b(timeout()?)?.is_none());
+    assert!(reader.poll_felica(poll_request()?, timeout()?)?.is_none());
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn type_b_activation_register_failure_revokes_readiness() -> Result<(), Box<dyn Error>> {
+    let mut steps = initialization(&ab_config_image());
+    steps.extend(ab_mode(true));
+    steps.push(command(0x4a, &[1, 3, 0, 1], &type_b_response()));
+    steps.push(command(8, &[0x63, 3, 0x8b], &[1]));
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    assert!(matches!(
+        reader.poll_type_b(timeout()?),
+        Err(ReaderError::RegisterStatus(1))
+    ));
+    let before = journal.borrow().requests.len();
+    assert!(matches!(
+        reader.poll_type_a(timeout()?),
+        Err(ReaderError::NotInitialized)
+    ));
+    assert_eq!(journal.borrow().requests.len(), before);
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn type_b_wtx_changes_timer_before_the_extended_block_exchange() -> Result<(), Box<dyn Error>> {
+    let mut response = type_b_response();
+    response[13] = 0x80; // ATQB FWI8 -> 84.48 ms block wait.
+    let mut steps = initialization(&ab_config_image());
+    steps.extend(ab_mode(true));
+    steps.push(command(0x4a, &[1, 3, 0, 1], &response));
+    steps.push(command(8, &[0x63, 3, 0x8b], &[0]));
+    steps.push(command(0xa0, &[0xa9, 0, 2, 0xa4], &[0, 0xf2, 20]));
+    steps.push(command(0x1c, &[0x80, 0xc7, 0], &[]));
+    steps.push(command(0xa0, &[0x34, 0x0d, 0xf2, 20], &[0, 2, 0x90, 0]));
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut card = reader
+        .poll_type_b(timeout()?)?
+        .ok_or("expected NFC-B card")?;
+    assert_eq!(card.exchange_apdu(&[0xa4])?, [0x90, 0]);
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn type_b_lost_exchange_keeps_transport_progress_without_apdu_replay() -> Result<(), Box<dyn Error>>
+{
+    let mut steps = initialization(&ab_config_image());
+    steps.extend(ab_mode(true));
+    steps.push(command(0x4a, &[1, 3, 0, 1], &type_b_response()));
+    steps.push(command(8, &[0x63, 3, 0x8b], &[0]));
+    steps.push(Step {
+        request: Request::Command(0xa0, vec![11, 0, 2, 0xa4]),
+        answer: Answer::LostAfterAck,
+    });
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut card = reader
+        .poll_type_b(timeout()?)?
+        .ok_or("expected NFC-B card")?;
+    let error = card
+        .exchange_apdu(&[0xa4])
+        .err()
+        .ok_or("expected exchange loss")?;
+    assert!(matches!(
+        error.cause,
+        rcs956::isodep::Cause::Transport(ReaderError::Transaction(_))
+    ));
+    assert_eq!(error.progress.attempted_application_bytes, 1);
+    let count = journal.borrow().requests.len();
+    let error = card
+        .exchange_apdu(&[0xa4])
+        .err()
+        .ok_or("expected invalid session")?;
+    assert!(matches!(error.cause, rcs956::isodep::Cause::SessionInvalid));
+    assert_eq!(journal.borrow().requests.len(), count);
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn unsupported_type_b_protocol_is_not_an_iso_dep_session() -> Result<(), Box<dyn Error>> {
+    let mut response = type_b_response();
+    response[12] = 0x50; // ATQB protocol type 0, FSCI5.
+    let mut steps = initialization(&ab_config_image());
+    steps.extend(ab_mode(true));
+    steps.push(command(0x4a, &[1, 3, 0, 1], &response));
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    assert!(matches!(
+        reader.poll_type_b(timeout()?),
+        Err(ReaderError::TypeBProtocol(0))
+    ));
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}

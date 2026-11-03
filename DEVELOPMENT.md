@@ -7,11 +7,13 @@ cargo build --locked
 .\verify.ps1
 cargo run --locked -- devices
 cargo run --locked -- probe
-cargo run --locked -- poll --system FFFF --request 1 --slots 0
+cargo run --locked -- poll --type felica --system FFFF --request 1 --slots 0
+cargo run --locked -- poll --type a
+cargo run --locked -- poll --type b
 cargo run --locked -- read --system 88B4 --service 000B --blocks 0,1
 ```
 
-read例のservice／systemは対象カードに存在するものを指定する。未確認のカードへ例の値をそのまま適用しない。`--path`は複数リーダーの中から対象のapplication interfaceを指定する。同じUSB functionの複数aliasは1台として扱い、使用可能なfunctionが1台なら登録pathのソート順で先頭を選ぶ。`--timeout-ms`はRF交換の有限待機値で、host応答待機には余裕時間を加える。書込みCLIと自動再送は提供しない。
+read例のservice／systemは対象カードに存在するものを指定する。未確認のカードへ例の値をそのまま適用しない。`--path`は複数リーダーの中から対象のapplication interfaceを指定する。同じUSB functionの複数aliasは1台として扱い、使用可能なfunctionが1台なら登録pathのソート順で先頭を選ぶ。`--timeout-ms`はRF交換の有限待機値で、host応答待機には余裕時間を加える。`exchange --type a --data HEX`はカードcommand、`exchange --type b --data HEX`はISO-DEP APDUを送る。送信内容とカードへの効果はcallerが決める。FeliCaのreadは非暗号化読取だけを行う。application commandの自動再実行はしない。
 
 ## Windows binding
 
@@ -23,7 +25,15 @@ WinUSBでないserviceが列挙された場合、`devices`の結果で実際のb
 
 ## 設定とカードsession
 
-初期化はreset／host ACK、設定bank読取、checksum／model検査、register設定、RF offを順に行う。失敗した初期化を成功状態として公開しない。FeliCa検出時には通常212 kbps用tableを設定し、`4A`の応答からカード情報を取り出す。読取は`A0`によるカードpacket交換を使う。
+初期化はreset／host ACK、設定bank読取、checksum／model検査、register設定、RF offを順に行う。失敗した初期化を成功状態として公開しない。RF modeはprotocolと適用済みtimerを保持し、protocol変更時には対応する設定imageのtableを適用する。FeliCaは212 kbps、NFC-A／Bは106 kbpsで`4A`による1 targetの検出を行う。
+
+NFC-AはUID（4／7／10 bytes）、SAK、optional ATSのTLとinterface byte境界を検査する。カード交換は`40 target`で最大262 bytesを送り、成功したreader statusの上位bitsも保持する。別controllerのMI処理を仮定した自動継続は行わない。ATSがないカードの検出は、ISO-DEPのactivation成立と同一ではない。
+
+NFC-BはATQB／ATTRIBを検査し、ISO-DEP対応のtargetだけを通信sessionとして公開する。通常table3とAFI wildcardを使う。FSCIは0〜8、FWIは0〜14、CIDは0〜14を受理し、非zero CIDはカードの対応を必要とする。NAD付きblockは扱わない。送信frameはカードのFSCと64-byte reader容量の小さい方に制限する。受信はRC-S956のoptional activation extensionのFSDI（省略時5）と64-byte容量の小さい方を上限とする。MBLIが非zeroの場合は`FSC × 2^MBLI`のカードbuffer上限も送信前に検査し、zeroの場合は上限不明として扱う。CRCはreaderに委譲する。FeliCaの非暗号化読取とNFC-Bの個別block交換は`A0`を使う。
+
+NFC-BのISO-DEP sessionはblock番号、送受信chaining、R-block、WTXを処理する。application入力は1〜65535 bytes、応答は65536 bytes、RF callbackは2048回、WTXは32回、protocol再送は2回を上限とする。最低限の送信frame数だけでbudgetを超える入力は送信前に拒否する。初期block待機はATQBのFWIに基づく`330 us × 2^FWI`で、WTX時には要求倍率を掛ける。`--timeout-ms`は検出待機を指定し、NFC-Bの各block待機を上書きしない。`A0`の待機表現を超えるWTXは短く丸めずエラーにする。
+
+送信前の入力拒否はsessionを保持する。RF交換を開始した後の失敗はISO-DEP sessionを失効させ、attemptした入力prefix、確認済みprefix、受信済み応答、frame数をerrorに残す。transport失敗の再送はせず、R-blockで要求された同一blockの再送だけをbudget内で行う。
 
 カードhandleはreaderの排他的borrowを保持する。transport失敗後にはRF readinessが失効する。RF statusのmask後の値が0Dの場合も再初期化を要求する。0Bの場合はraw値を保持してエラーを返す前に10 msの待機を入れる。readerへの`initialize`は明示的な再同期であり、失敗したカード操作の再実行や結果照合ではない。`rf_off`の失敗はcallerが観測する。DropはOS resourceの解放だけを担当する。
 
@@ -35,7 +45,7 @@ RF待機には`A0`のhalf-ms fieldと`1C`のreader timerを両方設定する。
 
 `verify.ps1`はcodec、command順序／失敗時progress、設定imageとcard packetの検査、および公開APIを確認する。固定packet vectorは実機captureではない。 registry取得のtestは隔離したvolatile HKCU keyを作成し、取得・型・アクセスエラーを実際のWindows APIで確認して終了時に削除する。deviceの登録やbindingには書き込まない。
 
-実機検証では、`devices`による対象／service／path、`probe`のfirmware／model／設定checksum、`poll`のidentity／PMm、対象serviceを指定した`read`を別々に記録する。CLI出力はAPIの観測結果であり、USB bus上のZLPやRF timingのcaptureとは区別する。全firmware、PC/SC完全互換、Type A／B、カードへの書込みの成立はこの検証の対象に含めない。
+実機検証では、`devices`による対象／service／path、`probe`のfirmware／model／設定checksum、`poll`のidentity／PMm、対象serviceを指定した`read`を別々に記録する。CLI出力はAPIの観測結果であり、USB bus上のZLPやRF timingのcaptureとは区別する。全firmware、PC/SC完全互換、全カードcommand／APDUの意味と副作用の成立は、この検証の対象に含めない。NFC-A／Bの固定vectorはカード実機の成功証拠ではない。
 
 ## 外部実装へ委譲する責務
 

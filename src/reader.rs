@@ -1,8 +1,9 @@
-//! Reader configuration and lifetime-bound FeliCa card access.
+//! Reader configuration and lifetime-bound NFC card access.
 #![forbid(unsafe_code)]
 
 use crate::{
     felica::{self, CardError, PollRequest, PollResponse, ReadResponse},
+    isodep, nfca, nfcb,
     transport::{Link, TransactionError, Transport},
 };
 use std::{fmt, thread, time::Duration};
@@ -28,6 +29,21 @@ pub enum Error {
     Card(CardError),
     /// The requested RF wait cannot be encoded as nonzero half-ms ticks.
     TimeoutRange,
+    /// NFC-A activation data failed validation.
+    TypeA(nfca::Error),
+    /// NFC-B activation data failed validation.
+    TypeB(nfcb::Error),
+    /// ATQB advertises a protocol type other than the supported ISO-DEP type 1.
+    TypeBProtocol(u8),
+    /// Activated NFC-B parameters cannot construct a supported ISO-DEP session.
+    IsoDepParameters(isodep::ParameterError),
+    /// Payload exceeds the selected reader command's supported limit.
+    InputLength {
+        /// Maximum accepted bytes.
+        maximum: usize,
+        /// Supplied bytes.
+        actual: usize,
+    },
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -102,11 +118,35 @@ impl ConfigImage {
     pub fn bytes(&self) -> &[u8; 256] {
         &self.bytes
     }
-    fn felica_config(&self) -> [u8; 9] {
-        let mut out = [0u8; 9];
-        out[0] = 0x0b;
-        out[1..].copy_from_slice(&self.bytes[0x1b..=0x22]);
-        out
+    fn rf_configuration(&self, protocol: RfProtocol) -> Vec<Vec<u8>> {
+        match protocol {
+            RfProtocol::TypeA => {
+                let mut item = vec![0x0a];
+                item.extend_from_slice(&self.bytes[0x10..=0x1a]);
+                vec![item]
+            }
+            RfProtocol::Felica => {
+                let mut item = vec![0x0b];
+                item.extend_from_slice(&self.bytes[0x1b..=0x22]);
+                vec![item]
+            }
+            RfProtocol::TypeB => {
+                let mut analog = vec![
+                    0x0a,
+                    self.bytes[0xc0],
+                    self.bytes[0x23],
+                    self.bytes[0xc1],
+                    self.bytes[0x24],
+                    self.bytes[0xc2],
+                    self.bytes[0x25],
+                ];
+                analog.extend_from_slice(&self.bytes[0x16..=0x1a]);
+                vec![
+                    analog,
+                    vec![0x0c, self.bytes[0x23], self.bytes[0x24], self.bytes[0x25]],
+                ]
+            }
+        }
     }
 }
 
@@ -149,7 +189,10 @@ enum RfProtocol {
 #[derive(Debug, Clone, Copy)]
 enum RfMode {
     Off,
-    Configured { protocol: RfProtocol, timer: ReaderTimer },
+    Configured {
+        protocol: RfProtocol,
+        timer: ReaderTimer,
+    },
 }
 
 #[derive(Debug)]
@@ -250,6 +293,46 @@ impl<T: Transport> Reader<T> {
         }
     }
 
+    fn configure_rf(&mut self, protocol: RfProtocol, timeout: RfTimeout) -> Result<(), Error> {
+        let timer = ReaderTimer::for_rf_timeout(timeout);
+        let (info, apply_mode) = match &self.state {
+            State::Ready {
+                rf:
+                    RfMode::Configured {
+                        protocol: applied,
+                        timer: old,
+                    },
+                ..
+            } if *applied == protocol && *old == timer => return Ok(()),
+            State::Ready { info, rf } => (
+                info.clone(),
+                !matches!(rf,
+                RfMode::Configured { protocol: applied, .. } if *applied == protocol),
+            ),
+            State::NeedsInitialization => return Err(Error::NotInitialized),
+        };
+        // Any partial configuration revokes the preceding published mode.
+        self.state = State::NeedsInitialization;
+        self.command(0x1c, &timer.args(), Duration::from_secs(1))?;
+        if apply_mode {
+            let (retry, timing) = match protocol {
+                RfProtocol::Felica => (0, 0xb7),
+                RfProtocol::TypeA | RfProtocol::TypeB => (4, 0x8f),
+            };
+            self.command(0x32, &[5, 0, 0, retry], Duration::from_secs(1))?;
+            self.command(0x32, &[0x81, timing], Duration::from_secs(1))?;
+            for item in info.configuration.rf_configuration(protocol) {
+                self.command(0x32, &item, Duration::from_secs(1))?;
+            }
+            self.write_register(0x630d, 0)?;
+        }
+        self.state = State::Ready {
+            info,
+            rf: RfMode::Configured { protocol, timer },
+        };
+        Ok(())
+    }
+
     /// Select one FeliCa card at 212 kbps. The returned card exclusively borrows
     /// this reader, so its identity cannot survive a reset/mode change through it.
     /// Unsupported Polling request data may be absent and is preserved as such.
@@ -258,7 +341,7 @@ impl<T: Transport> Reader<T> {
         request: PollRequest,
         timeout: RfTimeout,
     ) -> Result<Option<FelicaCard<'_, T>>, Error> {
-        self.configure_felica(timeout)?;
+        self.configure_rf(RfProtocol::Felica, timeout)?;
         let poll = request.encode();
         let mut args = vec![1, 1];
         args.extend_from_slice(&poll[1..]);
@@ -278,18 +361,105 @@ impl<T: Transport> Reader<T> {
         }
     }
 
-    fn exchange_rf(&mut self, data: &[u8], timeout: RfTimeout) -> Result<Vec<u8>, Error> {
-        if !matches!(self.state, State::Ready { .. }) {
+    /// Activate one NFC-A target at 106 kbps. UID, SAK and optional ATS are
+    /// validated before granting the returned card access to this reader.
+    pub fn poll_type_a(&mut self, timeout: RfTimeout) -> Result<Option<TypeACard<'_, T>>, Error> {
+        self.configure_rf(RfProtocol::TypeA, timeout)?;
+        let response = self.command(0x4a, &[1, 0], timeout.host_wait())?;
+        match response.as_slice() {
+            [0] => Ok(None),
+            [1, target, data @ ..] if *target != 0 => {
+                let observation = nfca::Observation::parse(data).map_err(Error::TypeA)?;
+                Ok(Some(TypeACard {
+                    reader: self,
+                    observation,
+                    target: *target,
+                    timeout,
+                }))
+            }
+            _ => Err(Error::Response("NFC-A target count/layout")),
+        }
+    }
+
+    /// Activate one NFC-B ISO-DEP target at 106 kbps, using the normal RF table
+    /// and AFI wildcard. A card requiring another protocol is detected as an
+    /// unsupported activation rather than granted ISO-DEP operation authority.
+    pub fn poll_type_b(&mut self, timeout: RfTimeout) -> Result<Option<TypeBCard<'_, T>>, Error> {
+        self.configure_rf(RfProtocol::TypeB, timeout)?;
+        let response = self.command(0x4a, &[1, 3, 0, 1], timeout.host_wait())?;
+        match response.as_slice() {
+            [0] => Ok(None),
+            [1, target, data @ ..] if *target != 0 => {
+                let observation = nfcb::Observation::parse(data).map_err(Error::TypeB)?;
+                if !observation.supports_iso_dep() {
+                    return Err(Error::TypeBProtocol(observation.protocol_info()[1] & 0x0f));
+                }
+                let wait = isodep::block_frame_wait(observation.fwi());
+                let cid = match observation.cid() {
+                    0 => None,
+                    cid => Some(cid),
+                };
+                let session = isodep::Session::new(
+                    observation.frame_size(),
+                    observation.reader_frame_size(),
+                    cid,
+                    wait,
+                    observation.maximum_command_bytes(),
+                )
+                .map_err(Error::IsoDepParameters)?;
+                let info = match &self.state {
+                    State::Ready { info, .. } => info.clone(),
+                    State::NeedsInitialization => return Err(Error::NotInitialized),
+                };
+                // The ordinary driver path configures software block exchange
+                // after activation. Failure must not publish a usable card.
+                self.state = State::NeedsInitialization;
+                self.write_register(0x6303, 0x8b)?;
+                // Re-establish the fully applied mode only after the write.
+                // The existing snapshot remains authoritative across this write.
+                self.state = State::Ready {
+                    info,
+                    rf: RfMode::Configured {
+                        protocol: RfProtocol::TypeB,
+                        timer: ReaderTimer::for_rf_timeout(timeout),
+                    },
+                };
+                Ok(Some(TypeBCard {
+                    reader: self,
+                    observation,
+                    target: *target,
+                    session,
+                }))
+            }
+            _ => Err(Error::Response("NFC-B target count/layout")),
+        }
+    }
+
+    fn exchange_rf(
+        &mut self,
+        data: &[u8],
+        timeout: RfTimeout,
+        protocol: RfProtocol,
+    ) -> Result<Vec<u8>, Error> {
+        if !matches!(self.state, State::Ready { rf: RfMode::Configured { protocol: applied, .. }, .. } if applied == protocol)
+        {
             return Err(Error::NotInitialized);
         }
         if data.len() > 255 {
-            return Err(Error::Response("RF input exceeds 255 bytes"));
+            return Err(Error::InputLength {
+                maximum: 255,
+                actual: data.len(),
+            });
         }
-        self.configure_felica(timeout)?;
+        self.configure_rf(protocol, timeout)?;
         let mut args = Vec::with_capacity(data.len() + 2);
         args.extend_from_slice(&timeout.ticks.to_le_bytes());
         args.extend_from_slice(data);
         let response = self.command(0xa0, &args, timeout.host_wait())?;
+        self.rf_response(response)
+    }
+
+    fn rf_response(&mut self, response: Vec<u8>) -> Result<Vec<u8>, Error> {
         match response.split_first() {
             Some((status, body)) if status & 0x3f == 0 => Ok(body.to_vec()),
             Some((status, _)) => {
@@ -325,6 +495,98 @@ impl<T: Transport> Reader<T> {
     }
 }
 
+/// Reply to a reader-managed target exchange. The complete reader status is
+/// retained, including upper bits whose continuation semantics are not assumed.
+#[derive(Debug, Clone)]
+pub struct TargetResponse {
+    /// Unmodified status byte of command 41; its low six bits are zero on success.
+    pub status: u8,
+    /// Card bytes returned by the reader, without a fabricated APDU status word.
+    pub data: Vec<u8>,
+}
+
+/// NFC-A selection tied to one exclusive reader borrow.
+#[derive(Debug)]
+pub struct TypeACard<'a, T: Transport> {
+    reader: &'a mut Reader<T>,
+    observation: nfca::Observation,
+    target: u8,
+    timeout: RfTimeout,
+}
+impl<T: Transport> TypeACard<'_, T> {
+    /// Validated activation data for this selection.
+    pub fn observation(&self) -> &nfca::Observation {
+        &self.observation
+    }
+    /// Target identifier returned by the reader.
+    pub fn target(&self) -> u8 {
+        self.target
+    }
+    /// Exchange up to 262 card-command bytes through reader command 40. Card
+    /// command semantics belong to the caller; no application request is replayed.
+    /// The complete status is preserved rather than assuming another controller's
+    /// upper status bits imply an automatic continuation.
+    pub fn exchange(&mut self, data: &[u8]) -> Result<TargetResponse, Error> {
+        if data.is_empty() || data.len() > 262 {
+            return Err(Error::InputLength {
+                maximum: 262,
+                actual: data.len(),
+            });
+        }
+        if !matches!(
+            self.reader.state,
+            State::Ready {
+                rf: RfMode::Configured {
+                    protocol: RfProtocol::TypeA,
+                    ..
+                },
+                ..
+            }
+        ) {
+            return Err(Error::NotInitialized);
+        }
+        let mut args = Vec::with_capacity(data.len() + 1);
+        args.push(self.target);
+        args.extend_from_slice(data);
+        let response = self.reader.command(0x40, &args, self.timeout.host_wait())?;
+        let status = response
+            .first()
+            .copied()
+            .ok_or(Error::Response("missing RF status"))?;
+        let data = self.reader.rf_response(response)?;
+        Ok(TargetResponse { status, data })
+    }
+}
+
+/// NFC-B ISO-DEP selection, with a block-number state that cannot outlive the
+/// reader selection. Protocol failure poisons the session; it never replays APDUs.
+#[derive(Debug)]
+pub struct TypeBCard<'a, T: Transport> {
+    reader: &'a mut Reader<T>,
+    observation: nfcb::Observation,
+    target: u8,
+    session: isodep::Session,
+}
+impl<T: Transport> TypeBCard<'_, T> {
+    /// Validated activation data, including ATQB and negotiated CID.
+    pub fn observation(&self) -> &nfcb::Observation {
+        &self.observation
+    }
+    /// Target identifier returned by the reader.
+    pub fn target(&self) -> u8 {
+        self.target
+    }
+    /// Exchange one APDU, handling ISO-DEP chaining, R-blocks and bounded WTX.
+    /// Errors retain partial progress. Application APDUs are never retried.
+    pub fn exchange_apdu(&mut self, apdu: &[u8]) -> Result<Vec<u8>, isodep::Error<Error>> {
+        let reader = &mut self.reader;
+        self.session.exchange(apdu, |block, wait| {
+            let timeout = RfTimeout::new(wait)?;
+            reader.exchange_rf(block, timeout, RfProtocol::TypeB)
+        })
+    }
+}
+
 /// Selected card identity whose operation authority is tied to one reader borrow.
 #[derive(Debug)]
 pub struct FelicaCard<'a, T: Transport> {
@@ -350,7 +612,9 @@ impl<T: Transport> FelicaCard<'_, T> {
         blocks: &[u16],
     ) -> Result<ReadResponse, Error> {
         let request = felica::read_without_encryption(self.observation.idm, service, blocks)?;
-        let response = self.reader.exchange(&request, self.timeout)?;
+        let response = self
+            .reader
+            .exchange_rf(&request, self.timeout, RfProtocol::Felica)?;
         Ok(ReadResponse::parse(
             &response,
             self.observation.idm,

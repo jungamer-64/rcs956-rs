@@ -1,10 +1,13 @@
-//! RC-S956 reader communication, with separate USB, frame, and FeliCa boundaries.
+//! RC-S956 reader communication, with separate USB, frame, and card-protocol boundaries.
 //!
 //! Transactions are exclusive and are never automatically replayed after a transport
 //! failure. A failed transaction poisons the stream until an explicit recovery.
 #![deny(unsafe_code)]
 
 pub mod felica;
+pub mod isodep;
+pub mod nfca;
+pub mod nfcb;
 pub mod reader;
 pub mod transport;
 #[cfg(windows)]

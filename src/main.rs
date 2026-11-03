@@ -1,4 +1,4 @@
-//! Command-line discovery and read-only hardware validation for RC-S956.
+//! Command-line discovery and NFC communication for RC-S956.
 #![forbid(unsafe_code)]
 
 use rcs956::{
@@ -19,7 +19,7 @@ fn main() -> std::process::ExitCode {
 }
 fn help() {
     println!(
-        "rcs956 devices\nrcs956 probe [--path DEVICE_INTERFACE]\nrcs956 poll [--system FFFF] [--request 1] [--slots 0] [--timeout-ms 500] [--path PATH]\nrcs956 read --service HEX --blocks DECIMAL[,DECIMAL...] [poll options]\nrcs956 decode READER_FRAME_HEX\n\nHardware commands use an existing WinUSB binding. No driver installation or card writes.\nA read requires a service known to exist on the card. No automatic command retries."
+        "rcs956 devices\nrcs956 probe [--path DEVICE_INTERFACE]\nrcs956 poll [--type felica|a|b] [--timeout-ms 500] [--path PATH]\nrcs956 poll --type felica [--system FFFF] [--request 1] [--slots 0]\nrcs956 read --service HEX --blocks DECIMAL[,DECIMAL...] [FeliCa poll options]\nrcs956 exchange --type a|b --data HEX [--timeout-ms 500] [--path PATH]\nrcs956 decode READER_FRAME_HEX\n\nHardware commands require an existing WinUSB binding. exchange sends caller-supplied card commands (A) or an ISO-DEP APDU (B); their effects belong to the caller. No automatic application-command replay."
     );
 }
 fn run() -> Result<(), Box<dyn Error>> {
@@ -47,7 +47,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         return list_devices();
     }
-    if !matches!(command.as_str(), "probe" | "poll" | "read") {
+    if !matches!(command.as_str(), "probe" | "poll" | "read" | "exchange") {
         return Err(format!("unknown command: {command}").into());
     }
     let mut path = None;
@@ -57,15 +57,29 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut timeout = 500u64;
     let mut service = None;
     let mut blocks = None;
+    let mut technology = Technology::Felica;
+    let mut data = None;
+    let mut felica_options = false;
     while let Some(key) = args.next() {
         let value = args
             .next()
             .ok_or_else(|| format!("missing value for {key}"))?;
         match key.as_str() {
             "--path" => path = Some(value),
-            "--system" => system = hex_u16(&value)?,
-            "--request" => request = u8::try_from(hex_u16(&value)?)?,
-            "--slots" => slots = u8::try_from(hex_u16(&value)?)?,
+            "--system" => {
+                system = hex_u16(&value)?;
+                felica_options = true;
+            }
+            "--request" => {
+                request = u8::try_from(hex_u16(&value)?)?;
+                felica_options = true;
+            }
+            "--slots" => {
+                slots = u8::try_from(hex_u16(&value)?)?;
+                felica_options = true;
+            }
+            "--type" => technology = Technology::parse(&value)?,
+            "--data" => data = Some(hex_bytes(&value)?),
             "--timeout-ms" => timeout = value.parse()?,
             "--service" => service = Some(hex_u16(&value)?),
             "--blocks" => {
@@ -91,6 +105,17 @@ fn run() -> Result<(), Box<dyn Error>> {
     if command != "read" && (service.is_some() || blocks.is_some()) {
         return Err("--service/--blocks require read".into());
     }
+    if technology != Technology::Felica && (felica_options || command == "read") {
+        return Err("--system/--request/--slots and read require --type felica".into());
+    }
+    if command == "exchange" {
+        validate_exchange(
+            technology,
+            data.as_deref().ok_or("exchange requires --data")?,
+        )?;
+    } else if data.is_some() {
+        return Err("--data requires exchange".into());
+    }
     let request = PollRequest::new(system, request, slots)?;
     let timeout = RfTimeout::new(Duration::from_millis(timeout))?;
     #[cfg(windows)]
@@ -109,7 +134,13 @@ fn run() -> Result<(), Box<dyn Error>> {
         let result = if command == "probe" {
             Ok(())
         } else {
-            card_operation(&mut reader, request, timeout, service, blocks.as_deref())
+            match technology {
+                Technology::Felica => {
+                    card_operation(&mut reader, request, timeout, service, blocks.as_deref())
+                }
+                Technology::TypeA => type_a_operation(&mut reader, timeout, data.as_deref()),
+                Technology::TypeB => type_b_operation(&mut reader, timeout, data.as_deref()),
+            }
         };
         let shutdown = reader.rf_off();
         if let Err(e) = shutdown {
@@ -122,9 +153,92 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     #[cfg(not(windows))]
     {
-        let _ = (path, request, timeout, service, blocks);
+        let _ = (path, request, timeout, service, blocks, technology, data);
         Err("hardware binding is currently Windows WinUSB; portable library and codec are available".into())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Technology {
+    Felica,
+    TypeA,
+    TypeB,
+}
+impl Technology {
+    fn parse(input: &str) -> Result<Self, Box<dyn Error>> {
+        match input {
+            "felica" => Ok(Self::Felica),
+            "a" => Ok(Self::TypeA),
+            "b" => Ok(Self::TypeB),
+            _ => Err("--type must be felica, a or b".into()),
+        }
+    }
+}
+
+fn validate_exchange(technology: Technology, data: &[u8]) -> Result<(), Box<dyn Error>> {
+    let maximum = match technology {
+        Technology::TypeA => 262,
+        Technology::TypeB => 65_535,
+        Technology::Felica => return Err("exchange requires --type a or b".into()),
+    };
+    if data.is_empty() || data.len() > maximum {
+        return Err(format!("exchange requires 1..={maximum} bytes").into());
+    }
+    Ok(())
+}
+
+fn type_a_operation<T: Transport>(
+    reader: &mut Reader<T>,
+    timeout: RfTimeout,
+    data: Option<&[u8]>,
+) -> Result<(), Box<dyn Error>> {
+    let Some(mut card) = reader.poll_type_a(timeout)? else {
+        println!("No NFC-A card");
+        return Ok(());
+    };
+    let observation = card.observation();
+    println!(
+        "Target: {}\nSENS_RES: {}\nSEL_RES: {:02X}\nUID: {}",
+        card.target(),
+        hex(&observation.sens_res()),
+        observation.sel_res(),
+        hex(observation.uid())
+    );
+    if let Some(ats) = observation.ats() {
+        println!("ATS: {}", hex(ats.bytes()));
+    }
+    if let Some(data) = data {
+        let reply = card.exchange(data)?;
+        println!(
+            "Reader status: {:02X}\nResponse: {}",
+            reply.status,
+            hex(&reply.data)
+        );
+    }
+    Ok(())
+}
+
+fn type_b_operation<T: Transport>(
+    reader: &mut Reader<T>,
+    timeout: RfTimeout,
+    data: Option<&[u8]>,
+) -> Result<(), Box<dyn Error>> {
+    let Some(mut card) = reader.poll_type_b(timeout)? else {
+        println!("No NFC-B card");
+        return Ok(());
+    };
+    let observation = card.observation();
+    println!(
+        "Target: {}\nPUPI: {}\nATQB: {}\nATTRIB: {}",
+        card.target(),
+        hex(&observation.pupi()),
+        hex(observation.atqb()),
+        hex(observation.attrib_response())
+    );
+    if let Some(data) = data {
+        println!("Response: {}", hex(&card.exchange_apdu(data)?));
+    }
+    Ok(())
 }
 
 fn card_operation<T: Transport>(
@@ -254,6 +368,17 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use rcs956::windows::Device;
+
+    #[test]
+    fn exchange_validation_happens_before_opening_a_device() {
+        assert!(validate_exchange(Technology::Felica, &[0]).is_err());
+        assert!(validate_exchange(Technology::TypeA, &[]).is_err());
+        assert!(validate_exchange(Technology::TypeA, &[0; 262]).is_ok());
+        assert!(validate_exchange(Technology::TypeA, &[0; 263]).is_err());
+        assert!(validate_exchange(Technology::TypeB, &vec![0; 65_535]).is_ok());
+        assert!(validate_exchange(Technology::TypeB, &vec![0; 65_536]).is_err());
+        assert!(Technology::parse("invalid").is_err());
+    }
 
     fn device(instance: &str, service: Option<&str>, paths: &[&str]) -> Device {
         Device {

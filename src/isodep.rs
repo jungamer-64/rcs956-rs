@@ -1,0 +1,615 @@
+//! Bounded ISO-DEP block exchange for the RC-S956 NFC-B path.
+//!
+//! CRC belongs to the reader. The block engine owns sequencing, CID, chaining
+//! and WTX; the caller owns each synchronous RF transfer and its timeout.
+//! A failed transfer is never retried. Only explicit protocol acknowledgments
+//! can request retransmission of a block within the same application exchange.
+#![forbid(unsafe_code)]
+
+use std::{fmt, time::Duration};
+
+const MAX_APDU: usize = 65_535;
+const MAX_RESPONSE: usize = 65_536;
+const MAX_FRAMES: usize = 2048;
+const MAX_WTX: usize = 32;
+const MAX_RETRANSMISSIONS: usize = 2;
+
+pub(crate) fn frame_size(index: u8) -> Option<u16> {
+    [16, 24, 32, 40, 48, 64, 96, 128, 256]
+        .get(usize::from(index))
+        .copied()
+}
+
+pub(crate) fn frame_wait(index: u8) -> Duration {
+    // ISO-DEP FWT = 4096 carrier periods at 13.56 MHz, rounded upward to ns.
+    Duration::from_nanos((4_096_000_000_000u64 * (1u64 << index)).div_ceil(13_560_000))
+}
+
+pub(crate) fn block_frame_wait(index: u8) -> Duration {
+    Duration::from_micros(330 * (1u64 << index))
+}
+
+/// Activation parameters cannot establish the supported block profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParameterError {
+    /// Unsupported frame capacity, including CRC.
+    FrameSize(u16),
+    /// CID must be absent or lie in 1..=14.
+    Cid(u8),
+    /// Base wait must be positive and at most the FWI14 reader wait.
+    Wait,
+}
+impl fmt::Display for ParameterError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+impl std::error::Error for ParameterError {}
+
+/// Finite per-APDU policy exhausted before the next operation is admitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Budget {
+    /// Synchronous RF transfers, including WTX and block retransmissions.
+    Frames,
+    /// WTX requests accepted during this exchange.
+    WaitExtensions,
+    /// Protocol-requested duplicate block transfers.
+    Retransmissions,
+    /// Accumulated response application bytes.
+    ResponseBytes,
+}
+
+/// Why an APDU could not complete; transport failures retain their native type.
+#[derive(Debug)]
+pub enum Cause<E> {
+    /// This selected session already failed after beginning an exchange.
+    SessionInvalid,
+    /// Application input exceeds the local or advertised card buffer limit.
+    /// No RF was attempted; the session remains reusable.
+    InputLength {
+        /// Supplied application bytes.
+        actual: usize,
+        /// Effective maximum after local and card limits are combined.
+        maximum: usize,
+    },
+    /// A transfer failed; its application effect can be uncertain.
+    Transport(E),
+    /// A block violates the selected profile or current protocol phase.
+    InvalidBlock(&'static str),
+    /// The target requested deselection.
+    Deselected,
+    /// A finite protocol policy was exhausted.
+    Budget(Budget),
+}
+
+/// Application progress observed during one APDU, separate from RF frame count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Progress {
+    /// Largest application prefix included in a transfer attempt, not proof of delivery.
+    pub attempted_application_bytes: usize,
+    /// Prefix acknowledged by a valid R-ACK or the first response I-block.
+    pub acknowledged_application_bytes: usize,
+    /// Valid response application bytes accumulated before completion or failure.
+    pub received_application_bytes: usize,
+    /// Transfer callback invocations, including unsuccessful ones.
+    pub frames: usize,
+}
+
+/// A failed exchange, with its partial response and uncertain-effect boundary.
+#[derive(Debug)]
+pub struct Error<E> {
+    /// Machine-readable failure classification.
+    pub cause: Cause<E>,
+    /// Observed progress; an error never implies the APDU had no effect.
+    pub progress: Progress,
+    /// Valid response bytes accumulated before failure, without duplicate blocks.
+    pub partial_response: Vec<u8>,
+}
+impl<E: fmt::Debug> fmt::Display for Error<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+impl<E: std::error::Error + 'static> std::error::Error for Error<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.cause {
+            Cause::Transport(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum State {
+    Active(u8),
+    Invalid,
+}
+
+#[derive(Debug)]
+pub(crate) struct Session {
+    state: State,
+    maximum_frame_bytes: usize,
+    maximum_receive_bytes: usize,
+    maximum_application_bytes: usize,
+    cid: Option<u8>,
+    wait: Duration,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Phase {
+    Sending { end: usize, more: bool },
+    Receiving,
+}
+
+impl Session {
+    pub(crate) fn new(
+        size: u16,
+        receive_size: u16,
+        cid: Option<u8>,
+        wait: Duration,
+        card_buffer: Option<usize>,
+    ) -> Result<Self, ParameterError> {
+        for size in [size, receive_size] {
+            if !(0..=8).any(|index| frame_size(index) == Some(size)) {
+                return Err(ParameterError::FrameSize(size));
+            }
+        }
+        if let Some(cid) = cid
+            && !(1..=14).contains(&cid)
+        {
+            return Err(ParameterError::Cid(cid));
+        }
+        if wait.is_zero() || wait > block_frame_wait(14) {
+            return Err(ParameterError::Wait);
+        }
+        Ok(Self {
+            state: State::Active(0),
+            maximum_frame_bytes: usize::from(size.min(64)) - 2,
+            maximum_receive_bytes: usize::from(receive_size.min(64)) - 2,
+            maximum_application_bytes: card_buffer.unwrap_or(MAX_APDU).min(MAX_APDU),
+            cid,
+            wait,
+        })
+    }
+
+    fn frame(&self, pcb: u8, data: &[u8]) -> Vec<u8> {
+        let mut result = Vec::with_capacity(data.len() + 2);
+        result.push(pcb | if self.cid.is_some() { 8 } else { 0 });
+        if let Some(cid) = self.cid {
+            result.push(cid);
+        }
+        result.extend_from_slice(data);
+        result
+    }
+
+    pub(crate) fn exchange<E>(
+        &mut self,
+        apdu: &[u8],
+        mut transmit: impl FnMut(&[u8], Duration) -> Result<Vec<u8>, E>,
+    ) -> Result<Vec<u8>, Error<E>> {
+        let mut progress = Progress::default();
+        let mut output = Vec::new();
+        let mut number = match self.state {
+            State::Active(number) => number,
+            State::Invalid => {
+                return Err(Error {
+                    cause: Cause::SessionInvalid,
+                    progress,
+                    partial_response: output,
+                });
+            }
+        };
+        if apdu.is_empty() || apdu.len() > self.maximum_application_bytes {
+            return Err(Error {
+                cause: Cause::InputLength {
+                    actual: apdu.len(),
+                    maximum: self.maximum_application_bytes,
+                },
+                progress,
+                partial_response: output,
+            });
+        }
+        let capacity = self.maximum_frame_bytes - 1 - usize::from(self.cid.is_some());
+        if apdu.len().div_ceil(capacity) > MAX_FRAMES {
+            return Err(Error {
+                cause: Cause::Budget(Budget::Frames),
+                progress,
+                partial_response: output,
+            });
+        }
+        // Publish invalidity before the first possibly effectful transfer. Only
+        // an entire valid response can publish a reusable next block number.
+        self.state = State::Invalid;
+        let first_end = apdu.len().min(capacity);
+        let mut phase = Phase::Sending {
+            end: first_end,
+            more: first_end < apdu.len(),
+        };
+        let mut pending = self.frame(
+            2 | number | if first_end < apdu.len() { 0x10 } else { 0 },
+            &apdu[..first_end],
+        );
+        let mut last_i = pending.clone();
+        let mut wait = self.wait;
+        let mut extensions = 0;
+        let mut retransmissions = 0;
+        let result = (|| -> Result<(), Cause<E>> {
+            loop {
+                if progress.frames == MAX_FRAMES {
+                    return Err(Cause::Budget(Budget::Frames));
+                }
+                progress.frames += 1;
+                if let Phase::Sending { end, .. } = phase {
+                    progress.attempted_application_bytes = end;
+                }
+                let response = transmit(&pending, wait).map_err(Cause::Transport)?;
+                wait = self.wait;
+                if response.is_empty() || response.len() > self.maximum_receive_bytes {
+                    return Err(Cause::InvalidBlock("RF block size"));
+                }
+                let pcb = response[0];
+                let with_cid = pcb & 8 != 0;
+                if with_cid != self.cid.is_some() {
+                    return Err(Cause::InvalidBlock("CID presence"));
+                }
+                let header = 1 + usize::from(with_cid);
+                if response.len() < header {
+                    return Err(Cause::InvalidBlock("truncated CID"));
+                }
+                if let Some(cid) = self.cid
+                    && (response[1] & 0x3f != cid)
+                {
+                    return Err(Cause::InvalidBlock("CID mismatch or reserved bits"));
+                }
+                let body = &response[header..];
+                match pcb & 0xf7 {
+                    0xf2 => {
+                        if body.len() != 1 || !(1..=59).contains(&(body[0] & 0x3f)) {
+                            return Err(Cause::InvalidBlock("WTX multiplier"));
+                        }
+                        if extensions == MAX_WTX {
+                            return Err(Cause::Budget(Budget::WaitExtensions));
+                        }
+                        extensions += 1;
+                        let multiplier = body[0] & 0x3f;
+                        wait = self
+                            .wait
+                            .checked_mul(u32::from(multiplier))
+                            .ok_or(Cause::InvalidBlock("WTX duration overflow"))?;
+                        pending = self.frame(0xf2, &[multiplier]);
+                    }
+                    0xc2 => return Err(Cause::Deselected),
+                    0xa2 | 0xa3 | 0xb2 | 0xb3 => {
+                        if !body.is_empty() {
+                            return Err(Cause::InvalidBlock("R-block data"));
+                        }
+                        let Phase::Sending { end, more } = phase else {
+                            return Err(Cause::InvalidBlock("R-block during response"));
+                        };
+                        if pcb & 0x10 == 0 && pcb & 1 == number {
+                            if !more {
+                                return Err(Cause::InvalidBlock("R-ACK without command chaining"));
+                            }
+                            progress.acknowledged_application_bytes = end;
+                            number ^= 1;
+                            let next_end = (end + capacity).min(apdu.len());
+                            phase = Phase::Sending {
+                                end: next_end,
+                                more: next_end < apdu.len(),
+                            };
+                            pending = self.frame(
+                                2 | number | if next_end < apdu.len() { 0x10 } else { 0 },
+                                &apdu[end..next_end],
+                            );
+                            last_i.clone_from(&pending);
+                        } else {
+                            if retransmissions == MAX_RETRANSMISSIONS {
+                                return Err(Cause::Budget(Budget::Retransmissions));
+                            }
+                            retransmissions += 1;
+                            pending.clone_from(&last_i);
+                        }
+                    }
+                    0x02 | 0x03 | 0x12 | 0x13 => {
+                        if let Phase::Sending { more: true, .. } = phase {
+                            return Err(Cause::InvalidBlock(
+                                "response before command chain completed",
+                            ));
+                        }
+                        if pcb & 1 != number {
+                            if !matches!(phase, Phase::Receiving) {
+                                return Err(Cause::InvalidBlock("I-block number"));
+                            }
+                            if retransmissions == MAX_RETRANSMISSIONS {
+                                return Err(Cause::Budget(Budget::Retransmissions));
+                            }
+                            retransmissions += 1;
+                            pending = self.frame(0xa2 | number, &[]);
+                            continue;
+                        }
+                        progress.acknowledged_application_bytes = apdu.len();
+                        if output.len() + body.len() > MAX_RESPONSE {
+                            return Err(Cause::Budget(Budget::ResponseBytes));
+                        }
+                        output.extend_from_slice(body);
+                        progress.received_application_bytes = output.len();
+                        number ^= 1;
+                        if pcb & 0x10 == 0 {
+                            return Ok(());
+                        }
+                        if body.is_empty() {
+                            return Err(Cause::InvalidBlock("empty chained I-block"));
+                        }
+                        phase = Phase::Receiving;
+                        pending = self.frame(0xa2 | number, &[]);
+                    }
+                    _ => return Err(Cause::InvalidBlock("PCB or unsupported NAD")),
+                }
+            }
+        })();
+        match result {
+            Ok(()) => {
+                self.state = State::Active(number);
+                Ok(output)
+            }
+            Err(cause) => Err(Error {
+                cause,
+                progress,
+                partial_response: output,
+            }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{collections::VecDeque, io};
+
+    fn session(size: u16, cid: Option<u8>) -> Result<Session, ParameterError> {
+        Session::new(size, 64, cid, block_frame_wait(4), None)
+    }
+
+    #[test]
+    fn command_and_response_chains_use_direction_specific_ack_numbers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut link = session(16, None)?;
+        let mut first = vec![0x12];
+        first.extend_from_slice(&[0x55; 13]);
+        let mut steps = VecDeque::from([
+            (first, vec![0xa2]),
+            (vec![3, 0x55], vec![0x13, 0xaa]),
+            (vec![0xa2], vec![2, 0xbb]),
+        ]);
+        let result = link.exchange(&[0x55; 14], |frame, wait| {
+            let (expected, reply) = steps
+                .pop_front()
+                .ok_or_else(|| io::Error::other("extra transfer"))?;
+            assert_eq!(frame, expected);
+            assert_eq!(wait, block_frame_wait(4));
+            Ok::<_, io::Error>(reply)
+        })?;
+        assert_eq!(result, [0xaa, 0xbb]);
+        assert!(steps.is_empty());
+        assert_eq!(
+            link.exchange(&[0x22], |frame, _| {
+                assert_eq!(frame, [3, 0x22]);
+                Ok::<_, io::Error>(vec![3, 0x90, 0])
+            })?,
+            [0x90, 0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn wtx_and_cid_are_echoed_with_a_separate_wait() -> Result<(), Box<dyn std::error::Error>> {
+        let mut link = session(256, Some(3))?;
+        let mut calls = 0;
+        let reply = link.exchange(&[0xa4], |frame, wait| {
+            calls += 1;
+            match calls {
+                1 => {
+                    assert_eq!(frame, [0x0a, 3, 0xa4]);
+                    assert_eq!(wait, block_frame_wait(4));
+                    Ok::<_, io::Error>(vec![0xfa, 3, 3])
+                }
+                _ => {
+                    assert_eq!(frame, [0xfa, 3, 3]);
+                    assert_eq!(wait, block_frame_wait(4) * 3);
+                    Ok(vec![0x0a, 3, 0x90, 0])
+                }
+            }
+        })?;
+        assert_eq!(calls, 2);
+        assert_eq!(reply, [0x90, 0]);
+        Ok(())
+    }
+
+    #[test]
+    fn protocol_nak_resends_one_block_and_duplicate_response_is_not_appended()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut link = session(64, None)?;
+        let mut steps = VecDeque::from([
+            (vec![2, 0xa4], vec![0xb2]),
+            (vec![2, 0xa4], vec![0x12, 0xaa]),
+            (vec![0xa3], vec![0x12, 0xaa]),
+            (vec![0xa3], vec![3, 0xbb]),
+        ]);
+        assert_eq!(
+            link.exchange(&[0xa4], |frame, _| {
+                let (expected, reply) = steps
+                    .pop_front()
+                    .ok_or_else(|| io::Error::other("extra transfer"))?;
+                assert_eq!(frame, expected);
+                Ok::<_, io::Error>(reply)
+            })?,
+            [0xaa, 0xbb]
+        );
+        assert!(steps.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn transfer_failure_preserves_partial_response_and_invalidates_session()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut link = session(64, None)?;
+        let mut calls = 0;
+        let error = link
+            .exchange(&[0xa4], |_, _| {
+                calls += 1;
+                if calls == 1 {
+                    Ok(vec![0x12, 0xaa])
+                } else {
+                    Err(io::Error::new(io::ErrorKind::TimedOut, "lost response"))
+                }
+            })
+            .err()
+            .ok_or("expected error")?;
+        assert!(
+            matches!(error.cause, Cause::Transport(ref e) if e.kind() == io::ErrorKind::TimedOut)
+        );
+        assert_eq!(
+            error.progress,
+            Progress {
+                attempted_application_bytes: 1,
+                acknowledged_application_bytes: 1,
+                received_application_bytes: 1,
+                frames: 2
+            }
+        );
+        assert_eq!(error.partial_response, [0xaa]);
+        let retry = link.exchange(&[0xa4], |_, _| -> Result<Vec<u8>, io::Error> {
+            panic!("poisoned session sent data")
+        });
+        assert!(matches!(
+            retry,
+            Err(Error {
+                cause: Cause::SessionInvalid,
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn preflight_rejection_keeps_session_and_malformed_blocks_poison_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut link = session(64, None)?;
+        assert!(matches!(
+            link.exchange(&[], |_, _| -> Result<Vec<u8>, io::Error> {
+                panic!("empty APDU sent")
+            }),
+            Err(Error {
+                cause: Cause::InputLength { actual: 0, .. },
+                ..
+            })
+        ));
+        assert_eq!(
+            link.exchange(&[0xa4], |_, _| Ok::<_, io::Error>(vec![2]))?,
+            []
+        );
+        for reply in [
+            vec![0xfa, 1, 1],
+            vec![0xf2, 0],
+            vec![0x06, 0],
+            vec![0xa3, 0],
+            vec![2; 63],
+        ] {
+            let mut link = session(64, None)?;
+            assert!(matches!(
+                link.exchange(&[1], |_, _| Ok::<_, io::Error>(reply.clone())),
+                Err(Error {
+                    cause: Cause::InvalidBlock(_),
+                    ..
+                })
+            ));
+            assert!(matches!(link.state, State::Invalid));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn wait_extensions_and_retransmissions_have_finite_budgets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut link = session(64, None)?;
+        let error = link
+            .exchange(&[1], |_, _| Ok::<_, io::Error>(vec![0xf2, 1]))
+            .err()
+            .ok_or("expected exhaustion")?;
+        assert!(matches!(error.cause, Cause::Budget(Budget::WaitExtensions)));
+        assert_eq!(error.progress.frames, 33);
+        let mut link = session(64, None)?;
+        let error = link
+            .exchange(&[1], |_, _| Ok::<_, io::Error>(vec![0xb2]))
+            .err()
+            .ok_or("expected exhaustion")?;
+        assert!(matches!(
+            error.cause,
+            Cause::Budget(Budget::Retransmissions)
+        ));
+        assert_eq!(error.progress.frames, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn frame_and_response_limits_preserve_their_partial_progress()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (body_length, expected) in [(1, Budget::Frames), (61, Budget::ResponseBytes)] {
+            let mut link = session(64, None)?;
+            let mut number = 0u8;
+            let error = link
+                .exchange(&[1], |_, _| {
+                    let mut reply = vec![0x12 | number];
+                    number ^= 1;
+                    reply.resize(body_length + 1, 0xaa);
+                    Ok::<_, io::Error>(reply)
+                })
+                .err()
+                .ok_or("expected exhaustion")?;
+            assert!(matches!(error.cause, Cause::Budget(actual) if actual == expected));
+            assert_eq!(
+                error.partial_response.len(),
+                error.progress.received_application_bytes
+            );
+            assert!(error.progress.acknowledged_application_bytes == 1);
+            assert!(error.progress.received_application_bytes <= MAX_RESPONSE);
+        }
+        let mut link = session(16, None)?;
+        let error = link
+            .exchange(&vec![0; MAX_APDU], |_, _| -> Result<Vec<u8>, io::Error> {
+                panic!("inadmissible input sent")
+            })
+            .err()
+            .ok_or("expected admission failure")?;
+        assert!(matches!(error.cause, Cause::Budget(Budget::Frames)));
+        assert_eq!(error.progress.frames, 0);
+        assert!(matches!(link.state, State::Active(0)));
+        Ok(())
+    }
+
+    #[test]
+    fn negotiated_receive_and_card_buffer_limits_are_distinct()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut link = Session::new(64, 32, None, block_frame_wait(4), Some(128))?;
+        let error = link
+            .exchange(&[0; 129], |_, _| -> Result<Vec<u8>, io::Error> {
+                panic!("card buffer limit exceeded before transfer")
+            })
+            .err()
+            .ok_or("expected input rejection")?;
+        assert!(matches!(
+            error.cause,
+            Cause::InputLength {
+                actual: 129,
+                maximum: 128
+            }
+        ));
+        assert_eq!(error.progress.frames, 0);
+        let error = link
+            .exchange(&[1], |_, _| Ok::<_, io::Error>(vec![2; 31]))
+            .err()
+            .ok_or("expected receive limit")?;
+        assert!(matches!(error.cause, Cause::InvalidBlock("RF block size")));
+        Ok(())
+    }
+}
