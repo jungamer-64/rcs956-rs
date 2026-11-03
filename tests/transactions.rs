@@ -9,6 +9,7 @@ use std::{cell::RefCell, collections::VecDeque, error::Error, io, rc::Rc, time::
 const TIMEOUT: Duration = Duration::from_secs(1);
 const FIRMWARE_REQUEST: [u8; 9] = [0, 0, 0xff, 2, 0xfe, 0xd4, 2, 0x2a, 0];
 const FIRMWARE_RESPONSE: [u8; 13] = [0, 0, 0xff, 6, 0xfa, 0xd5, 3, 0x32, 1, 6, 7, 0xe8, 0];
+const RESET_RESPONSE: [u8; 9] = [0, 0, 0xff, 2, 0xfe, 0xd5, 0x19, 0x12, 0];
 
 #[derive(Debug)]
 enum Read {
@@ -34,6 +35,7 @@ struct Journal {
 struct Script {
     reads: VecDeque<Read>,
     writes: VecDeque<Write>,
+    recovery_results: VecDeque<Result<(), io::ErrorKind>>,
     journal: Rc<RefCell<Journal>>,
 }
 
@@ -44,6 +46,7 @@ impl Script {
             Self {
                 reads: reads.into_iter().collect(),
                 writes: VecDeque::new(),
+                recovery_results: VecDeque::new(),
                 journal: Rc::clone(&journal),
             },
             journal,
@@ -87,7 +90,10 @@ impl Transport for Script {
 
     fn recover(&mut self) -> io::Result<()> {
         self.journal.borrow_mut().recoveries += 1;
-        Ok(())
+        self.recovery_results
+            .pop_front()
+            .unwrap_or(Ok(()))
+            .map_err(|kind| io::Error::new(kind, "scripted pipe recovery failure"))
     }
 }
 
@@ -125,6 +131,7 @@ fn fragmented_ack_and_response_preserve_buffered_bytes() -> Result<(), Box<dyn E
 fn ack_loss_is_not_replayed_and_requires_explicit_recovery() -> Result<(), Box<dyn Error>> {
     let (script, journal) = Script::new([
         Read::Error(io::ErrorKind::TimedOut),
+        Read::Bytes([wire::ACK.as_slice(), RESET_RESPONSE.as_slice()].concat()),
         Read::Bytes(acknowledged_response()),
     ]);
     let mut link = Link::new(script);
@@ -148,9 +155,183 @@ fn ack_loss_is_not_replayed_and_requires_explicit_recovery() -> Result<(), Box<d
     ));
     assert_eq!(journal.borrow().writes.len(), 1);
     link.recover()?;
-    assert_eq!(journal.borrow().recoveries, 1);
+    assert_eq!(journal.borrow().recoveries, 2);
+    assert_eq!(journal.borrow().writes[1], wire::ACK);
+    assert!(matches!(
+        link.command(2, &[], TIMEOUT),
+        Err(TransactionError {
+            failure: Failure::RecoveryRequired,
+            ..
+        })
+    ));
+    link.command(0x18, &[1], TIMEOUT)?;
+    assert!(matches!(
+        link.command(2, &[], TIMEOUT),
+        Err(TransactionError {
+            failure: Failure::RecoveryRequired,
+            ..
+        })
+    ));
+    link.host_ack(TIMEOUT)?;
     assert_eq!(link.command(2, &[], TIMEOUT)?.command, 3);
-    assert_eq!(journal.borrow().writes.len(), 2);
+    assert_eq!(journal.borrow().writes.len(), 5);
+    Ok(())
+}
+
+#[test]
+fn recovery_rejects_a_stale_same_command_response_at_the_reset_barrier()
+-> Result<(), Box<dyn Error>> {
+    let (script, journal) = Script::new([
+        Read::Error(io::ErrorKind::TimedOut),
+        Read::Bytes(acknowledged_response()),
+    ]);
+    let mut link = Link::new(script);
+    assert!(link.command(2, &[], TIMEOUT).is_err());
+    link.recover()?;
+    assert!(matches!(
+        link.command(2, &[], TIMEOUT),
+        Err(TransactionError {
+            failure: Failure::RecoveryRequired,
+            ..
+        })
+    ));
+    assert!(matches!(
+        link.command(0x18, &[1], TIMEOUT),
+        Err(TransactionError {
+            progress: Progress::Acknowledged,
+            failure: Failure::ResponseCommand {
+                expected: 0x19,
+                actual: 3
+            },
+        })
+    ));
+    assert!(matches!(
+        link.command(2, &[], TIMEOUT),
+        Err(TransactionError {
+            failure: Failure::RecoveryRequired,
+            ..
+        })
+    ));
+    assert_eq!(journal.borrow().writes.len(), 3);
+    Ok(())
+}
+
+#[test]
+fn recovery_and_reset_ack_failures_preserve_poison_and_progress() -> Result<(), Box<dyn Error>> {
+    let (mut script, journal) = Script::new([]);
+    script
+        .recovery_results
+        .push_back(Err(io::ErrorKind::NotConnected));
+    let mut link = Link::new(script);
+    assert!(matches!(
+        link.recover(),
+        Err(TransactionError {
+            progress: Progress::NotSent,
+            failure: Failure::Io(_)
+        })
+    ));
+    assert!(matches!(
+        link.command(2, &[], TIMEOUT),
+        Err(TransactionError {
+            failure: Failure::RecoveryRequired,
+            ..
+        })
+    ));
+    assert!(journal.borrow().writes.is_empty());
+
+    let (mut script, journal) = Script::new([]);
+    script.writes.push_back(Write::Short(3));
+    let mut link = Link::new(script);
+    assert!(matches!(
+        link.recover(),
+        Err(TransactionError {
+            progress: Progress::Sending,
+            failure: Failure::ShortWrite {
+                requested: 6,
+                transferred: 3
+            }
+        })
+    ));
+    assert!(matches!(
+        link.command(2, &[], TIMEOUT),
+        Err(TransactionError {
+            failure: Failure::RecoveryRequired,
+            ..
+        })
+    ));
+    assert_eq!(journal.borrow().writes, [wire::ACK.to_vec()]);
+
+    let (mut script, journal) = Script::new([]);
+    script
+        .recovery_results
+        .extend([Ok(()), Err(io::ErrorKind::NotConnected)]);
+    let mut link = Link::new(script);
+    assert!(matches!(
+        link.recover(),
+        Err(TransactionError {
+            progress: Progress::Sent,
+            failure: Failure::Io(_)
+        })
+    ));
+    assert!(matches!(
+        link.command(2, &[], TIMEOUT),
+        Err(TransactionError {
+            failure: Failure::RecoveryRequired,
+            ..
+        })
+    ));
+    assert_eq!(journal.borrow().writes, [wire::ACK.to_vec()]);
+
+    let (mut script, journal) = Script::new([Read::Bytes(
+        [wire::ACK.as_slice(), RESET_RESPONSE.as_slice()].concat(),
+    )]);
+    script
+        .writes
+        .extend([Write::Complete, Write::Complete, Write::Short(2)]);
+    let mut link = Link::new(script);
+    link.recover()?;
+    link.command(0x18, &[1], TIMEOUT)?;
+    assert!(matches!(
+        link.host_ack(TIMEOUT),
+        Err(TransactionError {
+            progress: Progress::Sending,
+            failure: Failure::ShortWrite {
+                requested: 6,
+                transferred: 2
+            }
+        })
+    ));
+    assert!(matches!(
+        link.command(2, &[], TIMEOUT),
+        Err(TransactionError {
+            failure: Failure::RecoveryRequired,
+            ..
+        })
+    ));
+    assert_eq!(journal.borrow().writes.len(), 3);
+    Ok(())
+}
+
+#[test]
+fn reset_commit_waits_before_admitting_the_next_command() -> Result<(), Box<dyn Error>> {
+    let (script, journal) = Script::new([
+        Read::Bytes([wire::ACK.as_slice(), RESET_RESPONSE.as_slice()].concat()),
+        Read::Bytes(acknowledged_response()),
+    ]);
+    let mut link = Link::new(script);
+    link.command(0x18, &[1], TIMEOUT)?;
+    assert!(matches!(
+        link.command(2, &[], TIMEOUT),
+        Err(TransactionError {
+            failure: Failure::RecoveryRequired,
+            ..
+        })
+    ));
+    let start = std::time::Instant::now();
+    link.host_ack(TIMEOUT)?;
+    assert!(start.elapsed() >= Duration::from_millis(10));
+    link.command(2, &[], TIMEOUT)?;
+    assert_eq!(journal.borrow().writes.len(), 3);
     Ok(())
 }
 

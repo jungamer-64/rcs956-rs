@@ -12,8 +12,8 @@ use std::{fmt, thread, time::Duration};
 pub enum Error {
     /// Host transport transaction failed; the stream must be reinitialized.
     Transaction(TransactionError),
-    /// Explicit transport recovery failed before initialization.
-    Recovery(std::io::Error),
+    /// Recovery failed, preserving the phase of its out-of-band ACK transfer.
+    Recovery(TransactionError),
     /// Reader initialization has not completed for this connection.
     NotInitialized,
     /// A command response did not have the required layout.
@@ -191,7 +191,6 @@ impl<T: Transport> Reader<T> {
             return Err(Error::Response("reset response"));
         }
         self.link.host_ack(wait).map_err(Error::Transaction)?;
-        thread::sleep(Duration::from_millis(10));
         let firmware: [u8; 4] = self
             .command(2, &[], wait)?
             .try_into()

@@ -124,7 +124,8 @@ impl<T: Transport> Link<T> {
         timeout: Duration,
     ) -> Result<Response, TransactionError> {
         if self.state != StreamState::Ready
-            && !(self.state == StreamState::NeedsReset && command == 0x18 && args == [1]) {
+            && !(self.state == StreamState::NeedsReset && command == 0x18 && args == [1])
+        {
             return Err(TransactionError {
                 progress: Progress::NotSent,
                 failure: Failure::RecoveryRequired,
@@ -246,7 +247,10 @@ impl<T: Transport> Link<T> {
     /// Send a host ACK without expecting another ACK. A reset response must be
     /// committed with this ACK; the link waits 10ms before admitting commands.
     pub fn host_ack(&mut self, timeout: Duration) -> Result<(), TransactionError> {
-        if !matches!(self.state, StreamState::Ready | StreamState::ResetCommitPending) {
+        if !matches!(
+            self.state,
+            StreamState::Ready | StreamState::ResetCommitPending
+        ) {
             return Err(TransactionError {
                 progress: Progress::NotSent,
                 failure: Failure::RecoveryRequired,
@@ -260,7 +264,9 @@ impl<T: Transport> Link<T> {
         }
         let reset_commit = self.state == StreamState::ResetCommitPending;
         self.send_host_ack(timeout)?;
-        if reset_commit { thread::sleep(Duration::from_millis(10)); }
+        if reset_commit {
+            thread::sleep(Duration::from_millis(10));
+        }
         self.state = StreamState::Ready;
         Ok(())
     }
@@ -287,15 +293,22 @@ impl<T: Transport> Link<T> {
     }
 
     /// Clear pipe state, cancel an unfinished reader command with an out-of-band
-    /// ACK, wait 1ms, then discard cached input again. Only reset (`18 01`) is
+    /// ACK, wait 10ms, then discard cached input again. The wait also covers an
+    /// uncertain preceding reset commit. Only reset (`18 01`) is
     /// admitted afterwards, followed by its response and committed host ACK.
     /// This never determines whether a preceding card operation executed.
     pub fn recover(&mut self) -> Result<(), TransactionError> {
         self.state = StreamState::RecoveryRequired;
-        self.transport.recover().map_err(|e| TransactionError { progress: Progress::NotSent, failure: Failure::Io(e) })?;
+        self.transport.recover().map_err(|e| TransactionError {
+            progress: Progress::NotSent,
+            failure: Failure::Io(e),
+        })?;
         self.send_host_ack(Duration::from_secs(1))?;
-        thread::sleep(Duration::from_millis(1));
-        self.transport.recover().map_err(|e| TransactionError { progress: Progress::Sent, failure: Failure::Io(e) })?;
+        thread::sleep(Duration::from_millis(10));
+        self.transport.recover().map_err(|e| TransactionError {
+            progress: Progress::Sent,
+            failure: Failure::Io(e),
+        })?;
         self.state = StreamState::NeedsReset;
         Ok(())
     }

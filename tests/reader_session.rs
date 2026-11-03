@@ -193,6 +193,10 @@ fn bank_addresses(bank: u8) -> Vec<u8> {
 
 fn initialization(config: &[u8; 256]) -> Vec<Step> {
     let mut steps = vec![
+        Step {
+            request: Request::HostAck,
+            answer: Answer::Data(Vec::new()),
+        },
         command(0x18, &[1], &[]),
         Step {
             request: Request::HostAck,
@@ -252,7 +256,7 @@ fn initialization_commits_reset_and_loads_four_distinct_banks() -> Result<(), Bo
     assert_eq!(info.flags, 0x1c);
     assert_eq!(info.configuration.model(), 0x0131);
     assert_eq!(info.configuration.bytes(), &expected);
-    assert_eq!(journal.borrow().recoveries, 1);
+    assert_eq!(journal.borrow().recoveries, 2);
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
 }
@@ -309,8 +313,12 @@ fn polling_read_and_rf_off_keep_identity_and_configuration_boundaries() -> Resul
 fn partial_configuration_failure_keeps_reader_uninitialized() -> Result<(), Box<dyn Error>> {
     let config = config_image();
     let mut steps = initialization(&config);
-    steps.truncate(6);
-    steps[5].answer = Answer::LostAfterAck;
+    let bank = steps
+        .iter()
+        .position(|s| s.request == Request::Command(6, bank_addresses(1)))
+        .ok_or("missing bank 1")?;
+    steps.truncate(bank + 1);
+    steps[bank].answer = Answer::LostAfterAck;
     let (script, journal) = Script::new(steps);
     let mut reader = Reader::new(script);
     let result = reader.initialize();
@@ -337,8 +345,12 @@ fn short_configuration_bank_is_rejected_without_publishing_readiness() -> Result
 {
     let config = config_image();
     let mut steps = initialization(&config);
-    steps.truncate(5);
-    steps[4].answer = Answer::Data(config[..63].to_vec());
+    let bank = steps
+        .iter()
+        .position(|s| s.request == Request::Command(6, bank_addresses(0)))
+        .ok_or("missing bank 0")?;
+    steps.truncate(bank + 1);
+    steps[bank].answer = Answer::Data(config[..63].to_vec());
     let (script, journal) = Script::new(steps);
     let mut reader = Reader::new(script);
     assert!(matches!(
@@ -358,7 +370,11 @@ fn invalid_configuration_checksum_is_not_published() -> Result<(), Box<dyn Error
     let mut config = config_image();
     config[0x40] ^= 1;
     let mut steps = initialization(&config);
-    steps.truncate(8);
+    let bank = steps
+        .iter()
+        .position(|s| s.request == Request::Command(6, bank_addresses(3)))
+        .ok_or("missing bank 3")?;
+    steps.truncate(bank + 1);
     let (script, journal) = Script::new(steps);
     let mut reader = Reader::new(script);
     assert!(matches!(

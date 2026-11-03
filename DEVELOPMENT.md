@@ -27,6 +27,8 @@ WinUSBでないserviceが列挙された場合、`devices`の結果で実際のb
 
 RF待機には`A0`のhalf-ms fieldと`1C`のreader timerを両方設定する。reader timerはRF待機を秒単位へ切り上げてから`(ms-10)/10`をLE16で送り、成功した設定だけをRF modeに保持する。同じ設定の再送は省略し、待機時間を変えた場合はカード交換より先に更新する。
 
+回復ではpipeの状態整理に加え、未完了commandを中断するhost ACKを送り、10 ms待って受信cacheを再整理する。ACKが直前のresetを確定する可能性もあるため、resetの最小待機時間を確保する。その後に許可するのはresetだけで、reset応答と確定ACKの完了・10 ms待機まで通常commandを許可しない。USB pipe resetだけをfirmware commandの中断として扱わない。中断前のカード操作の結果不明はcallerに残る。
+
 ## 検証境界
 
 `verify.ps1`はcodec、command順序／失敗時progress、設定imageとcard packetの検査、および公開APIを確認する。固定packet vectorは実機captureではない。
