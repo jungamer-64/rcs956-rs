@@ -138,11 +138,18 @@ impl ReaderTimer {
     }
 }
 
-/// A published FeliCa mode always carries its successfully applied timer.
+/// RF configuration and the timer are published only after all writes succeed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RfProtocol {
+    TypeA,
+    Felica,
+    TypeB,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum RfMode {
     Off,
-    Felica(ReaderTimer),
+    Configured { protocol: RfProtocol, timer: ReaderTimer },
 }
 
 #[derive(Debug)]
@@ -243,36 +250,6 @@ impl<T: Transport> Reader<T> {
         }
     }
 
-    fn configure_felica(&mut self, timeout: RfTimeout) -> Result<(), Error> {
-        let timer = ReaderTimer::for_rf_timeout(timeout);
-        let (info, apply_mode) = match &self.state {
-            State::Ready {
-                rf: RfMode::Felica(applied),
-                ..
-            } if *applied == timer => return Ok(()),
-            State::Ready { info, rf } => (info.clone(), matches!(rf, RfMode::Off)),
-            State::NeedsInitialization => return Err(Error::NotInitialized),
-        };
-        // A partially applied timer/mode is not the preceding published mode.
-        self.state = State::NeedsInitialization;
-        self.command(0x1c, &timer.args(), Duration::from_secs(1))?;
-        if apply_mode {
-            self.command(0x32, &[5, 0, 0, 0], Duration::from_secs(1))?;
-            self.command(0x32, &[0x81, 0xb7], Duration::from_secs(1))?;
-            self.command(
-                0x32,
-                &info.configuration.felica_config(),
-                Duration::from_secs(1),
-            )?;
-            self.write_register(0x630d, 0)?;
-        }
-        self.state = State::Ready {
-            info,
-            rf: RfMode::Felica(timer),
-        };
-        Ok(())
-    }
-
     /// Select one FeliCa card at 212 kbps. The returned card exclusively borrows
     /// this reader, so its identity cannot survive a reset/mode change through it.
     /// Unsupported Polling request data may be absent and is preserved as such.
@@ -301,7 +278,7 @@ impl<T: Transport> Reader<T> {
         }
     }
 
-    fn exchange(&mut self, data: &[u8], timeout: RfTimeout) -> Result<Vec<u8>, Error> {
+    fn exchange_rf(&mut self, data: &[u8], timeout: RfTimeout) -> Result<Vec<u8>, Error> {
         if !matches!(self.state, State::Ready { .. }) {
             return Err(Error::NotInitialized);
         }
