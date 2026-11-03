@@ -33,13 +33,15 @@ NFC-Aの`40`交換では、要求待機を整数msへ切り上げ、`32 02 0B 0B
 
 NFC-BはATQB／ATTRIBを検査し、ISO-DEP対応のtargetだけを通信sessionとして公開する。通常table3とAFI wildcardを使う。FSCIは0〜8、FWIは0〜14、CIDは0〜14を受理し、非zero CIDはカードの対応を必要とする。NAD付きblockは扱わない。送信frameはカードのFSCと64-byte reader容量の小さい方に制限する。受信はRC-S956のoptional activation extensionのFSDI（省略時5）と64-byte容量の小さい方を上限とする。MBLIが非zeroの場合は`FSC × 2^MBLI`のカードbuffer上限も送信前に検査し、zeroの場合は上限不明として扱う。CRCはreaderに委譲する。FeliCaの非暗号化読取とNFC-Bの個別block交換は`A0`を使う。
 
-NFC-BのISO-DEP sessionはblock番号、送受信chaining、R-block、WTXを処理する。application入力は1〜65535 bytes、応答は65536 bytes、RF callbackは2048回、WTXは32回、protocol再送は2回を上限とする。最低限の送信frame数だけでbudgetを超える入力は送信前に拒否する。初期block待機はATQBのFWIに基づく`330 us × 2^FWI`で、WTX時には要求倍率を掛ける。`--timeout-ms`は検出待機を指定し、NFC-Bの各block待機を上書きしない。`A0`の待機表現を超えるWTXは短く丸めずエラーにする。
+NFC-BのAPDU交換前には`32 02 0B 0B 10`と`1C 80 8F 01`を設定する。`32/02`の実効待機3280 msから`1C`を決め、blockごとのFWI／WTX待機は`A0`へ独立に指定する。WTXで`1C`は変更しない。成功したselectorとtimerは別々に保持し、再検出やprotocol切替でtimerが変わればAPDU前に再適用する。設定の途中で失敗した場合はapplication blockを送信せず再初期化を要求する。
 
-送信前の入力拒否はsessionを保持する。RF交換を開始した後の失敗はISO-DEP sessionを失効させ、attemptした入力prefix、確認済みprefix、受信済み応答、frame数をerrorに残す。transport失敗の再送はせず、R-blockで要求された同一blockの再送だけをbudget内で行う。
+NFC-BのISO-DEP sessionはblock番号、送受信chaining、R-block、WTXを処理する。空のINFを持つ継続I-blockも受理し、応答bytesを増やさずblock番号とframe数を進めてR-ACKを返す。application入力は1〜65535 bytes、応答は65536 bytes、RF callbackは2048回、WTXは32回、protocol再送は2回を上限とする。最低限の送信frame数だけでbudgetを超える入力は送信前に拒否する。初期block待機はATQBのFWIに基づく`330 us × 2^FWI`で、WTX時には要求倍率を掛ける。`--timeout-ms`は検出待機を指定し、NFC-Bの各block待機を上書きしない。`A0`の待機表現を超えるWTXは短く丸めずエラーにする。
+
+APDUの入力と最低frame数を検査してからreader設定を始める。入力拒否はsessionを保持する。設定失敗は`Cause::Preparation`として返し、applicationの送信progressとRF frame数を0に保ってsessionを失効させる。RF交換を開始した後の失敗もsessionを失効させ、attemptした入力prefix、確認済みprefix、受信済み応答、frame数をerrorに残す。transport失敗の再送はせず、R-blockで要求された同一blockの再送だけをbudget内で行う。
 
 カードhandleはreaderの排他的borrowを保持する。transport失敗後にはRF readinessが失効する。RF statusのmask後の値が0Dの場合も再初期化を要求する。0Bの場合はraw値を保持してエラーを返す前に10 msの待機を入れる。readerへの`initialize`は明示的な再同期であり、失敗したカード操作の再実行や結果照合ではない。`rf_off`の失敗はcallerが観測する。DropはOS resourceの解放だけを担当する。
 
-RF待機には`A0`のhalf-ms fieldと`1C`のreader timerを両方設定する。reader timerはRF待機を秒単位へ切り上げてから`(ms-10)/10`をLE16で送り、成功した設定だけをRF modeに保持する。同じ設定の再送は省略し、待機時間を変えた場合はカード交換より先に更新する。
+FeliCaのRF待機には`A0`のhalf-ms fieldと`1C`のreader timerを両方設定する。reader timerはRF待機を秒単位へ切り上げてから`(ms-10)/10`をLE16で送り、成功した設定だけをRF modeに保持する。同じ設定の再送は省略し、待機時間を変えた場合はカード交換より先に更新する。NFC-A／Bの`1C`は各protocolの応答設定に従い、`32/02`とは独立して保持する。
 
 回復ではpipeの状態整理に加え、未完了commandを中断するhost ACKを送り、10 ms待って受信cacheを再整理する。ACKが直前のresetを確定する可能性もあるため、resetの最小待機時間を確保する。その後に許可するのはresetだけで、reset応答と確定ACKの完了・10 ms待機まで通常commandを許可しない。USB pipe resetだけをfirmware commandの中断として扱わない。中断前のカード操作の結果不明はcallerに残る。
 

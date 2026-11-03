@@ -178,11 +178,11 @@ impl ReaderTimer {
     }
 }
 
-/// The reader-managed target command uses a separate, quantized RF wait.
+/// The reader response selector is independent of each A0 block timeout.
 /// Each variant fixes both a 32/02 selector and its effective milliseconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
-enum TargetTimeout {
+enum ResponseTimeout {
     Ms51 = 51,
     Ms102 = 102,
     Ms204 = 204,
@@ -191,7 +191,7 @@ enum TargetTimeout {
     Ms1640 = 1640,
     Ms3280 = 3280,
 }
-impl TargetTimeout {
+impl ResponseTimeout {
     fn for_request(request: RfTimeout) -> Self {
         match request.ticks.div_ceil(2) {
             0..=51 => Self::Ms51,
@@ -255,7 +255,7 @@ enum State {
         rf: RfMode,
         // 32/02 is independent of RF protocol/timer configuration. Only a
         // completed write establishes it; reset or an uncertain failure revokes it.
-        target_timeout: Option<TargetTimeout>,
+        response_timeout: Option<ResponseTimeout>,
     },
 }
 
@@ -333,7 +333,7 @@ impl<T: Transport> Reader<T> {
         self.state = State::Ready {
             info: info.clone(),
             rf: RfMode::Off,
-            target_timeout: None,
+            response_timeout: None,
         };
         Ok(info)
     }
@@ -350,7 +350,7 @@ impl<T: Transport> Reader<T> {
 
     fn configure_rf(&mut self, protocol: RfProtocol, timeout: RfTimeout) -> Result<(), Error> {
         let timer = ReaderTimer::for_rf_timeout(timeout);
-        let (info, apply_mode, target_timeout) = match &self.state {
+        let (info, apply_mode, response_timeout) = match &self.state {
             State::Ready {
                 rf:
                     RfMode::Configured {
@@ -362,12 +362,12 @@ impl<T: Transport> Reader<T> {
             State::Ready {
                 info,
                 rf,
-                target_timeout,
+                response_timeout,
             } => (
                 info.clone(),
                 !matches!(rf,
                 RfMode::Configured { protocol: applied, .. } if *applied == protocol),
-                *target_timeout,
+                *response_timeout,
             ),
             State::NeedsInitialization => return Err(Error::NotInitialized),
         };
@@ -389,7 +389,59 @@ impl<T: Transport> Reader<T> {
         self.state = State::Ready {
             info,
             rf: RfMode::Configured { protocol, timer },
-            target_timeout,
+            response_timeout,
+        };
+        Ok(())
+    }
+
+    fn prepare_exchange_timing(
+        &mut self,
+        protocol: RfProtocol,
+        timeout: ResponseTimeout,
+    ) -> Result<(), Error> {
+        let desired_timer = ReaderTimer::for_rf_timeout(RfTimeout::new(timeout.wait())?);
+        let (info, applied_timer, applied_timeout) = match &self.state {
+            State::Ready {
+                rf:
+                    RfMode::Configured {
+                        protocol: applied_protocol,
+                        timer,
+                    },
+                response_timeout: Some(applied),
+                ..
+            } if *applied_protocol == protocol
+                && *applied == timeout
+                && *timer == desired_timer =>
+            {
+                return Ok(());
+            }
+            State::Ready {
+                info,
+                rf:
+                    RfMode::Configured {
+                        protocol: applied,
+                        timer,
+                    },
+                response_timeout,
+            } if *applied == protocol => (info.clone(), *timer, *response_timeout),
+            _ => return Err(Error::NotInitialized),
+        };
+        // Do not publish a partial pair. Even if 32/02 succeeds, failure of 1C
+        // requires explicit initialization before another card command is sent.
+        self.state = State::NeedsInitialization;
+        if applied_timeout != Some(timeout) {
+            self.command(0x32, &timeout.args(), Duration::from_secs(1))?;
+        }
+        if applied_timer != desired_timer {
+            self.command(0x1c, &desired_timer.args(), Duration::from_secs(1))?;
+        }
+        self.state = State::Ready {
+            info,
+            rf: RfMode::Configured {
+                protocol,
+                timer: desired_timer,
+            },
+            response_timeout: Some(timeout),
         };
         Ok(())
     }
@@ -468,12 +520,12 @@ impl<T: Transport> Reader<T> {
                     observation.maximum_command_bytes(),
                 )
                 .map_err(Error::IsoDepParameters)?;
-                let (info, target_timeout) = match &self.state {
+                let (info, response_timeout) = match &self.state {
                     State::Ready {
                         info,
-                        target_timeout,
+                        response_timeout,
                         ..
-                    } => (info.clone(), *target_timeout),
+                    } => (info.clone(), *response_timeout),
                     State::NeedsInitialization => return Err(Error::NotInitialized),
                 };
                 // The ordinary driver path configures software block exchange
@@ -488,7 +540,7 @@ impl<T: Transport> Reader<T> {
                         protocol: RfProtocol::TypeB,
                         timer: ReaderTimer::for_rf_timeout(timeout),
                     },
-                    target_timeout,
+                    response_timeout,
                 };
                 Ok(Some(TypeBCard {
                     reader: self,
@@ -517,7 +569,6 @@ impl<T: Transport> Reader<T> {
                 actual: data.len(),
             });
         }
-        self.configure_rf(protocol, timeout)?;
         let mut args = Vec::with_capacity(data.len() + 2);
         args.extend_from_slice(&timeout.ticks.to_le_bytes());
         args.extend_from_slice(data);
@@ -546,12 +597,12 @@ impl<T: Transport> Reader<T> {
     /// Disable RF and invalidate the configured mode. Call explicitly to observe
     /// failure; dropping a reader only releases the backend's OS resources.
     pub fn rf_off(&mut self) -> Result<(), Error> {
-        let (info, target_timeout) = match &self.state {
+        let (info, response_timeout) = match &self.state {
             State::Ready {
                 info,
-                target_timeout,
+                response_timeout,
                 ..
-            } => (info.clone(), *target_timeout),
+            } => (info.clone(), *response_timeout),
             State::NeedsInitialization => return Err(Error::NotInitialized),
         };
         self.state = State::NeedsInitialization;
@@ -560,7 +611,7 @@ impl<T: Transport> Reader<T> {
         self.state = State::Ready {
             info,
             rf: RfMode::Off,
-            target_timeout,
+            response_timeout,
         };
         Ok(())
     }
@@ -621,8 +672,9 @@ impl<T: Transport> TypeACard<'_, T> {
         let mut args = Vec::with_capacity(data.len() + 1);
         args.push(self.target);
         args.extend_from_slice(data);
-        let timeout = TargetTimeout::for_request(self.timeout);
-        self.reader.prepare_target_exchange(timeout)?;
+        let timeout = ResponseTimeout::for_request(self.timeout);
+        self.reader
+            .prepare_exchange_timing(RfProtocol::TypeA, timeout)?;
         let response = self.reader.command(0x40, &args, timeout.host_wait())?;
         let status = response
             .first()
@@ -652,10 +704,18 @@ impl<T: Transport> TypeBCard<'_, T> {
         self.target
     }
     /// Exchange one APDU, handling ISO-DEP chaining, R-blocks and bounded WTX.
-    /// Errors retain partial progress. Application APDUs are never retried.
+    /// Errors distinguish reader setup (zero application progress) from RF
+    /// transfer attempts. Setup applies 32/02 selector 0x10 and a 3280 ms reader
+    /// response step; each A0 block independently uses its FWI/WTX wait.
+    /// Application APDUs are never retried.
     pub fn exchange_apdu(&mut self, apdu: &[u8]) -> Result<Vec<u8>, isodep::Error<Error>> {
         let reader = &mut self.reader;
-        self.session.exchange(apdu, |block, wait| {
+        let exchange = self.session.prepare::<Error>(apdu)?;
+        // The APDU guard requests at least 9896 ms, saturating 32/02 to its
+        // 3280 ms step. A0 keeps its independent FWI/WTX wait; individual
+        // blocks do not reprogram 1C.
+        let setup = reader.prepare_exchange_timing(RfProtocol::TypeB, ResponseTimeout::Ms3280);
+        exchange.exchange(setup, |block, wait| {
             let timeout = RfTimeout::new(wait)?;
             reader.exchange_rf(block, timeout, RfProtocol::TypeB)
         })
@@ -687,6 +747,7 @@ impl<T: Transport> FelicaCard<'_, T> {
         blocks: &[u16],
     ) -> Result<ReadResponse, Error> {
         let request = felica::read_without_encryption(self.observation.idm, service, blocks)?;
+        self.reader.configure_rf(RfProtocol::Felica, self.timeout)?;
         let response = self
             .reader
             .exchange_rf(&request, self.timeout, RfProtocol::Felica)?;
@@ -740,7 +801,7 @@ mod tests {
     }
 
     #[test]
-    fn target_timeout_vectors_cover_quantization_and_saturation() -> Result<(), Error> {
+    fn response_timeout_vectors_cover_quantization_and_saturation() -> Result<(), Error> {
         // Independent boundary vectors from f:3B250's millisecond intervals.
         for (microseconds, selector, effective_ms, timer) in [
             (500, 0x0a, 51, [0x80, 0x63, 0]),
@@ -760,7 +821,7 @@ mod tests {
             (32_767_500, 0x10, 3280, [0x80, 0x8f, 1]),
         ] {
             let timeout =
-                TargetTimeout::for_request(RfTimeout::new(Duration::from_micros(microseconds))?);
+                ResponseTimeout::for_request(RfTimeout::new(Duration::from_micros(microseconds))?);
             assert_eq!(timeout.args(), [2, 0x0b, 0x0b, selector]);
             assert_eq!(timeout.wait(), Duration::from_millis(effective_ms));
             assert_eq!(

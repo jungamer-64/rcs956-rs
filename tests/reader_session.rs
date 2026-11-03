@@ -674,6 +674,8 @@ fn type_b_apdu_uses_software_blocks_without_felica_mode() -> Result<(), Box<dyn 
     steps.extend(ab_mode(true));
     steps.push(command(0x4a, &[1, 3, 0, 1], &type_b_response()));
     steps.push(command(8, &[0x63, 3, 0x8b], &[0]));
+    steps.push(command(0x32, &[2, 0x0b, 0x0b, 0x10], &[]));
+    steps.push(command(0x1c, &[0x80, 0x8f, 1], &[]));
     steps.push(command(0xa0, &[11, 0, 2, 0, 0xa4, 4, 0], &[0, 2, 0x90, 0]));
     steps.push(command(
         0xa0,
@@ -688,6 +690,19 @@ fn type_b_apdu_uses_software_blocks_without_felica_mode() -> Result<(), Box<dyn 
         .ok_or("expected NFC-B card")?;
     assert_eq!(card.observation().pupi(), [1, 2, 3, 4]);
     assert_eq!(card.target(), 9);
+    let before = journal.borrow().requests.len();
+    for input in [Vec::new(), vec![0; 65536]] {
+        let error = card
+            .exchange_apdu(&input)
+            .err()
+            .ok_or("expected input rejection")?;
+        assert!(matches!(
+            error.cause,
+            rcs956::isodep::Cause::InputLength { .. }
+        ));
+        assert_eq!(error.progress, rcs956::isodep::Progress::default());
+        assert_eq!(journal.borrow().requests.len(), before);
+    }
     assert_eq!(card.exchange_apdu(&[0, 0xa4, 4, 0])?, [0x90, 0]);
     assert_eq!(card.exchange_apdu(&[0, 0xb0, 0, 0])?, [0xab, 0x90, 0]);
     assert_eq!(journal.borrow().remaining, 0);
@@ -738,15 +753,16 @@ fn type_b_activation_register_failure_revokes_readiness() -> Result<(), Box<dyn 
 }
 
 #[test]
-fn type_b_wtx_changes_timer_before_the_extended_block_exchange() -> Result<(), Box<dyn Error>> {
+fn type_b_wtx_changes_only_the_block_wait_after_apdu_timing_setup() -> Result<(), Box<dyn Error>> {
     let mut response = type_b_response();
     response[13] = 0x80; // ATQB FWI8 -> 84.48 ms block wait.
     let mut steps = initialization(&ab_config_image());
     steps.extend(ab_mode(true));
     steps.push(command(0x4a, &[1, 3, 0, 1], &response));
     steps.push(command(8, &[0x63, 3, 0x8b], &[0]));
+    steps.push(command(0x32, &[2, 0x0b, 0x0b, 0x10], &[]));
+    steps.push(command(0x1c, &[0x80, 0x8f, 1], &[]));
     steps.push(command(0xa0, &[0xa9, 0, 2, 0xa4], &[0, 0xf2, 20]));
-    steps.push(command(0x1c, &[0x80, 0xc7, 0], &[]));
     steps.push(command(0xa0, &[0x34, 0x0d, 0xf2, 20], &[0, 2, 0x90, 0]));
     let (script, journal) = Script::new(steps);
     let mut reader = Reader::new(script);
@@ -766,6 +782,8 @@ fn type_b_lost_exchange_keeps_transport_progress_without_apdu_replay() -> Result
     steps.extend(ab_mode(true));
     steps.push(command(0x4a, &[1, 3, 0, 1], &type_b_response()));
     steps.push(command(8, &[0x63, 3, 0x8b], &[0]));
+    steps.push(command(0x32, &[2, 0x0b, 0x0b, 0x10], &[]));
+    steps.push(command(0x1c, &[0x80, 0x8f, 1], &[]));
     steps.push(Step {
         request: Request::Command(0xa0, vec![11, 0, 2, 0xa4]),
         answer: Answer::LostAfterAck,
@@ -793,6 +811,180 @@ fn type_b_lost_exchange_keeps_transport_progress_without_apdu_replay() -> Result
     assert!(matches!(error.cause, rcs956::isodep::Cause::SessionInvalid));
     assert_eq!(journal.borrow().requests.len(), count);
     assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn partial_type_b_timing_setup_preserves_zero_apdu_progress_and_requires_reset()
+-> Result<(), Box<dyn Error>> {
+    for lose_timer in [false, true] {
+        let mut steps = initialization(&ab_config_image());
+        steps.extend(ab_mode(true));
+        steps.push(command(0x4a, &[1, 3, 0, 1], &type_b_response()));
+        steps.push(command(8, &[0x63, 3, 0x8b], &[0]));
+        let failure = if lose_timer {
+            steps.push(command(0x32, &[2, 0x0b, 0x0b, 0x10], &[]));
+            Request::Command(0x1c, vec![0x80, 0x8f, 1])
+        } else {
+            Request::Command(0x32, vec![2, 0x0b, 0x0b, 0x10])
+        };
+        steps.push(Step {
+            request: failure,
+            answer: Answer::LostAfterAck,
+        });
+        steps.extend(initialization(&ab_config_image()));
+        steps.extend(ab_mode(true));
+        steps.push(command(0x4a, &[1, 3, 0, 1], &type_b_response()));
+        steps.push(command(8, &[0x63, 3, 0x8b], &[0]));
+        steps.push(command(0x32, &[2, 0x0b, 0x0b, 0x10], &[]));
+        steps.push(command(0x1c, &[0x80, 0x8f, 1], &[]));
+        steps.push(command(0xa0, &[11, 0, 2, 0xa4], &[0, 2, 0x90, 0]));
+        let (script, journal) = Script::new(steps);
+        let mut reader = Reader::new(script);
+        reader.initialize()?;
+        let count;
+        {
+            let mut card = reader
+                .poll_type_b(timeout()?)?
+                .ok_or("expected NFC-B card")?;
+            let error = card
+                .exchange_apdu(&[0xa4])
+                .err()
+                .ok_or("expected timing setup loss")?;
+            assert!(matches!(
+                error.cause,
+                rcs956::isodep::Cause::Preparation(ReaderError::Transaction(TransactionError {
+                    progress: Progress::Acknowledged,
+                    ..
+                }))
+            ));
+            assert_eq!(error.progress, rcs956::isodep::Progress::default());
+            assert!(error.partial_response.is_empty());
+            assert!(
+                journal
+                    .borrow()
+                    .requests
+                    .iter()
+                    .all(|request| !matches!(request, Request::Command(0xa0, _)))
+            );
+            count = journal.borrow().requests.len();
+            let error = card
+                .exchange_apdu(&[0xa4])
+                .err()
+                .ok_or("expected invalid session")?;
+            assert!(matches!(error.cause, rcs956::isodep::Cause::SessionInvalid));
+            assert_eq!(error.progress, rcs956::isodep::Progress::default());
+        }
+        assert!(matches!(
+            reader.poll_type_b(timeout()?),
+            Err(ReaderError::NotInitialized)
+        ));
+        assert_eq!(journal.borrow().requests.len(), count);
+        reader.initialize()?;
+        assert_eq!(
+            reader
+                .poll_type_b(timeout()?)?
+                .ok_or("expected NFC-B card after reset")?
+                .exchange_apdu(&[0xa4])?,
+            [0x90, 0]
+        );
+        assert_eq!(journal.borrow().remaining, 0);
+    }
+    Ok(())
+}
+
+#[test]
+fn type_b_timing_cache_survives_reselection_and_tracks_cross_protocol_changes()
+-> Result<(), Box<dyn Error>> {
+    let mut steps = initialization(&ab_config_image());
+    steps.extend(ab_mode(true));
+    steps.push(command(0x4a, &[1, 3, 0, 1], &type_b_response()));
+    steps.push(command(8, &[0x63, 3, 0x8b], &[0]));
+    steps.push(command(0x32, &[2, 0x0b, 0x0b, 0x10], &[]));
+    steps.push(command(0x1c, &[0x80, 0x8f, 1], &[]));
+    steps.push(command(0xa0, &[11, 0, 2, 0xa4], &[0, 2, 0x90, 0]));
+    // Polling restores its own timer without reapplying the unchanged RF mode.
+    // The APDU then restores 1C while retaining the successful selector.
+    steps.push(command(0x1c, &[0x80, 0x63, 0], &[]));
+    steps.push(command(0x4a, &[1, 3, 0, 1], &type_b_response()));
+    steps.push(command(8, &[0x63, 3, 0x8b], &[0]));
+    steps.push(command(0x1c, &[0x80, 0x8f, 1], &[]));
+    steps.push(command(0xa0, &[11, 0, 2, 0xb0], &[0, 2, 0xab, 0x90, 0]));
+    steps.extend(ab_mode(false));
+    steps.push(command(0x4a, &[1, 0], &type_a_response(7)));
+    steps.push(command(0x32, &[2, 0x0b, 0x0b, 0x0e], &[]));
+    steps.push(command(0x40, &[7, 0xa4], &[0, 0x90, 0]));
+    steps.extend(ab_mode(true));
+    steps.push(command(0x4a, &[1, 3, 0, 1], &type_b_response()));
+    steps.push(command(8, &[0x63, 3, 0x8b], &[0]));
+    steps.push(command(0x32, &[2, 0x0b, 0x0b, 0x10], &[]));
+    steps.push(command(0x1c, &[0x80, 0x8f, 1], &[]));
+    steps.push(command(0xa0, &[11, 0, 2, 0xa4], &[0, 2, 0x90, 0]));
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    assert_eq!(
+        reader
+            .poll_type_b(timeout()?)?
+            .ok_or("expected first NFC-B card")?
+            .exchange_apdu(&[0xa4])?,
+        [0x90, 0]
+    );
+    assert_eq!(
+        reader
+            .poll_type_b(timeout()?)?
+            .ok_or("expected reselected NFC-B card")?
+            .exchange_apdu(&[0xb0])?,
+        [0xab, 0x90, 0]
+    );
+    assert_eq!(
+        reader
+            .poll_type_a(RfTimeout::new(Duration::from_millis(500))?)?
+            .ok_or("expected NFC-A card")?
+            .exchange(&[0xa4])?
+            .data,
+        [0x90, 0]
+    );
+    assert_eq!(
+        reader
+            .poll_type_b(timeout()?)?
+            .ok_or("expected NFC-B card after NFC-A")?
+            .exchange_apdu(&[0xa4])?,
+        [0x90, 0]
+    );
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn type_b_fwi_boundaries_keep_the_apdu_timer_independent_of_a0_wait() -> Result<(), Box<dyn Error>>
+{
+    for (fwi, tick_bytes) in [(0, [1, 0]), (14, [0x3e, 0x2a])] {
+        let mut response = type_b_response();
+        response[13] = fwi << 4;
+        let mut steps = initialization(&ab_config_image());
+        steps.extend(ab_mode(true));
+        steps.push(command(0x4a, &[1, 3, 0, 1], &response));
+        steps.push(command(8, &[0x63, 3, 0x8b], &[0]));
+        steps.push(command(0x32, &[2, 0x0b, 0x0b, 0x10], &[]));
+        steps.push(command(0x1c, &[0x80, 0x8f, 1], &[]));
+        steps.push(command(
+            0xa0,
+            &[tick_bytes[0], tick_bytes[1], 2, 0xa4],
+            &[0, 2, 0x90, 0],
+        ));
+        let (script, journal) = Script::new(steps);
+        let mut reader = Reader::new(script);
+        reader.initialize()?;
+        assert_eq!(
+            reader
+                .poll_type_b(timeout()?)?
+                .ok_or("expected NFC-B card")?
+                .exchange_apdu(&[0xa4])?,
+            [0x90, 0]
+        );
+        assert_eq!(journal.borrow().remaining, 0);
+    }
     Ok(())
 }
 
