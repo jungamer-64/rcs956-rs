@@ -319,6 +319,11 @@ impl<T: Transport> Reader<T> {
                 if status & 0x3f == 0x0d {
                     self.state = State::NeedsInitialization;
                 }
+                if status & 0x3f == 0x0b {
+                    // Settle this RF error before the caller can issue another
+                    // exchange; returning the error alone does not impose a gap.
+                    thread::sleep(Duration::from_millis(10));
+                }
                 Err(Error::RfStatus(*status))
             }
             None => Err(Error::Response("missing RF status")),

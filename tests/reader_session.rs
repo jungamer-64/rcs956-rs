@@ -8,7 +8,14 @@ use rcs956::{
     transport::{Progress, TransactionError, Transport},
     wire::{self, Direction, Frame},
 };
-use std::{cell::RefCell, collections::VecDeque, error::Error, io, rc::Rc, time::Duration};
+use std::{
+    cell::RefCell,
+    collections::VecDeque,
+    error::Error,
+    io,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 const IDENTITY: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
 const PARAMETERS: [u8; 8] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
@@ -47,6 +54,8 @@ enum Input {
 #[derive(Debug)]
 struct Journal {
     requests: Vec<Request>,
+    request_times: Vec<Instant>,
+    last_read_completed: Option<Instant>,
     remaining: usize,
     recoveries: usize,
 }
@@ -62,6 +71,8 @@ impl Script {
     fn new(steps: Vec<Step>) -> (Self, Rc<RefCell<Journal>>) {
         let journal = Rc::new(RefCell::new(Journal {
             requests: Vec::new(),
+            request_times: Vec::new(),
+            last_read_completed: None,
             remaining: steps.len(),
             recoveries: 0,
         }));
@@ -117,6 +128,7 @@ impl Transport for Script {
         })?;
         assert_eq!(actual, step.request, "wire request order or arguments");
         self.journal.borrow_mut().requests.push(actual.clone());
+        self.journal.borrow_mut().request_times.push(Instant::now());
         self.journal.borrow_mut().remaining = self.steps.len();
         match actual {
             Request::HostAck => {}
@@ -149,6 +161,7 @@ impl Transport for Script {
                     )
                 })?;
                 output.copy_from_slice(&bytes);
+                self.journal.borrow_mut().last_read_completed = Some(Instant::now());
                 Ok(bytes.len())
             }
             Some(Input::Timeout) => Err(io::Error::new(
@@ -518,6 +531,53 @@ fn failed_timer_change_revokes_preceding_mode() -> Result<(), Box<dyn Error>> {
         Err(ReaderError::NotInitialized)
     ));
     assert_eq!(journal.borrow().requests.len(), sent);
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn rf_error_0b_settles_before_a_following_exchange() -> Result<(), Box<dyn Error>> {
+    let mut steps = initialization(&config_image());
+    steps.extend(mode_configuration());
+    steps.push(command(
+        0x4a,
+        &[1, 1, 0, 0x12, 0x34, 1, 0],
+        &poll_response(),
+    ));
+    let mut args = vec![0xc8, 0, 16, 6];
+    args.extend_from_slice(&IDENTITY);
+    args.extend_from_slice(&[1, 0x8b, 0x1a, 1, 0x80, 0]);
+    steps.push(command(0xa0, &args, &[0x4b]));
+    let mut reply = vec![0, 29, 7];
+    reply.extend_from_slice(&IDENTITY);
+    reply.extend_from_slice(&[0, 0, 1]);
+    reply.extend_from_slice(&[0x5a; 16]);
+    steps.push(command(0xa0, &args, &reply));
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut card = reader
+        .poll_felica(poll_request()?, timeout()?)?
+        .ok_or("expected card")?;
+    assert!(matches!(
+        card.read_without_encryption(0x1a8b, &[0]),
+        Err(ReaderError::RfStatus(0x4b))
+    ));
+    let reply_completed = journal
+        .borrow()
+        .last_read_completed
+        .ok_or("missing error response time")?;
+    assert_eq!(
+        card.read_without_encryption(0x1a8b, &[0])?.blocks(),
+        &[[0x5a; 16]]
+    );
+    let next_request = journal
+        .borrow()
+        .request_times
+        .last()
+        .copied()
+        .ok_or("missing subsequent request time")?;
+    assert!(next_request.duration_since(reply_completed) >= Duration::from_millis(10));
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
 }

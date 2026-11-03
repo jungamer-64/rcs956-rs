@@ -23,7 +23,7 @@ WinUSBでないserviceが列挙された場合、`devices`の結果で実際のb
 
 初期化はreset／host ACK、設定bank読取、checksum／model検査、register設定、RF offを順に行う。失敗した初期化を成功状態として公開しない。FeliCa検出時には通常212 kbps用tableを設定し、`4A`の応答からカード情報を取り出す。読取は`A0`によるカードpacket交換を使う。
 
-カードhandleはreaderの排他的borrowを保持する。transport失敗後にはRF readinessが失効する。RF statusのmask後の値が0Dの場合も再初期化を要求する。readerへの`initialize`は明示的な再同期であり、失敗したカード操作の再実行や結果照合ではない。`rf_off`の失敗はcallerが観測する。DropはOS resourceの解放だけを担当する。
+カードhandleはreaderの排他的borrowを保持する。transport失敗後にはRF readinessが失効する。RF statusのmask後の値が0Dの場合も再初期化を要求する。0Bの場合はraw値を保持してエラーを返す前に10 msの待機を入れる。readerへの`initialize`は明示的な再同期であり、失敗したカード操作の再実行や結果照合ではない。`rf_off`の失敗はcallerが観測する。DropはOS resourceの解放だけを担当する。
 
 RF待機には`A0`のhalf-ms fieldと`1C`のreader timerを両方設定する。reader timerはRF待機を秒単位へ切り上げてから`(ms-10)/10`をLE16で送り、成功した設定だけをRF modeに保持する。同じ設定の再送は省略し、待機時間を変えた場合はカード交換より先に更新する。
 
