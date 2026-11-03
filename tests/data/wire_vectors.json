@@ -1,0 +1,306 @@
+{
+  "codec_contract": {
+    "max_payload": 265,
+    "min_data_payload": 2,
+    "normal_encoder_max_payload": 255,
+    "extended_length_endian": "big",
+    "a0_timeout_endian": "little",
+    "strict_single_frame": true
+  },
+  "frames": [
+    {
+      "name": "firmware_request",
+      "hex": "00 00 FF 02 FE D4 02 2A 00",
+      "direction": "host",
+      "expected": "normal",
+      "cc": "02",
+      "data_hex": ""
+    },
+    {
+      "name": "firmware_response_synthetic",
+      "hex": "00 00 FF 06 FA D5 03 32 01 06 07 E8 00",
+      "direction": "reader",
+      "expected": "normal",
+      "cc": "03",
+      "data_hex": "32 01 06 07",
+      "note": "Synthetic values; not captured firmware identity."
+    },
+    {
+      "name": "reset_request",
+      "hex": "00 00 FF 03 FD D4 18 01 13 00",
+      "direction": "host",
+      "expected": "normal",
+      "cc": "18",
+      "data_hex": "01"
+    },
+    {
+      "name": "reset_response_synthetic",
+      "hex": "00 00 FF 02 FE D5 19 12 00",
+      "direction": "reader",
+      "expected": "normal",
+      "cc": "19",
+      "data_hex": ""
+    },
+    {
+      "name": "ack",
+      "hex": "00 00 FF 00 FF 00",
+      "direction": "reader",
+      "expected": "ack"
+    },
+    {
+      "name": "nak",
+      "hex": "00 00 FF FF 00 00",
+      "direction": "reader",
+      "expected": "nak"
+    },
+    {
+      "name": "reader_error",
+      "hex": "00 00 FF 01 FF 7F 81 00",
+      "direction": "reader",
+      "expected": "reader_error"
+    },
+    {
+      "name": "config_probe",
+      "hex": "00 00 FF 04 FC D4 06 A0 00 86 00",
+      "direction": "host",
+      "expected": "normal",
+      "cc": "06",
+      "data_hex": "A0 00"
+    },
+    {
+      "name": "rf_off",
+      "hex": "00 00 FF 04 FC D4 32 01 00 F9 00",
+      "direction": "host",
+      "expected": "normal",
+      "cc": "32",
+      "data_hex": "01 00"
+    },
+    {
+      "name": "rf_config_response_synthetic",
+      "hex": "00 00 FF 02 FE D5 33 F8 00",
+      "direction": "reader",
+      "expected": "normal",
+      "cc": "33",
+      "data_hex": ""
+    },
+    {
+      "name": "felica_poll_request",
+      "hex": "00 00 FF 0A F6 D4 A0 C8 00 06 00 FF FF 00 00 C0 00",
+      "direction": "host",
+      "expected": "normal",
+      "cc": "A0",
+      "data_hex": "C8 00 06 00 FF FF 00 00",
+      "a0_timeout_ticks": 200,
+      "rf_hex": "06 00 FF FF 00 00"
+    },
+    {
+      "name": "rf_timeout_response_synthetic",
+      "hex": "00 00 FF 03 FD D5 A1 01 89 00",
+      "direction": "reader",
+      "expected": "normal",
+      "cc": "A1",
+      "data_hex": "01",
+      "rf_status_raw": 1,
+      "rf_status_masked": 1
+    },
+    {
+      "name": "rf_success_response_synthetic",
+      "hex": "00 00 FF 03 FD D5 A1 00 8A 00",
+      "direction": "reader",
+      "expected": "normal",
+      "cc": "A1",
+      "data_hex": "00",
+      "rf_status_raw": 0,
+      "rf_status_masked": 0
+    },
+    {
+      "name": "register_read_response_synthetic",
+      "hex": "00 00 FF 04 FC D5 07 55 AA 25 00",
+      "direction": "reader",
+      "expected": "normal",
+      "cc": "07",
+      "data_hex": "55 AA",
+      "note": "07 is response CC. 55 AA are register values, with no RF status byte."
+    },
+    {
+      "name": "register_write_response_synthetic",
+      "hex": "00 00 FF 03 FD D5 09 00 22 00",
+      "direction": "reader",
+      "expected": "normal",
+      "cc": "09",
+      "data_hex": "00"
+    },
+    {
+      "name": "response_command_mismatch",
+      "hex": "00 00 FF 06 FA D5 03 32 01 06 07 E8 00",
+      "direction": "reader",
+      "expected": "normal",
+      "cc": "03",
+      "data_hex": "32 01 06 07",
+      "request_cc": "A0",
+      "transaction_expected": "response_command_mismatch"
+    },
+    {
+      "name": "normal_255_payload",
+      "hex": "00 00 FF FF 01 D5 03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 28 00",
+      "direction": "reader",
+      "expected": "normal",
+      "cc": "03",
+      "data_hex": "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00",
+      "payload_length": 255,
+      "note": "Codec-only synthetic payload, not a valid firmware response schema."
+    },
+    {
+      "name": "extended_256_payload",
+      "hex": "00 00 FF FF FF 01 00 FF D5 03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 28 00",
+      "direction": "reader",
+      "expected": "extended",
+      "cc": "03",
+      "data_hex": "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00",
+      "payload_length": 256,
+      "note": "Codec-only synthetic payload."
+    },
+    {
+      "name": "extended_265_payload",
+      "hex": "00 00 FF FF FF 01 09 F6 D5 A1 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 8A 00",
+      "direction": "reader",
+      "expected": "extended",
+      "cc": "A1",
+      "data_hex": "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00",
+      "payload_length": 265,
+      "note": "Codec-only synthetic payload."
+    },
+    {
+      "name": "extended_266_rejected",
+      "hex": "00 00 FF FF FF 01 0A F5 D5 A1 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 8A 00",
+      "direction": "reader",
+      "expected": "reject",
+      "reason": "payload_too_large"
+    },
+    {
+      "name": "small_extended_accepted",
+      "hex": "00 00 FF FF FF 00 02 FE D5 03 28 00",
+      "direction": "reader",
+      "expected": "extended",
+      "cc": "03",
+      "data_hex": ""
+    },
+    {
+      "name": "data_without_command",
+      "hex": "00 00 FF 01 FF D5 2B 00",
+      "direction": "reader",
+      "expected": "reject",
+      "reason": "data_too_short",
+      "note": "Independent implementation minimum payload policy, not an original-parser safety claim."
+    },
+    {
+      "name": "bad_lcs",
+      "hex": "00 00 FF 02 FD D4 02 2A 00",
+      "direction": "host",
+      "expected": "reject",
+      "reason": "lcs"
+    },
+    {
+      "name": "bad_dcs",
+      "hex": "00 00 FF 02 FE D4 02 2B 00",
+      "direction": "host",
+      "expected": "reject",
+      "reason": "dcs"
+    },
+    {
+      "name": "truncated_frame",
+      "hex": "00 00 FF 02 FE D4 02 2A",
+      "direction": "host",
+      "expected": "reject",
+      "reason": "length"
+    },
+    {
+      "name": "bad_postamble",
+      "hex": "00 00 FF 02 FE D4 02 2A 01",
+      "direction": "host",
+      "expected": "reject",
+      "reason": "postamble"
+    },
+    {
+      "name": "wrong_direction",
+      "hex": "00 00 FF 02 FE D4 02 2A 00",
+      "direction": "reader",
+      "expected": "reject",
+      "reason": "direction"
+    },
+    {
+      "name": "trailing_garbage",
+      "hex": "00 00 FF 02 FE D4 02 2A 00 42",
+      "direction": "host",
+      "expected": "reject",
+      "reason": "length",
+      "note": "Strict single-frame codec case; stream framing is a separate responsibility."
+    },
+    {
+      "name": "bad_preamble",
+      "hex": "00 01 FF 02 FE D4 02 2A 00",
+      "direction": "host",
+      "expected": "reject",
+      "reason": "preamble"
+    },
+    {
+      "name": "out_length_64_requires_zlp",
+      "hex": "00 00 FF 39 C7 D4 A0 C8 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 C4 00",
+      "direction": "host",
+      "expected": "normal",
+      "cc": "A0",
+      "data_hex": "C8 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00",
+      "usb_zlp_required": true,
+      "note": "Synthetic RF data for USB transfer-boundary test only."
+    }
+  ],
+  "stream_cases": [
+    {
+      "name": "ack_and_response_coalesced",
+      "chunks_hex": [
+        "00 00 FF 00 FF 00 00 00 FF 03 FD D5 A1 00 8A 00"
+      ],
+      "expected_frames": [
+        "ack",
+        "rf_success_response_synthetic"
+      ]
+    },
+    {
+      "name": "frame_split_across_reads",
+      "chunks_hex": [
+        "00 00 FF 03",
+        "FD D5 A1",
+        "00 8A 00"
+      ],
+      "expected_frames": [
+        "rf_success_response_synthetic"
+      ]
+    }
+  ],
+  "usb_out_boundary_cases": [
+    {
+      "length": 0,
+      "zlp_required": false
+    },
+    {
+      "length": 63,
+      "zlp_required": false
+    },
+    {
+      "length": 64,
+      "zlp_required": true
+    },
+    {
+      "length": 65,
+      "zlp_required": false
+    },
+    {
+      "length": 128,
+      "zlp_required": true
+    },
+    {
+      "length": 275,
+      "zlp_required": false
+    }
+  ]
+}
