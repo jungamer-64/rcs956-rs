@@ -21,20 +21,18 @@ use windows_sys::{
     core::GUID,
 };
 
-const READER_GUID: GUID = GUID::from_u128(0x0c729742_85a4_4105_8fcd_579e5f2d821e);
-const USB_GUID: GUID = GUID::from_u128(0xa5dcbf10_6530_11d2_901f_00c04fb951ed);
-
 /// A currently enumerated RC-S956 USB device and its available interface paths.
 #[derive(Debug, Clone)]
 pub struct Device {
     /// PnP instance identity used only for selecting this attached device.
     pub instance: String,
-    /// Device description reported by Windows.
-    pub description: String,
-    /// Active OS function service, such as WinUSB or sonyrcs956c.
-    pub service: String,
-    /// Device interfaces belonging to this exact PnP instance.
-    pub paths: Vec<String>,
+    /// Device description, absent only if the property is not registered.
+    pub description: Option<String>,
+    /// Active OS function service, absent if no service property is registered.
+    pub service: Option<String>,
+    /// Registered WinUSB application interface aliases of this exact function.
+    /// USB hub presence interfaces are not candidates for application I/O.
+    pub winusb_paths: Vec<String>,
 }
 
 struct DeviceSet(HDEVINFO);
