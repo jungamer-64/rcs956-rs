@@ -394,49 +394,6 @@ impl<T: Transport> Reader<T> {
         Ok(())
     }
 
-    fn prepare_target_exchange(&mut self, timeout: TargetTimeout) -> Result<(), Error> {
-        let desired_timer = ReaderTimer::for_rf_timeout(RfTimeout::new(timeout.wait())?);
-        let (info, applied_timer, applied_timeout) = match &self.state {
-            State::Ready {
-                rf:
-                    RfMode::Configured {
-                        protocol: RfProtocol::TypeA,
-                        timer,
-                    },
-                target_timeout: Some(applied),
-                ..
-            } if *applied == timeout && *timer == desired_timer => return Ok(()),
-            State::Ready {
-                info,
-                rf:
-                    RfMode::Configured {
-                        protocol: RfProtocol::TypeA,
-                        timer,
-                    },
-                target_timeout,
-            } => (info.clone(), *timer, *target_timeout),
-            _ => return Err(Error::NotInitialized),
-        };
-        // Do not publish a partial pair. Even if 32/02 succeeds, failure of 1C
-        // requires explicit initialization before another card command is sent.
-        self.state = State::NeedsInitialization;
-        if applied_timeout != Some(timeout) {
-            self.command(0x32, &timeout.args(), Duration::from_secs(1))?;
-        }
-        if applied_timer != desired_timer {
-            self.command(0x1c, &desired_timer.args(), Duration::from_secs(1))?;
-        }
-        self.state = State::Ready {
-            info,
-            rf: RfMode::Configured {
-                protocol: RfProtocol::TypeA,
-                timer: desired_timer,
-            },
-            target_timeout: Some(timeout),
-        };
-        Ok(())
-    }
-
     /// Select one FeliCa card at 212 kbps. The returned card exclusively borrows
     /// this reader, so its identity cannot survive a reset/mode change through it.
     /// Unsupported Polling request data may be absent and is preserved as such.
