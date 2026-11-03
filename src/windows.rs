@@ -3,6 +3,10 @@
 //! WinUSB must already own the selected function. Synchronous pipe operations
 //! retain all buffers until completion and use a finite pipe timeout.
 
+mod metadata;
+#[cfg(test)]
+mod registry_tests;
+
 use crate::transport::Transport;
 use std::{
     fmt, io,
@@ -13,10 +17,21 @@ use std::{
 };
 use windows_sys::{
     Win32::{
-        Devices::{DeviceAndDriverInstallation::*, Usb::*},
-        Foundation::{ERROR_NO_MORE_ITEMS, INVALID_HANDLE_VALUE},
+        Devices::{
+            DeviceAndDriverInstallation::*,
+            Properties::{DEVPKEY_Device_DeviceDesc, DEVPKEY_Device_Service, DEVPROP_TYPE_STRING},
+            Usb::*,
+        },
+        Foundation::{
+            DEVPROPKEY, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_KEY_DOES_NOT_EXIST,
+            ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_NOT_FOUND, ERROR_PATH_NOT_FOUND,
+            GetLastError, INVALID_HANDLE_VALUE,
+        },
         Storage::FileSystem::{CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING},
-        System::Registry::{KEY_READ, RRF_RT_REG_MULTI_SZ, RegCloseKey, RegGetValueW},
+        System::Registry::{
+            HKEY, KEY_QUERY_VALUE, REG_ROUTINE_FLAGS, RRF_RT_REG_MULTI_SZ, RRF_RT_REG_SZ,
+            RegCloseKey, RegGetValueW,
+        },
     },
     core::GUID,
 };
@@ -56,71 +71,115 @@ fn win_ok(ok: i32) -> io::Result<()> {
         Ok(())
     }
 }
-fn property(set: HDEVINFO, dev: &mut SP_DEVINFO_DATA, key: u32) -> String {
-    let mut buf = [0u16; 512];
-    let mut required = 0;
-    // SAFETY: set/dev are live SetupAPI objects; the initialized aligned UTF-16
-    // buffer is writable for exactly the supplied byte length during this call.
-    let ok = unsafe {
-        SetupDiGetDeviceRegistryPropertyW(
-            set,
-            dev,
-            key,
-            null_mut(),
-            buf.as_mut_ptr().cast(),
-            1024,
-            &mut required,
-        )
-    };
-    if ok == 0 {
-        return String::new();
-    }
-    String::from_utf16_lossy(buf.split(|c| *c == 0).next().unwrap_or(&[]))
+fn native_error(code: u32) -> io::Error {
+    io::Error::from_raw_os_error(i32::from_ne_bytes(code.to_ne_bytes()))
 }
 
-fn interface_guids(set: HDEVINFO, dev: &mut SP_DEVINFO_DATA) -> Vec<GUID> {
-    // SAFETY: the device set and element are live, and only read access is requested.
-    let key = unsafe { SetupDiOpenDevRegKey(set, dev, DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_READ) };
-    if key == INVALID_HANDLE_VALUE {
-        return Vec::new();
+fn property(set: HDEVINFO, dev: &SP_DEVINFO_DATA, key: &DEVPROPKEY) -> io::Result<Option<String>> {
+    let value = metadata::read_utf16(|buffer| {
+        let capacity = metadata::capacity_bytes(buffer)?;
+        let mut required = 0;
+        let mut kind = 0;
+        let output = if buffer.is_empty() {
+            null_mut()
+        } else {
+            buffer.as_mut_ptr().cast()
+        };
+        // SAFETY: set/dev are live; key and both scalar outputs are valid. The
+        // initialized aligned output buffer has exactly capacity writable bytes.
+        let ok = unsafe {
+            SetupDiGetDevicePropertyW(set, dev, key, &mut kind, output, capacity, &mut required, 0)
+        };
+        if ok == 0 {
+            // SAFETY: called immediately after the failed SetupAPI operation.
+            return match unsafe { GetLastError() } {
+                ERROR_NOT_FOUND => Ok(metadata::Query::Missing),
+                ERROR_INSUFFICIENT_BUFFER => Ok(metadata::Query::NeededBytes(required)),
+                code => Err(native_error(code)),
+            };
+        }
+        if kind != DEVPROP_TYPE_STRING {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "device property is not a string",
+            ));
+        }
+        Ok(metadata::Query::ValueBytes(required))
+    })?;
+    value.as_deref().map(metadata::string).transpose()
+}
+
+struct RegistryKey(HKEY);
+impl Drop for RegistryKey {
+    fn drop(&mut self) {
+        // SAFETY: this object uniquely owns the open registry key.
+        // Closing releases local resources and has no device or registry write effect.
+        unsafe {
+            RegCloseKey(self.0);
+        }
     }
-    let subkey = wide("Device Parameters");
-    let name = wide("DeviceInterfaceGUIDs");
-    let mut data = [0u16; 2048];
-    let mut len = 4096;
-    // SAFETY: key is open for reading, both strings are terminated, and data
-    // has 4096 initialized writable bytes with no outstanding aliases.
-    let status = unsafe {
-        RegGetValueW(
-            key,
-            subkey.as_ptr(),
-            name.as_ptr(),
-            RRF_RT_REG_MULTI_SZ,
-            null_mut(),
-            data.as_mut_ptr().cast(),
-            &mut len,
-        )
-    };
-    // SAFETY: key is the unique handle returned above; it is no longer used.
-    unsafe {
-        RegCloseKey(key);
-    }
-    if status != 0 {
-        return Vec::new();
-    }
-    data.split(|c| *c == 0)
-        .filter_map(|s| {
-            let s = String::from_utf16(s).ok()?;
-            let digits: String = s
-                .chars()
-                .filter(|c| !matches!(c, '{' | '}' | '-'))
-                .collect();
-            if digits.len() != 32 {
-                return None;
+}
+
+fn registry_value(
+    key: &RegistryKey,
+    name: &str,
+    flags: REG_ROUTINE_FLAGS,
+) -> io::Result<Option<Vec<u16>>> {
+    let name = wide(name);
+    metadata::read_utf16(|buffer| {
+        let mut size = metadata::capacity_bytes(buffer)?;
+        let output = if buffer.is_empty() {
+            null_mut()
+        } else {
+            buffer.as_mut_ptr().cast()
+        };
+        // SAFETY: key is live, the value name is terminated, and
+        // output is null for sizing or points to size initialized writable bytes.
+        // DIREG_DEV already opens Device Parameters, so the value is on key itself.
+        let status = unsafe {
+            RegGetValueW(
+                key.0,
+                null(),
+                name.as_ptr(),
+                flags,
+                null_mut(),
+                output,
+                &mut size,
+            )
+        };
+        match status {
+            0 if buffer.is_empty() && size > 0 => Ok(metadata::Query::NeededBytes(size)),
+            0 => Ok(metadata::Query::ValueBytes(size)),
+            ERROR_MORE_DATA => Ok(metadata::Query::NeededBytes(size)),
+            ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => Ok(metadata::Query::Missing),
+            code => Err(native_error(code)),
+        }
+    })
+}
+
+/// Interpret both Windows registration forms on an already opened hardware key.
+/// Missing values are absence; access, type, and malformed-data failures propagate.
+fn registered_interface_guids(key: &RegistryKey) -> io::Result<Vec<GUID>> {
+    let multi = registry_value(key, "DeviceInterfaceGUIDs", RRF_RT_REG_MULTI_SZ)?;
+    let single = registry_value(key, "DeviceInterfaceGUID", RRF_RT_REG_SZ)?;
+    metadata::interface_guids(multi.as_deref(), single.as_deref())
+}
+
+fn interface_guids(set: HDEVINFO, dev: &SP_DEVINFO_DATA) -> io::Result<Vec<GUID>> {
+    // SAFETY: the device set and element are live; only value-read access is requested.
+    let raw =
+        unsafe { SetupDiOpenDevRegKey(set, dev, DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_QUERY_VALUE) };
+    if raw == INVALID_HANDLE_VALUE {
+        // SAFETY: called immediately after the failed key-open operation.
+        return match unsafe { GetLastError() } {
+            ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND | ERROR_KEY_DOES_NOT_EXIST => {
+                Ok(Vec::new())
             }
-            u128::from_str_radix(&digits, 16).ok().map(GUID::from_u128)
-        })
-        .collect()
+            code => Err(native_error(code)),
+        };
+    }
+    let key = RegistryKey(raw);
+    registered_interface_guids(&key)
 }
 
 fn interface_paths(guid: &GUID, instance: &str) -> io::Result<Vec<String>> {
@@ -155,8 +214,13 @@ fn interface_paths(guid: &GUID, instance: &str) -> io::Result<Vec<String>> {
         }
         let mut needed = 0;
         // SAFETY: this is the documented size query with a null output buffer.
-        unsafe {
+        let ok = unsafe {
             SetupDiGetDeviceInterfaceDetailW(set.0, &item, null_mut(), 0, &mut needed, null_mut());
+            // GetLastError is captured before any other operation can change it.
+            GetLastError()
+        };
+        if ok != ERROR_INSUFFICIENT_BUFFER {
+            return Err(native_error(ok));
         }
         if !(8..=65536).contains(&needed) {
             return Err(io::Error::new(
@@ -261,19 +325,24 @@ pub fn devices() -> io::Result<Vec<Device>> {
         {
             continue;
         }
-        let mut guids = interface_guids(set.0, &mut dev);
-        guids.extend([READER_GUID, USB_GUID]);
+        let description = property(set.0, &dev, &DEVPKEY_Device_DeviceDesc)?;
+        let service = property(set.0, &dev, &DEVPKEY_Device_Service)?;
         let mut paths = Vec::new();
-        for guid in guids {
-            paths.extend(interface_paths(&guid, &instance)?);
+        if service
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case("winusb"))
+        {
+            for guid in interface_guids(set.0, &dev)? {
+                paths.extend(interface_paths(&guid, &instance)?);
+            }
         }
         paths.sort();
         paths.dedup();
         out.push(Device {
             instance,
-            description: property(set.0, &mut dev, SPDRP_DEVICEDESC),
-            service: property(set.0, &mut dev, SPDRP_SERVICE),
-            paths,
+            description,
+            service,
+            winusb_paths: paths,
         });
     }
     Err(io::Error::new(

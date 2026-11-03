@@ -11,11 +11,13 @@ cargo run --locked -- poll --system FFFF --request 1 --slots 0
 cargo run --locked -- read --system 88B4 --service 000B --blocks 0,1
 ```
 
-read例のservice／systemは対象カードに存在するものを指定する。未確認のカードへ例の値をそのまま適用しない。`--path`は複数interfaceの中から対象を選ぶ。`--timeout-ms`はRF交換の有限待機値で、host応答待機には余裕時間を加える。書込みCLIと自動再送は提供しない。
+read例のservice／systemは対象カードに存在するものを指定する。未確認のカードへ例の値をそのまま適用しない。`--path`は複数リーダーの中から対象のapplication interfaceを指定する。同じUSB functionの複数aliasは1台として扱い、使用可能なfunctionが1台なら登録pathのソート順で先頭を選ぶ。`--timeout-ms`はRF交換の有限待機値で、host応答待機には余裕時間を加える。書込みCLIと自動再送は提供しない。
 
 ## Windows binding
 
 ハードウェア操作には、対象USB functionがWinUSBで利用可能であることが必要。CLIはdescriptorと`054C:02E1`、Bulk IN／OUT、64-byte MPSを検査する。OSドライバーの自動インストール・置換、registryへの書込みは行わない。Sonyの既存private SDK interfaceはWinUSB interfaceとは別である。
+
+WinUSBのapplication interface登録は、hardware key上の`DeviceInterfaceGUIDs`（REG_MULTI_SZ）と`DeviceInterfaceGUID`（REG_SZ）を読む。hardware keyは`SetupDiOpenDevRegKey(DIREG_DEV)`で開き、追加の`Device Parameters` subkeyは開かない。USB hubの存在通知interfaceをI/O候補に含めない。property／registry値の不在と、アクセス失敗・型不一致・不正な文字列を区別する。可変長metadataは64 KiBを上限に取得し、4回のqueryで確定しなければWouldBlockを返す。登録形式と取得APIの外部契約は[WinUSB installation](https://learn.microsoft.com/en-us/windows-hardware/drivers/usbcon/winusb-installation)と[hardware key](https://learn.microsoft.com/en-us/windows-hardware/drivers/install/opening-a-device-s-hardware-key)を参照する。
 
 WinUSBでないserviceが列挙された場合、`devices`の結果で実際のbindingを確認する。OSドライバーを変更する必要がある場合は、対象と復元方法を決めて別途実施する。`probe`成功はRF／カード読取成功を意味しない。
 
@@ -31,7 +33,7 @@ RF待機には`A0`のhalf-ms fieldと`1C`のreader timerを両方設定する。
 
 ## 検証境界
 
-`verify.ps1`はcodec、command順序／失敗時progress、設定imageとcard packetの検査、および公開APIを確認する。固定packet vectorは実機captureではない。
+`verify.ps1`はcodec、command順序／失敗時progress、設定imageとcard packetの検査、および公開APIを確認する。固定packet vectorは実機captureではない。 registry取得のtestは隔離したvolatile HKCU keyを作成し、取得・型・アクセスエラーを実際のWindows APIで確認して終了時に削除する。deviceの登録やbindingには書き込まない。
 
 実機検証では、`devices`による対象／service／path、`probe`のfirmware／model／設定checksum、`poll`のidentity／PMm、対象serviceを指定した`read`を別々に記録する。CLI出力はAPIの観測結果であり、USB bus上のZLPやRF timingのcaptureとは区別する。全firmware、PC/SC完全互換、Type A／B、カードへの書込みの成立はこの検証の対象に含めない。
 

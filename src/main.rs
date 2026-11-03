@@ -167,9 +167,14 @@ fn list_devices() -> Result<(), Box<dyn Error>> {
     for device in devices {
         println!(
             "{}\n  {}\n  Service: {}",
-            device.instance, device.description, device.service
+            device.instance,
+            device
+                .description
+                .as_deref()
+                .unwrap_or("description not registered"),
+            device.service.as_deref().unwrap_or("not bound")
         );
-        for path in device.paths {
+        for path in device.winusb_paths {
             println!("  Interface: {path}");
         }
     }
@@ -186,22 +191,46 @@ fn select_path(explicit: Option<String>) -> Result<String, Box<dyn Error>> {
         return Ok(path);
     }
     let devices = rcs956::windows::devices()?;
+    match select_discovered_path(&devices) {
+        Ok(path) => Ok(path.to_owned()),
+        Err(SelectionError::NoDevice) => Err(
+            "RC-S956 USB (054C:02E1) is not present; connect it to this PC, then run devices".into(),
+        ),
+        Err(SelectionError::NoWinUsbInterface) => Err(format!(
+            "reader is present, but no registered WinUSB application interface is available (services: {}). OS driver rebinding is not performed by this tool",
+            devices.iter().map(|d| d.service.as_deref().unwrap_or("not bound")).collect::<Vec<_>>().join(", ")
+        ).into()),
+        Err(SelectionError::MultipleReaders) => Err("multiple WinUSB readers found; select one with --path".into()),
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, PartialEq, Eq)]
+enum SelectionError {
+    NoDevice,
+    NoWinUsbInterface,
+    MultipleReaders,
+}
+
+#[cfg(windows)]
+fn select_discovered_path(devices: &[rcs956::windows::Device]) -> Result<&str, SelectionError> {
     if devices.is_empty() {
-        return Err(
-            "RC-S956 USB (054C:02E1) is not present; connect it to this PC, then run devices"
-                .into(),
-        );
+        return Err(SelectionError::NoDevice);
     }
-    let candidates: Vec<_> = devices
-        .iter()
-        .filter(|d| d.service.eq_ignore_ascii_case("winusb"))
-        .flat_map(|d| d.paths.iter())
-        .collect();
-    match candidates.as_slice() {
-        [path]=>Ok((*path).clone()),
-        []=>Err(format!("reader is present, but no WinUSB interface is available (services: {}). OS driver rebinding is not performed by this tool",devices.iter().map(|d|d.service.as_str()).collect::<Vec<_>>().join(", ")).into()),
-        _=>Err("multiple reader interfaces found; select one with --path".into()),
+    // Each Device is one PnP function. Multiple registered aliases do not make
+    // that function multiple readers; enumeration sorts aliases deterministically.
+    let mut functions = devices.iter().filter_map(|device| {
+        device
+            .service
+            .as_deref()
+            .filter(|service| service.eq_ignore_ascii_case("winusb"))
+            .and_then(|_| device.winusb_paths.first())
+    });
+    let path = functions.next().ok_or(SelectionError::NoWinUsbInterface)?;
+    if functions.next().is_some() {
+        return Err(SelectionError::MultipleReaders);
     }
+    Ok(path)
 }
 
 fn hex_u16(s: &str) -> Result<u16, std::num::ParseIntError> {
@@ -219,4 +248,55 @@ fn hex_bytes(s: &str) -> Result<Vec<u8>, Box<dyn Error>> {
 }
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02X}")).collect()
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use rcs956::windows::Device;
+
+    fn device(instance: &str, service: Option<&str>, paths: &[&str]) -> Device {
+        Device {
+            instance: instance.to_owned(),
+            description: None,
+            service: service.map(str::to_owned),
+            winusb_paths: paths.iter().map(|path| (*path).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn aliases_belong_to_one_function_and_other_services_are_not_candidates() {
+        let devices = [
+            device("reader-one", Some("WinUSB"), &["alias-a", "alias-b"]),
+            device("reader-two", Some("sonyrcs956c"), &["native-path"]),
+        ];
+        assert_eq!(select_discovered_path(&devices), Ok("alias-a"));
+    }
+
+    #[test]
+    fn separate_winusb_functions_require_selection() {
+        let devices = [
+            device("reader-one", Some("WinUSB"), &["alias-a", "alias-b"]),
+            device("reader-two", Some("WinUSB"), &["alias-c"]),
+        ];
+        assert_eq!(
+            select_discovered_path(&devices),
+            Err(SelectionError::MultipleReaders)
+        );
+    }
+
+    #[test]
+    fn absence_and_present_without_application_interface_are_distinct() {
+        assert_eq!(select_discovered_path(&[]), Err(SelectionError::NoDevice));
+        for present in [
+            device("reader", None, &[]),
+            device("reader", Some("WinUSB"), &[]),
+            device("reader", Some("sonyrcs956c"), &["native-path"]),
+        ] {
+            assert_eq!(
+                select_discovered_path(&[present]),
+                Err(SelectionError::NoWinUsbInterface)
+            );
+        }
+    }
 }
