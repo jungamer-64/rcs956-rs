@@ -432,3 +432,76 @@ fn recovery_rf_status_revokes_the_selected_cards_operation_authority() -> Result
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
 }
+
+#[test]
+fn changing_rf_wait_updates_reader_timer_without_reapplying_mode() -> Result<(), Box<dyn Error>> {
+    let mut steps = initialization(&config_image());
+    steps.extend(mode_configuration());
+    steps.push(command(0x4a, &[1, 1, 0, 0x12, 0x34, 1, 0], &[0]));
+    // 1500ms rounds to 2000ms in 1C, whose parameter is (2000-10)/10=199.
+    steps.push(command(0x1c, &[0x80, 0xc7, 0], &[]));
+    steps.push(command(
+        0x4a,
+        &[1, 1, 0, 0x12, 0x34, 1, 0],
+        &poll_response(),
+    ));
+    let mut args = vec![0xb8, 0x0b, 16, 6]; // A0 timeout remains 3000 half-ms ticks.
+    args.extend_from_slice(&IDENTITY);
+    args.extend_from_slice(&[1, 0x8b, 0x1a, 1, 0x80, 0]);
+    let mut reply = vec![0, 29, 7];
+    reply.extend_from_slice(&IDENTITY);
+    reply.extend_from_slice(&[0, 0, 1]);
+    reply.extend_from_slice(&[0x5a; 16]);
+    steps.push(command(0xa0, &args, &reply));
+    steps.push(command(0x1c, &[0x80, 0x63, 0], &[]));
+    steps.push(command(0x4a, &[1, 1, 0, 0x12, 0x34, 1, 0], &[0]));
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    assert!(reader.poll_felica(poll_request()?, timeout()?)?.is_none());
+    {
+        let mut card = reader
+            .poll_felica(
+                poll_request()?,
+                RfTimeout::new(Duration::from_millis(1500))?,
+            )?
+            .ok_or("expected card")?;
+        assert_eq!(
+            card.read_without_encryption(0x1a8b, &[0])?.blocks(),
+            &[[0x5a; 16]]
+        );
+    }
+    assert!(reader.poll_felica(poll_request()?, timeout()?)?.is_none());
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn failed_timer_change_revokes_preceding_mode() -> Result<(), Box<dyn Error>> {
+    let mut steps = initialization(&config_image());
+    steps.extend(mode_configuration());
+    steps.push(command(0x4a, &[1, 1, 0, 0x12, 0x34, 1, 0], &[0]));
+    steps.push(Step {
+        request: Request::Command(0x1c, vec![0x80, 0xc7, 0]),
+        answer: Answer::LostAfterAck,
+    });
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    assert!(reader.poll_felica(poll_request()?, timeout()?)?.is_none());
+    assert!(matches!(
+        reader.poll_felica(
+            poll_request()?,
+            RfTimeout::new(Duration::from_millis(1500))?
+        ),
+        Err(ReaderError::Transaction(_))
+    ));
+    let sent = journal.borrow().requests.len();
+    assert!(matches!(
+        reader.poll_felica(poll_request()?, timeout()?),
+        Err(ReaderError::NotInitialized)
+    ));
+    assert_eq!(journal.borrow().requests.len(), sent);
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}

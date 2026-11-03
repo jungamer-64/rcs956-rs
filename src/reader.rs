@@ -121,6 +121,30 @@ pub struct ReaderInfo {
     pub configuration: ConfigImage,
 }
 
+/// Parameter of the reader's 1C timer, derived only from a validated RF wait.
+/// This timer and the A0 half-ms field are different protocol representations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReaderTimer(u16);
+impl ReaderTimer {
+    fn for_rf_timeout(timeout: RfTimeout) -> Self {
+        // The accepted tick range is 1..=65535, so this conversion yields
+        // 1..=33 whole seconds and a parameter in 99..=3299.
+        Self(timeout.ticks.div_ceil(2000) * 100 - 1)
+    }
+
+    fn args(self) -> [u8; 3] {
+        let [lo, hi] = self.0.to_le_bytes();
+        [0x80, lo, hi]
+    }
+}
+
+/// A published FeliCa mode always carries its successfully applied timer.
+#[derive(Debug, Clone, Copy)]
+enum RfMode {
+    Off,
+    Felica(ReaderTimer),
+}
+
 #[derive(Debug)]
 #[expect(
     clippy::large_enum_variant,
@@ -128,10 +152,7 @@ pub struct ReaderInfo {
 )]
 enum State {
     NeedsInitialization,
-    Ready {
-        info: ReaderInfo,
-        felica_configured: bool,
-    },
+    Ready { info: ReaderInfo, rf: RfMode },
 }
 
 /// Exclusive reader owner. Uncertain transport failures revoke RF readiness.
@@ -208,7 +229,7 @@ impl<T: Transport> Reader<T> {
         };
         self.state = State::Ready {
             info: info.clone(),
-            felica_configured: false,
+            rf: RfMode::Off,
         };
         Ok(info)
     }
@@ -223,29 +244,32 @@ impl<T: Transport> Reader<T> {
         }
     }
 
-    fn configure_felica(&mut self) -> Result<(), Error> {
-        let info = match &self.state {
+    fn configure_felica(&mut self, timeout: RfTimeout) -> Result<(), Error> {
+        let timer = ReaderTimer::for_rf_timeout(timeout);
+        let (info, apply_mode) = match &self.state {
             State::Ready {
-                felica_configured: true,
+                rf: RfMode::Felica(applied),
                 ..
-            } => return Ok(()),
-            State::Ready { info, .. } => info.clone(),
+            } if *applied == timer => return Ok(()),
+            State::Ready { info, rf } => (info.clone(), matches!(rf, RfMode::Off)),
             State::NeedsInitialization => return Err(Error::NotInitialized),
         };
-        // Publish the mode only after the entire setting sequence succeeds.
+        // A partially applied timer/mode is not the preceding published mode.
         self.state = State::NeedsInitialization;
-        self.command(0x1c, &[0x80, 0x63, 0], Duration::from_secs(1))?;
-        self.command(0x32, &[5, 0, 0, 0], Duration::from_secs(1))?;
-        self.command(0x32, &[0x81, 0xb7], Duration::from_secs(1))?;
-        self.command(
-            0x32,
-            &info.configuration.felica_config(),
-            Duration::from_secs(1),
-        )?;
-        self.write_register(0x630d, 0)?;
+        self.command(0x1c, &timer.args(), Duration::from_secs(1))?;
+        if apply_mode {
+            self.command(0x32, &[5, 0, 0, 0], Duration::from_secs(1))?;
+            self.command(0x32, &[0x81, 0xb7], Duration::from_secs(1))?;
+            self.command(
+                0x32,
+                &info.configuration.felica_config(),
+                Duration::from_secs(1),
+            )?;
+            self.write_register(0x630d, 0)?;
+        }
         self.state = State::Ready {
             info,
-            felica_configured: true,
+            rf: RfMode::Felica(timer),
         };
         Ok(())
     }
@@ -258,7 +282,7 @@ impl<T: Transport> Reader<T> {
         request: PollRequest,
         timeout: RfTimeout,
     ) -> Result<Option<FelicaCard<'_, T>>, Error> {
-        self.configure_felica()?;
+        self.configure_felica(timeout)?;
         let poll = request.encode();
         let mut args = vec![1, 1];
         args.extend_from_slice(&poll[1..]);
@@ -285,6 +309,7 @@ impl<T: Transport> Reader<T> {
         if data.len() > 255 {
             return Err(Error::Response("RF input exceeds 255 bytes"));
         }
+        self.configure_felica(timeout)?;
         let mut args = Vec::with_capacity(data.len() + 2);
         args.extend_from_slice(&timeout.ticks.to_le_bytes());
         args.extend_from_slice(data);
@@ -313,7 +338,7 @@ impl<T: Transport> Reader<T> {
         thread::sleep(Duration::from_millis(5));
         self.state = State::Ready {
             info,
-            felica_configured: false,
+            rf: RfMode::Off,
         };
         Ok(())
     }
@@ -376,5 +401,21 @@ mod tests {
             ConfigImage::parse(e),
             Err(Error::Configuration("checksum 40..BF"))
         ));
+    }
+
+    #[test]
+    fn reader_timer_wire_values_cover_second_boundaries() -> Result<(), Error> {
+        for (wait, expected) in [
+            (Duration::from_millis(100), [0x80, 0x63, 0]),
+            (Duration::from_secs(1), [0x80, 0x63, 0]),
+            (Duration::from_micros(1_000_500), [0x80, 0xc7, 0]),
+            (Duration::from_micros(32_767_500), [0x80, 0xe3, 0x0c]),
+        ] {
+            assert_eq!(
+                ReaderTimer::for_rf_timeout(RfTimeout::new(wait)?).args(),
+                expected
+            );
+        }
+        Ok(())
     }
 }
