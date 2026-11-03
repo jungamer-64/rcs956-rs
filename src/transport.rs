@@ -15,8 +15,8 @@ pub trait Transport: fmt::Debug {
     fn write(&mut self, frame: &[u8], timeout: Duration) -> io::Result<usize>;
     /// Receive at most `buffer.len()` bytes within the backend's timeout policy.
     fn read(&mut self, buffer: &mut [u8], timeout: Duration) -> io::Result<usize>;
-    /// Explicitly discard pending transport data and reestablish a byte boundary.
-    /// This does not establish whether a prior card operation executed.
+    /// Clear transport stalls and cached bytes. This does not cancel a reader
+    /// firmware command or establish whether a prior card operation executed.
     fn recover(&mut self) -> io::Result<()>;
 }
 
@@ -103,6 +103,8 @@ pub struct Link<T: Transport> {
 enum StreamState {
     Ready,
     RecoveryRequired,
+    NeedsReset,
+    ResetCommitPending,
 }
 
 impl<T: Transport> Link<T> {
@@ -121,7 +123,8 @@ impl<T: Transport> Link<T> {
         args: &[u8],
         timeout: Duration,
     ) -> Result<Response, TransactionError> {
-        if self.state != StreamState::Ready {
+        if self.state != StreamState::Ready
+            && !(self.state == StreamState::NeedsReset && command == 0x18 && args == [1]) {
             return Err(TransactionError {
                 progress: Progress::NotSent,
                 failure: Failure::RecoveryRequired,
@@ -223,7 +226,11 @@ impl<T: Transport> Link<T> {
                         command: actual,
                         data: data.to_vec(),
                     };
-                    self.state = StreamState::Ready;
+                    self.state = if command == 0x18 && args == [1] {
+                        StreamState::ResetCommitPending
+                    } else {
+                        StreamState::Ready
+                    };
                     return Ok(response);
                 }
                 Frame::Ack | Frame::Data { .. } => {
@@ -236,9 +243,10 @@ impl<T: Transport> Link<T> {
         }
     }
 
-    /// Send a host ACK without expecting another ACK. Used to commit reset.
+    /// Send a host ACK without expecting another ACK. A reset response must be
+    /// committed with this ACK; the link waits 10ms before admitting commands.
     pub fn host_ack(&mut self, timeout: Duration) -> Result<(), TransactionError> {
-        if self.state != StreamState::Ready {
+        if !matches!(self.state, StreamState::Ready | StreamState::ResetCommitPending) {
             return Err(TransactionError {
                 progress: Progress::NotSent,
                 failure: Failure::RecoveryRequired,
@@ -250,6 +258,14 @@ impl<T: Transport> Link<T> {
                 failure: Failure::Deadline,
             });
         }
+        let reset_commit = self.state == StreamState::ResetCommitPending;
+        self.send_host_ack(timeout)?;
+        if reset_commit { thread::sleep(Duration::from_millis(10)); }
+        self.state = StreamState::Ready;
+        Ok(())
+    }
+
+    fn send_host_ack(&mut self, timeout: Duration) -> Result<(), TransactionError> {
         self.state = StreamState::RecoveryRequired;
         let n = self
             .transport
@@ -267,16 +283,20 @@ impl<T: Transport> Link<T> {
                 },
             });
         }
-        self.state = StreamState::Ready;
         Ok(())
     }
 
-    /// Reestablish the transport boundary. The caller must also reset/reconfigure
-    /// the reader and discard card-session state before RF use.
-    pub fn recover(&mut self) -> io::Result<()> {
+    /// Clear pipe state, cancel an unfinished reader command with an out-of-band
+    /// ACK, wait 1ms, then discard cached input again. Only reset (`18 01`) is
+    /// admitted afterwards, followed by its response and committed host ACK.
+    /// This never determines whether a preceding card operation executed.
+    pub fn recover(&mut self) -> Result<(), TransactionError> {
         self.state = StreamState::RecoveryRequired;
-        self.transport.recover()?;
-        self.state = StreamState::Ready;
+        self.transport.recover().map_err(|e| TransactionError { progress: Progress::NotSent, failure: Failure::Io(e) })?;
+        self.send_host_ack(Duration::from_secs(1))?;
+        thread::sleep(Duration::from_millis(1));
+        self.transport.recover().map_err(|e| TransactionError { progress: Progress::Sent, failure: Failure::Io(e) })?;
+        self.state = StreamState::NeedsReset;
         Ok(())
     }
 }
