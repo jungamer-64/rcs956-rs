@@ -19,7 +19,7 @@ fn main() -> std::process::ExitCode {
 }
 fn help() {
     println!(
-        "rcs956 devices\nrcs956 probe [--path DEVICE_INTERFACE]\nrcs956 poll [--type felica|a|b] [--timeout-ms 500] [--path PATH]\nrcs956 poll --type felica [--system FFFF] [--request 1] [--slots 0]\nrcs956 read --service HEX --blocks DECIMAL[,DECIMAL...] [FeliCa poll options]\nrcs956 exchange --type a|b --data HEX [--timeout-ms 500] [--path PATH]\nrcs956 decode READER_FRAME_HEX\n\nHardware commands require an existing WinUSB binding. exchange sends caller-supplied card commands (A) or an ISO-DEP APDU (B); their effects belong to the caller. No automatic application-command replay."
+        "rcs956 devices\nrcs956 probe [--path DEVICE_INTERFACE]\nrcs956 poll [--type felica|a|b] [--timeout-ms 500] [--path PATH]\nrcs956 poll --type felica [--system FFFF] [--request 1] [--slots 0]\nrcs956 read --service HEX --blocks DECIMAL[,DECIMAL...] [FeliCa poll options]\nrcs956 exchange --type a|b --data HEX [--timeout-ms 500] [--path PATH]\nrcs956 sequence --type a|b --data HEX --data HEX [...] [--timeout-ms 500] [--path PATH]\nrcs956 decode READER_FRAME_HEX\n\nHardware commands require an existing WinUSB binding. exchange sends one caller-supplied card command (A) or ISO-DEP APDU (B); sequence sends each supplied command in order within one card selection. Their effects belong to the caller. No automatic application-command replay."
     );
 }
 fn run() -> Result<(), Box<dyn Error>> {
@@ -47,7 +47,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         return list_devices();
     }
-    if !matches!(command.as_str(), "probe" | "poll" | "read" | "exchange") {
+    if !matches!(
+        command.as_str(),
+        "probe" | "poll" | "read" | "exchange" | "sequence"
+    ) {
         return Err(format!("unknown command: {command}").into());
     }
     let mut path = None;
@@ -58,7 +61,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut service = None;
     let mut blocks = None;
     let mut technology = Technology::Felica;
-    let mut data = None;
+    let mut data: Vec<Vec<u8>> = Vec::new();
     let mut felica_options = false;
     while let Some(key) = args.next() {
         let value = args
@@ -79,7 +82,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 felica_options = true;
             }
             "--type" => technology = Technology::parse(&value)?,
-            "--data" => data = Some(hex_bytes(&value)?),
+            "--data" => data.push(hex_bytes(&value)?),
             "--timeout-ms" => timeout = value.parse()?,
             "--service" => service = Some(hex_u16(&value)?),
             "--blocks" => {
@@ -108,14 +111,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     if technology != Technology::Felica && (felica_options || command == "read") {
         return Err("--system/--request/--slots and read require --type felica".into());
     }
-    if command == "exchange" {
-        validate_exchange(
-            technology,
-            data.as_deref().ok_or("exchange requires --data")?,
-        )?;
-    } else if data.is_some() {
-        return Err("--data requires exchange".into());
-    }
+    validate_data_options(&command, technology, &data)?;
     let request = PollRequest::new(system, request, slots)?;
     let timeout = RfTimeout::new(Duration::from_millis(timeout))?;
     #[cfg(windows)]
@@ -138,8 +134,12 @@ fn run() -> Result<(), Box<dyn Error>> {
                 Technology::Felica => {
                     card_operation(&mut reader, request, timeout, service, blocks.as_deref())
                 }
-                Technology::TypeA => type_a_operation(&mut reader, timeout, data.as_deref()),
-                Technology::TypeB => type_b_operation(&mut reader, timeout, data.as_deref()),
+                Technology::TypeA => {
+                    type_a_operation(&mut reader, timeout, &data, command == "sequence")
+                }
+                Technology::TypeB => {
+                    type_b_operation(&mut reader, timeout, &data, command == "sequence")
+                }
             }
         };
         let shutdown = reader.rf_off();
@@ -175,11 +175,34 @@ impl Technology {
     }
 }
 
+fn validate_data_options(
+    command: &str,
+    technology: Technology,
+    data: &[Vec<u8>],
+) -> Result<(), Box<dyn Error>> {
+    match command {
+        "exchange" if data.len() != 1 => {
+            return Err("exchange requires exactly one --data".into());
+        }
+        "sequence" if data.is_empty() => {
+            return Err("sequence requires at least one --data".into());
+        }
+        "exchange" | "sequence" => {
+            for apdu in data {
+                validate_exchange(technology, apdu)?;
+            }
+        }
+        _ if !data.is_empty() => return Err("--data requires exchange or sequence".into()),
+        _ => {}
+    }
+    Ok(())
+}
+
 fn validate_exchange(technology: Technology, data: &[u8]) -> Result<(), Box<dyn Error>> {
     let maximum = match technology {
         Technology::TypeA => 262,
         Technology::TypeB => 65_535,
-        Technology::Felica => return Err("exchange requires --type a or b".into()),
+        Technology::Felica => return Err("exchange and sequence require --type a or b".into()),
     };
     if data.is_empty() || data.len() > maximum {
         return Err(format!("exchange requires 1..={maximum} bytes").into());
@@ -190,7 +213,8 @@ fn validate_exchange(technology: Technology, data: &[u8]) -> Result<(), Box<dyn 
 fn type_a_operation<T: Transport>(
     reader: &mut Reader<T>,
     timeout: RfTimeout,
-    data: Option<&[u8]>,
+    data: &[Vec<u8>],
+    sequence: bool,
 ) -> Result<(), Box<dyn Error>> {
     let Some(mut card) = reader.poll_type_a(timeout)? else {
         println!("No NFC-A card");
@@ -207,8 +231,11 @@ fn type_a_operation<T: Transport>(
     if let Some(ats) = observation.ats() {
         println!("ATS: {}", hex(ats.bytes()));
     }
-    if let Some(data) = data {
-        let reply = card.exchange(data)?;
+    for (index, apdu) in data.iter().enumerate() {
+        if sequence {
+            println!("APDU {}: {}", index + 1, hex(apdu));
+        }
+        let reply = card.exchange(apdu)?;
         println!(
             "Reader status: {:02X}\nResponse: {}",
             reply.status,
@@ -221,7 +248,8 @@ fn type_a_operation<T: Transport>(
 fn type_b_operation<T: Transport>(
     reader: &mut Reader<T>,
     timeout: RfTimeout,
-    data: Option<&[u8]>,
+    data: &[Vec<u8>],
+    sequence: bool,
 ) -> Result<(), Box<dyn Error>> {
     let Some(mut card) = reader.poll_type_b(timeout)? else {
         println!("No NFC-B card");
@@ -235,8 +263,11 @@ fn type_b_operation<T: Transport>(
         hex(observation.atqb()),
         hex(observation.attrib_response())
     );
-    if let Some(data) = data {
-        println!("Response: {}", hex(&card.exchange_apdu(data)?));
+    for (index, apdu) in data.iter().enumerate() {
+        if sequence {
+            println!("APDU {}: {}", index + 1, hex(apdu));
+        }
+        println!("Response: {}", hex(&card.exchange_apdu(apdu)?));
     }
     Ok(())
 }
@@ -423,5 +454,36 @@ mod tests {
                 Err(SelectionError::NoWinUsbInterface)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod sequence_tests {
+    use super::*;
+
+    #[test]
+    fn sequence_requires_apdus_and_type_a_or_b() {
+        assert!(validate_data_options("sequence", Technology::TypeA, &[]).is_err());
+        assert!(validate_data_options("sequence", Technology::Felica, &[vec![0]]).is_err());
+        assert!(validate_data_options("sequence", Technology::TypeA, &[vec![0]]).is_ok());
+        assert!(validate_data_options("sequence", Technology::TypeB, &[vec![0]]).is_ok());
+    }
+
+    #[test]
+    fn exchange_retains_single_command_contract() {
+        assert!(validate_data_options("exchange", Technology::TypeA, &[]).is_err());
+        assert!(
+            validate_data_options("exchange", Technology::TypeA, &[vec![1], vec![2]]).is_err()
+        );
+        assert!(validate_data_options("exchange", Technology::TypeB, &[vec![1]]).is_ok());
+        assert!(validate_data_options("poll", Technology::TypeA, &[vec![1]]).is_err());
+    }
+
+    #[test]
+    fn sequence_checks_every_apdu_before_hardware() {
+        let oversized = vec![vec![1], vec![2; 263]];
+        assert!(validate_data_options("sequence", Technology::TypeA, &oversized).is_err());
+        let empty = vec![vec![1], vec![]];
+        assert!(validate_data_options("sequence", Technology::TypeB, &empty).is_err());
     }
 }
