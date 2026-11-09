@@ -2,27 +2,27 @@
 
 `Cargo.toml`がworkspace構成、`Cargo.lock`が解決済み依存、`verify.ps1`がWindows上の正規検証手順を所有する。
 
-`rcs956-core`はフレーム、取引状態、RF設定、カードプロトコルを所有する。`no_std`と`alloc`で動作し、crate全体で`unsafe_code`を禁止する。Rustからは`rcs956_core::reader::Reader`などを使用する。coreが定義する`Transport`へ同期転送、pipe回復、単調時計、待機を委譲し、期限・待機時間とエラー時の状態遷移はcoreで決める。`rcs956`は`rcs956::windows::WinUsb`とCLIを提供する。
+`rcs956-core`はフレーム、取引状態、RF設定、カードプロトコルを所有する。`no_std`と`alloc`で動作し、crate全体で`unsafe_code`を禁止する。Rustからは`rcs956_core::reader::Reader`などを使用する。coreが定義する`Transport`へ同期転送、pipe回復、単調時計、待機を委譲し、期限・待機時間とエラー時の状態遷移はcoreで決める。`rcs956`は`rcs956::windows::WinUsb`を提供し、`rcs956-cli`が両ライブラリを組み合わせて`rcs956`コマンドを提供する。
 
 正規検証にはcoreのベアメタル向けコンパイルに使うRust targetが必要。
 
 ```powershell
 rustup target add x86_64-unknown-none
-cargo build --locked
+cargo build --workspace --locked
 .\verify.ps1
-cargo run --locked -- devices
-cargo run --locked -- probe
-cargo run --locked -- poll --type felica --system FFFF --request 1 --slots 0
-cargo run --locked -- poll --type a
-cargo run --locked -- poll --type b
-cargo run --locked -- read --system 88B4 --service 000B --blocks 0,1
+cargo run --locked -p rcs956-cli -- devices
+cargo run --locked -p rcs956-cli -- probe
+cargo run --locked -p rcs956-cli -- poll --type felica --system FFFF --request 1 --slots 0
+cargo run --locked -p rcs956-cli -- poll --type a
+cargo run --locked -p rcs956-cli -- poll --type b
+cargo run --locked -p rcs956-cli -- read --system 88B4 --service 000B --blocks 0,1
 ```
 
 read例のservice／systemは対象カードに存在するものを指定する。未確認のカードへ例の値をそのまま適用しない。`--path`は複数リーダーの中から対象のapplication interfaceを指定する。同じUSB functionの複数aliasは1台として扱い、使用可能なfunctionが1台なら登録pathのソート順で先頭を選ぶ。`--timeout-ms`はRF交換の有限待機値で、host応答待機には余裕時間を加える。`exchange --type a --data HEX`はカードcommand、`exchange --type b --data HEX`はISO-DEP APDUを送る。送信内容とカードへの効果はcallerが決める。FeliCaのreadは非暗号化読取だけを行う。application commandの自動再実行はしない。
 
 ## Windows binding
 
-ハードウェア操作には、対象USB functionがWinUSBで利用可能であることが必要。CLIはdescriptorと`054C:02E1`、Bulk IN／OUT、64-byte MPSを検査する。OSドライバーの自動インストール・置換、registryへの書込みは行わない。Sonyの既存private SDK interfaceはWinUSB interfaceとは別である。
+ハードウェア操作には、対象USB functionがWinUSBで利用可能であることが必要。`WinUsb::open`はdescriptorと`054C:02E1`、Bulk IN／OUT、64-byte MPSを検査する。OSドライバーの自動インストール・置換、registryへの書込みは行わない。Sonyの既存private SDK interfaceはWinUSB interfaceとは別である。
 
 WinUSBのapplication interface登録は、hardware key上の`DeviceInterfaceGUIDs`（REG_MULTI_SZ）と`DeviceInterfaceGUID`（REG_SZ）を読む。hardware keyは`SetupDiOpenDevRegKey(DIREG_DEV)`で開き、追加の`Device Parameters` subkeyは開かない。USB hubの存在通知interfaceをI/O候補に含めない。property／registry値の不在と、アクセス失敗・型不一致・不正な文字列を区別する。可変長metadataは64 KiBを上限に取得し、4回のqueryで確定しなければWouldBlockを返す。登録形式と取得APIの外部契約は[WinUSB installation](https://learn.microsoft.com/en-us/windows-hardware/drivers/usbcon/winusb-installation)と[hardware key](https://learn.microsoft.com/en-us/windows-hardware/drivers/install/opening-a-device-s-hardware-key)を参照する。
 
@@ -52,7 +52,7 @@ FeliCaのRF待機には`A0`のhalf-ms fieldと`1C`のreader timerを両方設定
 
 ## 検証境界
 
-`verify.ps1`は両crateのテスト・lint・公開APIと、coreの`no_std`ビルドを確認する。固定packet vectorは実機captureではない。registry取得のtestは隔離したvolatile HKCU keyを作成し、取得・型・アクセスエラーを実際のWindows APIで確認して終了時に削除する。deviceの登録やbindingには書き込まない。
+`verify.ps1`はworkspaceのテスト・lint、ライブラリの公開API、coreの`no_std`ビルドを確認する。固定packet vectorは実機captureではない。registry取得のtestは隔離したvolatile HKCU keyを作成し、取得・型・アクセスエラーを実際のWindows APIで確認して終了時に削除する。deviceの登録やbindingには書き込まない。
 
 実機検証では、`devices`による対象／service／path、`probe`のfirmware／model／設定checksum、`poll`のidentity／PMm、対象serviceを指定した`read`を別々に記録する。CLI出力はAPIの観測結果であり、USB bus上のZLPやRF timingのcaptureとは区別する。全firmware、PC/SC完全互換、全カードcommand／APDUの意味と副作用の成立は、この検証の対象に含めない。NFC-A／Bの固定vectorはカード実機の成功証拠ではない。
 
