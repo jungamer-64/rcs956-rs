@@ -2,20 +2,14 @@
 //!
 //! These model command/response contracts, not physical device operation.
 
-use rcs956::{
+use rcs956_core::{
     felica::{Idm, PollRequest},
-    reader::{Error as ReaderError, Reader, RfTimeout},
+    isodep,
+    reader::{ConfigurationError, Error as ReaderError, Reader, RfTimeout, TimeoutRange},
     transport::{Progress, TransactionError, Transport},
     wire::{self, Direction, Frame},
 };
-use std::{
-    cell::RefCell,
-    collections::VecDeque,
-    error::Error,
-    io,
-    rc::Rc,
-    time::{Duration, Instant},
-};
+use std::{cell::RefCell, collections::VecDeque, error::Error, io, rc::Rc, time::Duration};
 
 const IDENTITY: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
 const PARAMETERS: [u8; 8] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
@@ -54,8 +48,8 @@ enum Input {
 #[derive(Debug)]
 struct Journal {
     requests: Vec<Request>,
-    request_times: Vec<Instant>,
-    last_read_completed: Option<Instant>,
+    request_times: Vec<Duration>,
+    last_read_completed: Option<Duration>,
     remaining: usize,
     recoveries: usize,
 }
@@ -65,6 +59,7 @@ struct Script {
     steps: VecDeque<Step>,
     input: VecDeque<Input>,
     journal: Rc<RefCell<Journal>>,
+    elapsed: Duration,
 }
 
 impl Script {
@@ -81,6 +76,7 @@ impl Script {
                 steps: steps.into(),
                 input: VecDeque::new(),
                 journal: Rc::clone(&journal),
+                elapsed: Duration::ZERO,
             },
             journal,
         )
@@ -105,6 +101,16 @@ fn reader_response(cc: u8, data: &[u8]) -> io::Result<Vec<u8>> {
 }
 
 impl Transport for Script {
+    type Error = io::Error;
+
+    fn monotonic_time(&self) -> Duration {
+        self.elapsed
+    }
+
+    fn wait(&mut self, duration: Duration) {
+        self.elapsed += duration;
+    }
+
     fn write(&mut self, bytes: &[u8], timeout: Duration) -> io::Result<usize> {
         assert!(!timeout.is_zero());
         assert!(
@@ -128,7 +134,7 @@ impl Transport for Script {
         })?;
         assert_eq!(actual, step.request, "wire request order or arguments");
         self.journal.borrow_mut().requests.push(actual.clone());
-        self.journal.borrow_mut().request_times.push(Instant::now());
+        self.journal.borrow_mut().request_times.push(self.elapsed);
         self.journal.borrow_mut().remaining = self.steps.len();
         match actual {
             Request::HostAck => {}
@@ -161,7 +167,7 @@ impl Transport for Script {
                     )
                 })?;
                 output.copy_from_slice(&bytes);
-                self.journal.borrow_mut().last_read_completed = Some(Instant::now());
+                self.journal.borrow_mut().last_read_completed = Some(self.elapsed);
                 Ok(bytes.len())
             }
             Some(Input::Timeout) => Err(io::Error::new(
@@ -244,7 +250,7 @@ fn mode_configuration() -> Vec<Step> {
     ]
 }
 
-fn poll_request() -> Result<PollRequest, rcs956::felica::CardError> {
+fn poll_request() -> Result<PollRequest, rcs956_core::felica::CardError> {
     PollRequest::new(0x1234, 1, 0)
 }
 
@@ -255,7 +261,7 @@ fn poll_response() -> Vec<u8> {
     packet
 }
 
-fn timeout() -> Result<RfTimeout, ReaderError> {
+fn timeout() -> Result<RfTimeout, TimeoutRange> {
     RfTimeout::new(Duration::from_millis(100))
 }
 
@@ -392,7 +398,9 @@ fn invalid_configuration_checksum_is_not_published() -> Result<(), Box<dyn Error
     let mut reader = Reader::new(script);
     assert!(matches!(
         reader.initialize(),
-        Err(ReaderError::Configuration("checksum 40..BF"))
+        Err(ReaderError::Configuration(ConfigurationError::Checksum {
+            offset: 0x40
+        }))
     ));
     assert!(matches!(
         reader.poll_felica(poll_request()?, timeout()?),
@@ -577,7 +585,7 @@ fn rf_error_0b_settles_before_a_following_exchange() -> Result<(), Box<dyn Error
         .last()
         .copied()
         .ok_or("missing subsequent request time")?;
-    assert!(next_request.duration_since(reply_completed) >= Duration::from_millis(10));
+    assert!(next_request >= reply_completed + Duration::from_millis(10));
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
 }
@@ -696,11 +704,8 @@ fn type_b_apdu_uses_software_blocks_without_felica_mode() -> Result<(), Box<dyn 
             .exchange_apdu(&input)
             .err()
             .ok_or("expected input rejection")?;
-        assert!(matches!(
-            error.cause,
-            rcs956::isodep::Cause::InputLength { .. }
-        ));
-        assert_eq!(error.progress, rcs956::isodep::Progress::default());
+        assert!(matches!(error.cause, isodep::Cause::InputLength { .. }));
+        assert_eq!(error.progress, isodep::Progress::default());
         assert_eq!(journal.borrow().requests.len(), before);
     }
     assert_eq!(card.exchange_apdu(&[0, 0xa4, 4, 0])?, [0x90, 0]);
@@ -800,7 +805,7 @@ fn type_b_lost_exchange_keeps_transport_progress_without_apdu_replay() -> Result
         .ok_or("expected exchange loss")?;
     assert!(matches!(
         error.cause,
-        rcs956::isodep::Cause::Transport(ReaderError::Transaction(_))
+        isodep::Cause::Transport(ReaderError::Transaction(_))
     ));
     assert_eq!(error.progress.attempted_application_bytes, 1);
     let count = journal.borrow().requests.len();
@@ -808,7 +813,7 @@ fn type_b_lost_exchange_keeps_transport_progress_without_apdu_replay() -> Result
         .exchange_apdu(&[0xa4])
         .err()
         .ok_or("expected invalid session")?;
-    assert!(matches!(error.cause, rcs956::isodep::Cause::SessionInvalid));
+    assert!(matches!(error.cause, isodep::Cause::SessionInvalid));
     assert_eq!(journal.borrow().requests.len(), count);
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
@@ -853,12 +858,12 @@ fn partial_type_b_timing_setup_preserves_zero_apdu_progress_and_requires_reset()
                 .ok_or("expected timing setup loss")?;
             assert!(matches!(
                 error.cause,
-                rcs956::isodep::Cause::Preparation(ReaderError::Transaction(TransactionError {
+                isodep::Cause::Preparation(ReaderError::Transaction(TransactionError {
                     progress: Progress::Acknowledged,
                     ..
                 }))
             ));
-            assert_eq!(error.progress, rcs956::isodep::Progress::default());
+            assert_eq!(error.progress, isodep::Progress::default());
             assert!(error.partial_response.is_empty());
             assert!(
                 journal
@@ -872,8 +877,8 @@ fn partial_type_b_timing_setup_preserves_zero_apdu_progress_and_requires_reset()
                 .exchange_apdu(&[0xa4])
                 .err()
                 .ok_or("expected invalid session")?;
-            assert!(matches!(error.cause, rcs956::isodep::Cause::SessionInvalid));
-            assert_eq!(error.progress, rcs956::isodep::Progress::default());
+            assert!(matches!(error.cause, isodep::Cause::SessionInvalid));
+            assert_eq!(error.progress, isodep::Progress::default());
         }
         assert!(matches!(
             reader.poll_type_b(timeout()?),

@@ -1,10 +1,15 @@
 //! Command-line discovery and NFC communication for RC-S956.
 #![forbid(unsafe_code)]
 
-use rcs956::{
-    felica::PollRequest,
-    reader::{Reader, RfTimeout},
-    transport::Transport,
+#[cfg(windows)]
+use rcs956::windows::WinUsb;
+#[cfg(windows)]
+use rcs956_core::reader::Reader;
+use rcs956_core::{
+    felica::{MAX_READ_BLOCKS, PollRequest},
+    isodep::MAX_APDU_BYTES,
+    reader::{MAX_TYPE_A_COMMAND_BYTES, RfTimeout},
+    wire,
 };
 use std::{error::Error, time::Duration};
 
@@ -35,10 +40,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     if command == "decode" {
         let text = args.collect::<Vec<_>>().join(" ");
         let bytes = hex_bytes(&text)?;
-        println!(
-            "{:?}",
-            rcs956::wire::parse(&bytes, rcs956::wire::Direction::Reader)?
-        );
+        println!("{:?}", wire::parse(&bytes, wire::Direction::Reader)?);
         return Ok(());
     }
     if command == "devices" {
@@ -101,9 +103,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     if blocks
         .as_ref()
-        .is_some_and(|b| !(1..=12).contains(&b.len()))
+        .is_some_and(|b| !(1..=MAX_READ_BLOCKS).contains(&b.len()))
     {
-        return Err("read requires 1..12 block numbers".into());
+        return Err(format!("read requires 1..{MAX_READ_BLOCKS} block numbers").into());
     }
     if command != "read" && (service.is_some() || blocks.is_some()) {
         return Err("--service/--blocks require read".into());
@@ -117,7 +119,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     #[cfg(windows)]
     {
         let path = select_path(path)?;
-        let usb = rcs956::windows::WinUsb::open(&path)?;
+        let usb = WinUsb::open(&path)?;
         println!("Interface: {path}");
         let mut reader = Reader::new(usb);
         let info = reader.initialize()?;
@@ -200,8 +202,8 @@ fn validate_data_options(
 
 fn validate_exchange(technology: Technology, data: &[u8]) -> Result<(), Box<dyn Error>> {
     let maximum = match technology {
-        Technology::TypeA => 262,
-        Technology::TypeB => 65_535,
+        Technology::TypeA => MAX_TYPE_A_COMMAND_BYTES,
+        Technology::TypeB => MAX_APDU_BYTES,
         Technology::Felica => return Err("exchange and sequence require --type a or b".into()),
     };
     if data.is_empty() || data.len() > maximum {
@@ -210,8 +212,9 @@ fn validate_exchange(technology: Technology, data: &[u8]) -> Result<(), Box<dyn 
     Ok(())
 }
 
-fn type_a_operation<T: Transport>(
-    reader: &mut Reader<T>,
+#[cfg(windows)]
+fn type_a_operation(
+    reader: &mut Reader<WinUsb>,
     timeout: RfTimeout,
     data: &[Vec<u8>],
     sequence: bool,
@@ -245,8 +248,9 @@ fn type_a_operation<T: Transport>(
     Ok(())
 }
 
-fn type_b_operation<T: Transport>(
-    reader: &mut Reader<T>,
+#[cfg(windows)]
+fn type_b_operation(
+    reader: &mut Reader<WinUsb>,
     timeout: RfTimeout,
     data: &[Vec<u8>],
     sequence: bool,
@@ -272,8 +276,9 @@ fn type_b_operation<T: Transport>(
     Ok(())
 }
 
-fn card_operation<T: Transport>(
-    reader: &mut Reader<T>,
+#[cfg(windows)]
+fn card_operation(
+    reader: &mut Reader<WinUsb>,
     request: PollRequest,
     timeout: RfTimeout,
     service: Option<u16>,
@@ -391,6 +396,7 @@ fn hex_bytes(s: &str) -> Result<Vec<u8>, Box<dyn Error>> {
         .map(|n| u8::from_str_radix(&digits[n..n + 2], 16).map_err(Into::into))
         .collect()
 }
+#[cfg(windows)]
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02X}")).collect()
 }
@@ -472,9 +478,7 @@ mod sequence_tests {
     #[test]
     fn exchange_retains_single_command_contract() {
         assert!(validate_data_options("exchange", Technology::TypeA, &[]).is_err());
-        assert!(
-            validate_data_options("exchange", Technology::TypeA, &[vec![1], vec![2]]).is_err()
-        );
+        assert!(validate_data_options("exchange", Technology::TypeA, &[vec![1], vec![2]]).is_err());
         assert!(validate_data_options("exchange", Technology::TypeB, &[vec![1]]).is_ok());
         assert!(validate_data_options("poll", Technology::TypeA, &[vec![1]]).is_err());
     }

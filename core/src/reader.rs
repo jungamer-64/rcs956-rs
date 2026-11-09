@@ -1,26 +1,29 @@
 //! Reader configuration and lifetime-bound NFC card access.
-#![forbid(unsafe_code)]
 
 use crate::{
     felica::{self, CardError, PollRequest, PollResponse, ReadResponse},
     isodep, nfca, nfcb,
     transport::{Link, TransactionError, Transport},
 };
-use std::{fmt, thread, time::Duration};
+use alloc::{vec, vec::Vec};
+use core::{error, fmt, time::Duration};
+
+/// Maximum card-command bytes accepted by the reader's NFC-A exchange.
+pub const MAX_TYPE_A_COMMAND_BYTES: usize = 262;
 
 /// Failures of reader initialization, RF configuration, or card exchange.
 #[derive(Debug)]
-pub enum Error {
+pub enum Error<E> {
     /// Host transport transaction failed; the stream must be reinitialized.
-    Transaction(TransactionError),
+    Transaction(TransactionError<E>),
     /// Recovery failed, preserving the phase of its out-of-band ACK transfer.
-    Recovery(TransactionError),
+    Recovery(TransactionError<E>),
     /// Reader initialization has not completed for this connection.
     NotInitialized,
     /// A command response did not have the required layout.
     Response(&'static str),
-    /// A configuration checksum/signature failed.
-    Configuration(&'static str),
+    /// The configuration image failed validation.
+    Configuration(ConfigurationError),
     /// Register write returned an error value.
     RegisterStatus(u8),
     /// Raw RF status and its command-specific classification.
@@ -28,7 +31,7 @@ pub enum Error {
     /// Card-level response validation failed.
     Card(CardError),
     /// The requested RF wait cannot be encoded as nonzero half-ms ticks.
-    TimeoutRange,
+    Timeout(TimeoutRange),
     /// NFC-A activation data failed validation.
     TypeA(nfca::Error),
     /// NFC-B activation data failed validation.
@@ -45,17 +48,46 @@ pub enum Error {
         actual: usize,
     },
 }
-impl fmt::Display for Error {
+impl<E: fmt::Debug> fmt::Display for Error<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{self:?}")
     }
 }
-impl std::error::Error for Error {}
-impl From<CardError> for Error {
+impl<E: error::Error + 'static> error::Error for Error<E> {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match self {
+            Self::Transaction(error) | Self::Recovery(error) => Some(error),
+            Self::Configuration(error) => Some(error),
+            Self::Card(error) => Some(error),
+            Self::Timeout(error) => Some(error),
+            Self::TypeA(error) => Some(error),
+            Self::TypeB(error) => Some(error),
+            Self::IsoDepParameters(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+impl<E> From<CardError> for Error<E> {
     fn from(e: CardError) -> Self {
         Self::Card(e)
     }
 }
+impl<E> From<TimeoutRange> for Error<E> {
+    fn from(e: TimeoutRange) -> Self {
+        Self::Timeout(e)
+    }
+}
+
+/// The requested wait is zero or exceeds 65535 half-ms ticks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeoutRange;
+
+impl fmt::Display for TimeoutRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RF wait must be positive and fit in 65535 half-ms ticks")
+    }
+}
+impl error::Error for TimeoutRange {}
 
 /// Positive RF timeout with a checked conversion to RC-S956 wire ticks.
 #[derive(Debug, Clone, Copy)]
@@ -63,14 +95,18 @@ pub struct RfTimeout {
     ticks: u16,
 }
 impl RfTimeout {
-    /// Round a positive duration up to half-ms ticks. Rejects more than 65535 ticks.
-    pub fn new(duration: Duration) -> Result<Self, Error> {
+    /// Round a positive duration up to half-ms ticks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TimeoutRange`] for zero or a duration requiring more than 65535 ticks.
+    pub fn new(duration: Duration) -> Result<Self, TimeoutRange> {
         let ticks = duration.as_nanos().div_ceil(500_000);
         if ticks == 0 {
-            return Err(Error::TimeoutRange);
+            return Err(TimeoutRange);
         }
         Ok(Self {
-            ticks: u16::try_from(ticks).map_err(|_| Error::TimeoutRange)?,
+            ticks: u16::try_from(ticks).map_err(|_| TimeoutRange)?,
         })
     }
     /// Encoded little-endian device timeout.
@@ -82,6 +118,27 @@ impl RfTimeout {
     }
 }
 
+/// Invalid reader configuration image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigurationError {
+    /// The configuration signature was absent.
+    Signature,
+    /// A checksummed region did not sum to zero.
+    Checksum {
+        /// Byte offset where the failing region begins.
+        offset: usize,
+    },
+    /// The image's model class is unsupported.
+    ModelClass,
+}
+
+impl fmt::Display for ConfigurationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+impl error::Error for ConfigurationError {}
+
 /// Immutable, validated configuration read from one attached reader.
 #[derive(Debug, Clone)]
 pub struct ConfigImage {
@@ -91,21 +148,22 @@ pub struct ConfigImage {
 impl ConfigImage {
     /// Check the signature, three defined checksum ranges, and model class.
     /// Bytes C0..FF are not covered by those checksums.
-    pub fn parse(bytes: [u8; 256]) -> Result<Self, Error> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigurationError`] if the image fails validation.
+    pub fn parse(bytes: [u8; 256]) -> Result<Self, ConfigurationError> {
         if bytes[..2] != [0x55, 0xaa] {
-            return Err(Error::Configuration("signature"));
+            return Err(ConfigurationError::Signature);
         }
-        for (range, name) in [
-            (0..16, "checksum 00..0F"),
-            (16..64, "checksum 10..3F"),
-            (64..192, "checksum 40..BF"),
-        ] {
+        for range in [0..16, 16..64, 64..192] {
+            let offset = range.start;
             if bytes[range].iter().fold(0u8, |s, b| s.wrapping_add(*b)) != 0 {
-                return Err(Error::Configuration(name));
+                return Err(ConfigurationError::Checksum { offset });
             }
         }
         if !matches!(bytes[253], 1 | 2) {
-            return Err(Error::Configuration("unsupported model class"));
+            return Err(ConfigurationError::ModelClass);
         }
         let model = u16::from_be_bytes([bytes[253], bytes[254]]);
         Ok(Self { bytes, model })
@@ -274,7 +332,7 @@ impl<T: Transport> Reader<T> {
         }
     }
 
-    fn command(&mut self, cc: u8, args: &[u8], wait: Duration) -> Result<Vec<u8>, Error> {
+    fn command(&mut self, cc: u8, args: &[u8], wait: Duration) -> Result<Vec<u8>, Error<T::Error>> {
         match self.link.command(cc, args, wait) {
             Ok(r) => Ok(r.data),
             Err(e) => {
@@ -286,7 +344,7 @@ impl<T: Transport> Reader<T> {
 
     /// Recover the transport, reset the reader, read its configuration, and enter
     /// RF-off readiness. Failure leaves the reader uninitialized; no command replay.
-    pub fn initialize(&mut self) -> Result<ReaderInfo, Error> {
+    pub fn initialize(&mut self) -> Result<ReaderInfo, Error<T::Error>> {
         self.state = State::NeedsInitialization;
         self.link.recover().map_err(Error::Recovery)?;
         let wait = Duration::from_secs(1);
@@ -316,7 +374,7 @@ impl<T: Transport> Reader<T> {
             let begin = usize::from(bank) * 64;
             config[begin..begin + 64].copy_from_slice(&values);
         }
-        let configuration = ConfigImage::parse(config)?;
+        let configuration = ConfigImage::parse(config).map_err(Error::Configuration)?;
         let flags = self
             .command(0x0c, &[], wait)?
             .first()
@@ -324,7 +382,7 @@ impl<T: Transport> Reader<T> {
             .ok_or(Error::Response("reader flags length"))?;
         self.write_register(0x630a, 0x40)?;
         self.command(0x32, &[1, 0], wait)?;
-        thread::sleep(Duration::from_millis(5));
+        self.link.wait(Duration::from_millis(5));
         let info = ReaderInfo {
             firmware,
             flags,
@@ -338,7 +396,7 @@ impl<T: Transport> Reader<T> {
         Ok(info)
     }
 
-    fn write_register(&mut self, address: u16, value: u8) -> Result<(), Error> {
+    fn write_register(&mut self, address: u16, value: u8) -> Result<(), Error<T::Error>> {
         let [hi, lo] = address.to_be_bytes();
         let reply = self.command(8, &[hi, lo, value], Duration::from_secs(1))?;
         match reply.as_slice() {
@@ -348,7 +406,11 @@ impl<T: Transport> Reader<T> {
         }
     }
 
-    fn configure_rf(&mut self, protocol: RfProtocol, timeout: RfTimeout) -> Result<(), Error> {
+    fn configure_rf(
+        &mut self,
+        protocol: RfProtocol,
+        timeout: RfTimeout,
+    ) -> Result<(), Error<T::Error>> {
         let timer = ReaderTimer::for_rf_timeout(timeout);
         let (info, apply_mode, response_timeout) = match &self.state {
             State::Ready {
@@ -398,7 +460,7 @@ impl<T: Transport> Reader<T> {
         &mut self,
         protocol: RfProtocol,
         timeout: ResponseTimeout,
-    ) -> Result<(), Error> {
+    ) -> Result<(), Error<T::Error>> {
         let desired_timer = ReaderTimer::for_rf_timeout(RfTimeout::new(timeout.wait())?);
         let (info, applied_timer, applied_timeout) = match &self.state {
             State::Ready {
@@ -453,7 +515,7 @@ impl<T: Transport> Reader<T> {
         &mut self,
         request: PollRequest,
         timeout: RfTimeout,
-    ) -> Result<Option<FelicaCard<'_, T>>, Error> {
+    ) -> Result<Option<FelicaCard<'_, T>>, Error<T::Error>> {
         self.configure_rf(RfProtocol::Felica, timeout)?;
         let poll = request.encode();
         let mut args = vec![1, 1];
@@ -476,7 +538,10 @@ impl<T: Transport> Reader<T> {
 
     /// Activate one NFC-A target at 106 kbps. UID, SAK and optional ATS are
     /// validated before granting the returned card access to this reader.
-    pub fn poll_type_a(&mut self, timeout: RfTimeout) -> Result<Option<TypeACard<'_, T>>, Error> {
+    pub fn poll_type_a(
+        &mut self,
+        timeout: RfTimeout,
+    ) -> Result<Option<TypeACard<'_, T>>, Error<T::Error>> {
         self.configure_rf(RfProtocol::TypeA, timeout)?;
         let response = self.command(0x4a, &[1, 0], timeout.host_wait())?;
         match response.as_slice() {
@@ -497,7 +562,10 @@ impl<T: Transport> Reader<T> {
     /// Activate one NFC-B ISO-DEP target at 106 kbps, using the normal RF table
     /// and AFI wildcard. A card requiring another protocol is detected as an
     /// unsupported activation rather than granted ISO-DEP operation authority.
-    pub fn poll_type_b(&mut self, timeout: RfTimeout) -> Result<Option<TypeBCard<'_, T>>, Error> {
+    pub fn poll_type_b(
+        &mut self,
+        timeout: RfTimeout,
+    ) -> Result<Option<TypeBCard<'_, T>>, Error<T::Error>> {
         self.configure_rf(RfProtocol::TypeB, timeout)?;
         let response = self.command(0x4a, &[1, 3, 0, 1], timeout.host_wait())?;
         match response.as_slice() {
@@ -558,7 +626,7 @@ impl<T: Transport> Reader<T> {
         data: &[u8],
         timeout: RfTimeout,
         protocol: RfProtocol,
-    ) -> Result<Vec<u8>, Error> {
+    ) -> Result<Vec<u8>, Error<T::Error>> {
         if !matches!(self.state, State::Ready { rf: RfMode::Configured { protocol: applied, .. }, .. } if applied == protocol)
         {
             return Err(Error::NotInitialized);
@@ -576,7 +644,7 @@ impl<T: Transport> Reader<T> {
         self.rf_response(response)
     }
 
-    fn rf_response(&mut self, response: Vec<u8>) -> Result<Vec<u8>, Error> {
+    fn rf_response(&mut self, response: Vec<u8>) -> Result<Vec<u8>, Error<T::Error>> {
         match response.split_first() {
             Some((status, body)) if status & 0x3f == 0 => Ok(body.to_vec()),
             Some((status, _)) => {
@@ -586,7 +654,7 @@ impl<T: Transport> Reader<T> {
                 if status & 0x3f == 0x0b {
                     // Settle this RF error before the caller can issue another
                     // exchange; returning the error alone does not impose a gap.
-                    thread::sleep(Duration::from_millis(10));
+                    self.link.wait(Duration::from_millis(10));
                 }
                 Err(Error::RfStatus(*status))
             }
@@ -596,7 +664,7 @@ impl<T: Transport> Reader<T> {
 
     /// Disable RF and invalidate the configured mode. Call explicitly to observe
     /// failure; dropping a reader only releases the backend's OS resources.
-    pub fn rf_off(&mut self) -> Result<(), Error> {
+    pub fn rf_off(&mut self) -> Result<(), Error<T::Error>> {
         let (info, response_timeout) = match &self.state {
             State::Ready {
                 info,
@@ -607,7 +675,7 @@ impl<T: Transport> Reader<T> {
         };
         self.state = State::NeedsInitialization;
         self.command(0x32, &[1, 0], Duration::from_secs(1))?;
-        thread::sleep(Duration::from_millis(5));
+        self.link.wait(Duration::from_millis(5));
         self.state = State::Ready {
             info,
             rf: RfMode::Off,
@@ -650,10 +718,10 @@ impl<T: Transport> TypeACard<'_, T> {
     /// upper status bits imply an automatic continuation.
     /// The requested RF wait is rounded upward to a 32/02 timing step, capped
     /// at 3280 ms. The reader timer uses that effective wait; host waiting adds 1 s.
-    pub fn exchange(&mut self, data: &[u8]) -> Result<TargetResponse, Error> {
-        if data.is_empty() || data.len() > 262 {
+    pub fn exchange(&mut self, data: &[u8]) -> Result<TargetResponse, Error<T::Error>> {
+        if data.is_empty() || data.len() > MAX_TYPE_A_COMMAND_BYTES {
             return Err(Error::InputLength {
-                maximum: 262,
+                maximum: MAX_TYPE_A_COMMAND_BYTES,
                 actual: data.len(),
             });
         }
@@ -708,9 +776,12 @@ impl<T: Transport> TypeBCard<'_, T> {
     /// transfer attempts. Setup applies 32/02 selector 0x10 and a 3280 ms reader
     /// response step; each A0 block independently uses its FWI/WTX wait.
     /// Application APDUs are never retried.
-    pub fn exchange_apdu(&mut self, apdu: &[u8]) -> Result<Vec<u8>, isodep::Error<Error>> {
+    pub fn exchange_apdu(
+        &mut self,
+        apdu: &[u8],
+    ) -> Result<Vec<u8>, isodep::Error<Error<T::Error>>> {
         let reader = &mut self.reader;
-        let exchange = self.session.prepare::<Error>(apdu)?;
+        let exchange = self.session.prepare(apdu)?;
         // The APDU guard requests at least 9896 ms, saturating 32/02 to its
         // 3280 ms step. A0 keeps its independent FWI/WTX wait; individual
         // blocks do not reprogram 1C.
@@ -745,7 +816,7 @@ impl<T: Transport> FelicaCard<'_, T> {
         &mut self,
         service: u16,
         blocks: &[u16],
-    ) -> Result<ReadResponse, Error> {
+    ) -> Result<ReadResponse, Error<T::Error>> {
         let request = felica::read_without_encryption(self.observation.idm, service, blocks)?;
         self.reader.configure_rf(RfProtocol::Felica, self.timeout)?;
         let response = self
@@ -780,12 +851,12 @@ mod tests {
         e[0x40] = 1;
         assert!(matches!(
             ConfigImage::parse(e),
-            Err(Error::Configuration("checksum 40..BF"))
+            Err(ConfigurationError::Checksum { offset: 0x40 })
         ));
     }
 
     #[test]
-    fn reader_timer_wire_values_cover_second_boundaries() -> Result<(), Error> {
+    fn reader_timer_wire_values_cover_second_boundaries() -> Result<(), TimeoutRange> {
         for (wait, expected) in [
             (Duration::from_millis(100), [0x80, 0x63, 0]),
             (Duration::from_secs(1), [0x80, 0x63, 0]),
@@ -801,7 +872,7 @@ mod tests {
     }
 
     #[test]
-    fn response_timeout_vectors_cover_quantization_and_saturation() -> Result<(), Error> {
+    fn response_timeout_vectors_cover_quantization_and_saturation() -> Result<(), TimeoutRange> {
         // Independent boundary vectors from f:3B250's millisecond intervals.
         for (microseconds, selector, effective_ms, timer) in [
             (500, 0x0a, 51, [0x80, 0x63, 0]),

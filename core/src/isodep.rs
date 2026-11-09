@@ -4,11 +4,11 @@
 //! and WTX; the caller owns each synchronous RF transfer and its timeout.
 //! A failed transfer is never retried. Only explicit protocol acknowledgments
 //! can request retransmission of a block within the same application exchange.
-#![forbid(unsafe_code)]
+use alloc::vec::Vec;
+use core::{error, fmt, time::Duration};
 
-use std::{fmt, time::Duration};
-
-const MAX_APDU: usize = 65_535;
+/// Local APDU size limit, before applying limits of the selected session.
+pub const MAX_APDU_BYTES: usize = 65_535;
 const MAX_RESPONSE: usize = 65_536;
 const MAX_FRAMES: usize = 2048;
 const MAX_WTX: usize = 32;
@@ -44,7 +44,7 @@ impl fmt::Display for ParameterError {
         write!(f, "{self:?}")
     }
 }
-impl std::error::Error for ParameterError {}
+impl error::Error for ParameterError {}
 
 /// Finite per-APDU policy exhausted before the next operation is admitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,8 +112,8 @@ impl<E: fmt::Debug> fmt::Display for Error<E> {
         write!(f, "{self:?}")
     }
 }
-impl<E: std::error::Error + 'static> std::error::Error for Error<E> {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl<E: error::Error + 'static> error::Error for Error<E> {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match &self.cause {
             Cause::Preparation(error) | Cause::Transport(error) => Some(error),
             _ => None,
@@ -168,7 +168,7 @@ impl Session {
             state: State::Active(0),
             maximum_frame_bytes: usize::from(size.min(64)) - 2,
             maximum_receive_bytes: usize::from(receive_size.min(64)) - 2,
-            maximum_application_bytes: card_buffer.unwrap_or(MAX_APDU).min(MAX_APDU),
+            maximum_application_bytes: card_buffer.unwrap_or(MAX_APDU_BYTES).min(MAX_APDU_BYTES),
             cid,
             wait,
         })
@@ -397,7 +397,8 @@ impl PreparedExchange<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::VecDeque, io};
+    use alloc::{boxed::Box, collections::VecDeque, vec};
+    use std::io;
 
     fn session(size: u16, cid: Option<u8>) -> Result<Session, ParameterError> {
         Session::new(size, 64, cid, block_frame_wait(4), None)
@@ -661,7 +662,7 @@ mod tests {
         }
         let mut link = session(16, None)?;
         let error = link
-            .prepare::<io::Error>(&vec![0; MAX_APDU])
+            .prepare::<io::Error>(&vec![0; MAX_APDU_BYTES])
             .err()
             .ok_or("expected admission failure")?;
         assert!(matches!(error.cause, Cause::Budget(Budget::Frames)));

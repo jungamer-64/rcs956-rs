@@ -2,9 +2,8 @@
 //!
 //! Parsing begins after the reader's target number. UID bytes remain in wire
 //! order, and ATS retains its own inclusive length byte without RF CRC bytes.
-#![forbid(unsafe_code)]
-
-use std::{fmt, time::Duration};
+use alloc::vec::Vec;
+use core::{fmt, time::Duration};
 
 /// Invalid NFC-A selection data or unsupported ISO-DEP timing parameters.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,7 +40,7 @@ impl fmt::Display for Error {
         write!(f, "{self:?}")
     }
 }
-impl std::error::Error for Error {}
+impl core::error::Error for Error {}
 
 /// A complete ATS with checked interface-byte boundaries and timing fields.
 ///

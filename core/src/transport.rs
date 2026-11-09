@@ -1,23 +1,29 @@
 //! Exclusive command transactions over a bounded byte transport.
-#![forbid(unsafe_code)]
 
 use crate::wire::{self, Direction, Frame, FrameError};
-use std::{
-    fmt, io, thread,
-    time::{Duration, Instant},
-};
+use alloc::vec::Vec;
+use core::{error, fmt, time::Duration};
 
 /// Backend transfer contract. Reads return initialized bytes only; each operation
 /// must finish or cancel and reap its I/O before returning. A write error may have
 /// sent bytes, so callers must not assume that an error means zero device effects.
 pub trait Transport: fmt::Debug {
+    /// Backend failure, preserved in transaction errors.
+    type Error: error::Error;
+
+    /// Elapsed time since a fixed epoch for this transport. Values must be
+    /// nondecreasing and account for transfers and waits.
+    fn monotonic_time(&self) -> Duration;
+    /// Block for at least the requested duration, including reader settle times.
+    fn wait(&mut self, duration: Duration);
     /// Send one frame, including USB ZLP termination when needed.
-    fn write(&mut self, frame: &[u8], timeout: Duration) -> io::Result<usize>;
+    fn write(&mut self, frame: &[u8], timeout: Duration) -> Result<usize, Self::Error>;
     /// Receive at most `buffer.len()` bytes within the backend's timeout policy.
-    fn read(&mut self, buffer: &mut [u8], timeout: Duration) -> io::Result<usize>;
+    /// Returning zero bytes ends the transaction with [`Failure::Deadline`].
+    fn read(&mut self, buffer: &mut [u8], timeout: Duration) -> Result<usize, Self::Error>;
     /// Clear transport stalls and cached bytes. This does not cancel a reader
     /// firmware command or establish whether a prior card operation executed.
-    fn recover(&mut self) -> io::Result<()>;
+    fn recover(&mut self) -> Result<(), Self::Error>;
 }
 
 /// Last externally visible phase reached by a failed transaction.
@@ -35,11 +41,11 @@ pub enum Progress {
 
 /// Machine-readable failure independent of display text.
 #[derive(Debug)]
-pub enum Failure {
+pub enum Failure<E> {
     /// Host validation or reader frame validation failed.
     Frame(FrameError),
     /// OS/device transport failure.
-    Io(io::Error),
+    Io(E),
     /// A prior failed transaction requires explicit recovery.
     RecoveryRequired,
     /// Finite host deadline expired.
@@ -50,6 +56,13 @@ pub enum Failure {
         requested: usize,
         /// Confirmed bytes.
         transferred: usize,
+    },
+    /// The backend reported more bytes than the supplied buffer could hold.
+    ReceiveLength {
+        /// Available buffer bytes.
+        capacity: usize,
+        /// Reported bytes.
+        reported: usize,
     },
     /// Reader returned NAK instead of ACK.
     Nak,
@@ -71,18 +84,26 @@ pub enum Failure {
 /// Transaction failure plus progress. Any value other than `NotSent` may carry
 /// device effects, even if ACK was not seen.
 #[derive(Debug)]
-pub struct TransactionError {
+pub struct TransactionError<E> {
     /// Phase reached before failure.
     pub progress: Progress,
     /// Specific reason for failure.
-    pub failure: Failure,
+    pub failure: Failure<E>,
 }
-impl fmt::Display for TransactionError {
+impl<E: fmt::Debug> fmt::Display for TransactionError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "transaction {:?}: {:?}", self.progress, self.failure)
     }
 }
-impl std::error::Error for TransactionError {}
+impl<E: error::Error + 'static> error::Error for TransactionError<E> {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match &self.failure {
+            Failure::Frame(error) => Some(error),
+            Failure::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// Owned command response, with the direction and response command removed.
 #[derive(Debug, PartialEq, Eq)]
@@ -107,6 +128,19 @@ enum StreamState {
     ResetCommitPending,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Deadline(Duration);
+
+impl Deadline {
+    fn after(now: Duration, timeout: Duration) -> Option<Self> {
+        now.checked_add(timeout).map(Self)
+    }
+
+    fn remaining(self, now: Duration) -> Option<Duration> {
+        self.0.checked_sub(now).filter(|wait| !wait.is_zero())
+    }
+}
+
 impl<T: Transport> Link<T> {
     /// Take ownership of a newly opened transport without sending data.
     pub fn new(transport: T) -> Self {
@@ -122,7 +156,7 @@ impl<T: Transport> Link<T> {
         command: u8,
         args: &[u8],
         timeout: Duration,
-    ) -> Result<Response, TransactionError> {
+    ) -> Result<Response, TransactionError<T::Error>> {
         if self.state != StreamState::Ready
             && !(self.state == StreamState::NeedsReset && command == 0x18 && args == [1])
         {
@@ -145,19 +179,18 @@ impl<T: Transport> Link<T> {
             progress: Progress::NotSent,
             failure: Failure::UnexpectedFrame,
         })?;
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .ok_or(TransactionError {
+        let deadline =
+            Deadline::after(self.transport.monotonic_time(), timeout).ok_or(TransactionError {
                 progress: Progress::NotSent,
                 failure: Failure::Deadline,
             })?;
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|d| !d.is_zero())
-            .ok_or(TransactionError {
-                progress: Progress::NotSent,
-                failure: Failure::Deadline,
-            })?;
+        let remaining =
+            deadline
+                .remaining(self.transport.monotonic_time())
+                .ok_or(TransactionError {
+                    progress: Progress::NotSent,
+                    failure: Failure::Deadline,
+                })?;
         // Set the failure state before starting the first externally visible effect.
         self.state = StreamState::RecoveryRequired;
         let sent = self
@@ -176,10 +209,10 @@ impl<T: Transport> Link<T> {
                 },
             });
         }
-        thread::sleep(Duration::from_millis(2));
-        let ack_deadline = Instant::now()
-            .checked_add(Duration::from_millis(20))
-            .map_or(deadline, |a| a.min(deadline));
+        self.wait(Duration::from_millis(2));
+        let ack_deadline =
+            Deadline::after(self.transport.monotonic_time(), Duration::from_millis(20))
+                .map_or(deadline, |ack| ack.min(deadline));
         let mut pending = Vec::with_capacity(600);
         let mut progress = Progress::Sent;
         loop {
@@ -246,7 +279,7 @@ impl<T: Transport> Link<T> {
 
     /// Send a host ACK without expecting another ACK. A reset response must be
     /// committed with this ACK; the link waits 10ms before admitting commands.
-    pub fn host_ack(&mut self, timeout: Duration) -> Result<(), TransactionError> {
+    pub fn host_ack(&mut self, timeout: Duration) -> Result<(), TransactionError<T::Error>> {
         if !matches!(
             self.state,
             StreamState::Ready | StreamState::ResetCommitPending
@@ -265,13 +298,13 @@ impl<T: Transport> Link<T> {
         let reset_commit = self.state == StreamState::ResetCommitPending;
         self.send_host_ack(timeout)?;
         if reset_commit {
-            thread::sleep(Duration::from_millis(10));
+            self.wait(Duration::from_millis(10));
         }
         self.state = StreamState::Ready;
         Ok(())
     }
 
-    fn send_host_ack(&mut self, timeout: Duration) -> Result<(), TransactionError> {
+    fn send_host_ack(&mut self, timeout: Duration) -> Result<(), TransactionError<T::Error>> {
         self.state = StreamState::RecoveryRequired;
         let n = self
             .transport
@@ -297,14 +330,14 @@ impl<T: Transport> Link<T> {
     /// uncertain preceding reset commit. Only reset (`18 01`) is
     /// admitted afterwards, followed by its response and committed host ACK.
     /// This never determines whether a preceding card operation executed.
-    pub fn recover(&mut self) -> Result<(), TransactionError> {
+    pub fn recover(&mut self) -> Result<(), TransactionError<T::Error>> {
         self.state = StreamState::RecoveryRequired;
         self.transport.recover().map_err(|e| TransactionError {
             progress: Progress::NotSent,
             failure: Failure::Io(e),
         })?;
         self.send_host_ack(Duration::from_secs(1))?;
-        thread::sleep(Duration::from_millis(10));
+        self.wait(Duration::from_millis(10));
         self.transport.recover().map_err(|e| TransactionError {
             progress: Progress::Sent,
             failure: Failure::Io(e),
@@ -312,13 +345,17 @@ impl<T: Transport> Link<T> {
         self.state = StreamState::NeedsReset;
         Ok(())
     }
+
+    pub(crate) fn wait(&mut self, duration: Duration) {
+        self.transport.wait(duration);
+    }
 }
 
 fn next_frame<T: Transport>(
     transport: &mut T,
     pending: &mut Vec<u8>,
-    deadline: Instant,
-) -> Result<Vec<u8>, Failure> {
+    deadline: Deadline,
+) -> Result<Vec<u8>, Failure<T::Error>> {
     loop {
         if let Some(length) = wire::frame_length(pending).map_err(Failure::Frame)?
             && pending.len() >= length
@@ -326,8 +363,7 @@ fn next_frame<T: Transport>(
             return Ok(pending.drain(..length).collect());
         }
         let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|d| !d.is_zero())
+            .remaining(transport.monotonic_time())
             .ok_or(Failure::Deadline)?;
         let mut buffer = [0u8; 300];
         let n = transport
@@ -336,11 +372,9 @@ fn next_frame<T: Transport>(
         if n == 0 {
             return Err(Failure::Deadline);
         }
-        let bytes = buffer.get(..n).ok_or_else(|| {
-            Failure::Io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "backend exceeded receive capacity",
-            ))
+        let bytes = buffer.get(..n).ok_or(Failure::ReceiveLength {
+            capacity: buffer.len(),
+            reported: n,
         })?;
         if pending.len() + n > 600 {
             return Err(Failure::TrailingData);

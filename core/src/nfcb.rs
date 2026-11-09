@@ -2,9 +2,8 @@
 //!
 //! Parsing begins after the target number and requires the 12-byte ATQB without
 //! CRC, followed by the ATTRIB response length and complete ATTRIB response.
-#![forbid(unsafe_code)]
-
-use std::{fmt, time::Duration};
+use alloc::vec::Vec;
+use core::{fmt, time::Duration};
 
 /// Invalid NFC-B activation data or unsupported standard-frame parameters.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,7 +42,7 @@ impl fmt::Display for Error {
         write!(f, "{self:?}")
     }
 }
-impl std::error::Error for Error {}
+impl core::error::Error for Error {}
 
 /// Complete ATQB and ATTRIB data for one selected NFC-B target.
 ///

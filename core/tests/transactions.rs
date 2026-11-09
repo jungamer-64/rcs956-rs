@@ -1,6 +1,6 @@
 //! Scripted transport behavior tests through the production transaction API.
 
-use rcs956::{
+use rcs956_core::{
     transport::{Failure, Link, Progress, TransactionError, Transport},
     wire,
 };
@@ -15,6 +15,7 @@ const RESET_RESPONSE: [u8; 9] = [0, 0, 0xff, 2, 0xfe, 0xd5, 0x19, 0x12, 0];
 enum Read {
     Bytes(Vec<u8>),
     Error(io::ErrorKind),
+    OversizedLength,
 }
 
 #[derive(Debug)]
@@ -27,8 +28,9 @@ enum Write {
 #[derive(Debug, Default)]
 struct Journal {
     writes: Vec<Vec<u8>>,
-    reads: usize,
+    read_timeouts: Vec<Duration>,
     recoveries: usize,
+    elapsed: Duration,
 }
 
 #[derive(Debug)]
@@ -55,6 +57,16 @@ impl Script {
 }
 
 impl Transport for Script {
+    type Error = io::Error;
+
+    fn monotonic_time(&self) -> Duration {
+        self.journal.borrow().elapsed
+    }
+
+    fn wait(&mut self, duration: Duration) {
+        self.journal.borrow_mut().elapsed += duration;
+    }
+
     fn write(&mut self, frame: &[u8], timeout: Duration) -> io::Result<usize> {
         assert!(!timeout.is_zero(), "expired request reached the backend");
         self.journal.borrow_mut().writes.push(frame.to_vec());
@@ -67,7 +79,7 @@ impl Transport for Script {
 
     fn read(&mut self, buffer: &mut [u8], timeout: Duration) -> io::Result<usize> {
         assert!(!timeout.is_zero(), "expired read reached the backend");
-        self.journal.borrow_mut().reads += 1;
+        self.journal.borrow_mut().read_timeouts.push(timeout);
         match self.reads.pop_front() {
             Some(Read::Bytes(bytes)) => {
                 let capacity = buffer.len();
@@ -81,6 +93,7 @@ impl Transport for Script {
                 Ok(bytes.len())
             }
             Some(Read::Error(kind)) => Err(io::Error::new(kind, "scripted read failure")),
+            Some(Read::OversizedLength) => Ok(buffer.len() + 1),
             None => Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "unexpected backend read",
@@ -109,7 +122,7 @@ fn coalesced_ack_response_completes_one_transaction() -> Result<(), Box<dyn Erro
     assert_eq!(response.command, 3);
     assert_eq!(response.data, [0x32, 1, 6, 7]);
     assert_eq!(journal.borrow().writes, [FIRMWARE_REQUEST.to_vec()]);
-    assert_eq!(journal.borrow().reads, 1);
+    assert_eq!(journal.borrow().read_timeouts.len(), 1);
     Ok(())
 }
 
@@ -122,7 +135,10 @@ fn fragmented_ack_and_response_preserve_buffered_bytes() -> Result<(), Box<dyn E
     ]);
     let mut link = Link::new(script);
     assert_eq!(link.command(2, &[], TIMEOUT)?.data, [0x32, 1, 6, 7]);
-    assert_eq!(journal.borrow().reads, 3);
+    assert_eq!(
+        journal.borrow().read_timeouts,
+        [20, 20, 998].map(Duration::from_millis)
+    );
     assert_eq!(journal.borrow().writes.len(), 1);
     Ok(())
 }
@@ -327,9 +343,9 @@ fn reset_commit_waits_before_admitting_the_next_command() -> Result<(), Box<dyn 
             ..
         })
     ));
-    let start = std::time::Instant::now();
+    let start = journal.borrow().elapsed;
     link.host_ack(TIMEOUT)?;
-    assert!(start.elapsed() >= Duration::from_millis(10));
+    assert!(journal.borrow().elapsed >= start + Duration::from_millis(10));
     link.command(2, &[], TIMEOUT)?;
     assert_eq!(journal.borrow().writes.len(), 3);
     Ok(())
@@ -403,7 +419,7 @@ fn short_write_and_write_error_preserve_uncertain_send_progress() {
             })
         ));
         assert_eq!(journal.borrow().writes.len(), 1);
-        assert_eq!(journal.borrow().reads, 0);
+        assert!(journal.borrow().read_timeouts.is_empty());
         assert!(matches!(
             link.command(2, &[], TIMEOUT),
             Err(TransactionError {
@@ -463,7 +479,7 @@ fn host_ack_is_an_out_only_operation() -> Result<(), Box<dyn Error>> {
     let (script, journal) = Script::new([Read::Bytes(acknowledged_response())]);
     let mut link = Link::new(script);
     link.host_ack(TIMEOUT)?;
-    assert_eq!(journal.borrow().reads, 0);
+    assert!(journal.borrow().read_timeouts.is_empty());
     assert_eq!(journal.borrow().writes, [wire::ACK.to_vec()]);
     assert_eq!(link.command(2, &[], TIMEOUT)?.command, 3);
     Ok(())
@@ -505,4 +521,33 @@ fn zero_duration_never_starts_a_device_effect() {
         })
     ));
     assert!(journal.borrow().writes.is_empty());
+}
+
+#[test]
+fn deadline_expiry_after_the_send_gap_preserves_sent_progress() {
+    let (script, journal) = Script::new([]);
+    let mut link = Link::new(script);
+    assert!(matches!(
+        link.command(2, &[], Duration::from_millis(2)),
+        Err(TransactionError {
+            progress: Progress::Sent,
+            failure: Failure::Deadline
+        })
+    ));
+    assert_eq!(journal.borrow().writes, [FIRMWARE_REQUEST]);
+    assert!(journal.borrow().read_timeouts.is_empty());
+}
+
+#[test]
+fn read_count_beyond_capacity_is_a_backend_contract_failure() {
+    let (script, journal) = Script::new([Read::OversizedLength]);
+    let mut link = Link::new(script);
+    assert!(matches!(
+        link.command(2, &[], TIMEOUT),
+        Err(TransactionError {
+            progress: Progress::Sent,
+            failure: Failure::ReceiveLength { capacity, reported }
+        }) if reported == capacity + 1
+    ));
+    assert_eq!(journal.borrow().writes, [FIRMWARE_REQUEST]);
 }

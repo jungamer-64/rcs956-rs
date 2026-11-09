@@ -1,6 +1,6 @@
 //! Static known-answer fixtures. These verify codec behavior, not USB/RF conformance.
 
-use rcs956::wire::{self, Direction, Frame, FrameError};
+use rcs956_core::wire::{self, Direction, Frame, FrameError};
 use serde_json::Value;
 use std::{error::Error, io};
 

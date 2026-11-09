@@ -1,8 +1,13 @@
 # Build and device validation
 
-`Cargo.toml`がcrate構成、`Cargo.lock`が解決済み依存、`verify.ps1`がWindows上の正規検証手順を所有する。
+`Cargo.toml`がworkspace構成、`Cargo.lock`が解決済み依存、`verify.ps1`がWindows上の正規検証手順を所有する。
+
+`rcs956-core`はフレーム、取引状態、RF設定、カードプロトコルを所有する。`no_std`と`alloc`で動作し、crate全体で`unsafe_code`を禁止する。Rustからは`rcs956_core::reader::Reader`などを使用する。coreが定義する`Transport`へ同期転送、pipe回復、単調時計、待機を委譲し、期限・待機時間とエラー時の状態遷移はcoreで決める。`rcs956`は`rcs956::windows::WinUsb`とCLIを提供する。
+
+正規検証にはcoreのベアメタル向けコンパイルに使うRust targetが必要。
 
 ```powershell
+rustup target add x86_64-unknown-none
 cargo build --locked
 .\verify.ps1
 cargo run --locked -- devices
@@ -47,13 +52,13 @@ FeliCaのRF待機には`A0`のhalf-ms fieldと`1C`のreader timerを両方設定
 
 ## 検証境界
 
-`verify.ps1`はcodec、command順序／失敗時progress、設定imageとcard packetの検査、および公開APIを確認する。固定packet vectorは実機captureではない。 registry取得のtestは隔離したvolatile HKCU keyを作成し、取得・型・アクセスエラーを実際のWindows APIで確認して終了時に削除する。deviceの登録やbindingには書き込まない。
+`verify.ps1`は両crateのテスト・lint・公開APIと、coreの`no_std`ビルドを確認する。固定packet vectorは実機captureではない。registry取得のtestは隔離したvolatile HKCU keyを作成し、取得・型・アクセスエラーを実際のWindows APIで確認して終了時に削除する。deviceの登録やbindingには書き込まない。
 
 実機検証では、`devices`による対象／service／path、`probe`のfirmware／model／設定checksum、`poll`のidentity／PMm、対象serviceを指定した`read`を別々に記録する。CLI出力はAPIの観測結果であり、USB bus上のZLPやRF timingのcaptureとは区別する。全firmware、PC/SC完全互換、全カードcommand／APDUの意味と副作用の成立は、この検証の対象に含めない。NFC-A／Bの固定vectorはカード実機の成功証拠ではない。
 
 ## 外部実装へ委譲する責務
 
-Windows ABIの宣言とlinkはMicrosoftの`windows-sys`へ委譲し、handle lifetime・buffer境界・protocol状態はこのcrateが所有する。runtimeの外部依存はそのABI projectionと`windows-link`。native codeの独自buildやFFI宣言の複製は行わない。
+Windows ABIの宣言とlinkはMicrosoftの`windows-sys`へ委譲し、`rcs956`がhandle lifetimeとFFI buffer境界を所有する。hostのruntimeの外部依存はそのABI projectionと`windows-link`。native codeの独自buildやFFI宣言の複製は行わない。
 
 `serde_json`は固定fixtureの読取にだけ使うdev dependencyで、通常のlibrary／CLIへ入れない。JSON parserとそのformatter／string処理の依存、およびCargo targetに基づくbuild scriptはtest buildのtrust surfaceとして扱う。driverやPDFのsample codeを同梱・portする依存ではない。
 

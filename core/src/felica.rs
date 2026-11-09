@@ -4,9 +4,11 @@
 //! Service and block numbers are encoded little-endian; polling system codes are
 //! encoded big-endian.
 
-#![forbid(unsafe_code)]
-
+use alloc::vec::Vec;
 use core::fmt;
+
+/// Maximum blocks in one supported Read Without Encryption command.
+pub const MAX_READ_BLOCKS: usize = 12;
 
 /// Eight-byte card identity returned by the selected system's polling response.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -90,7 +92,9 @@ impl fmt::Display for CardError {
             Self::ResponseCode { expected, actual } => {
                 write!(f, "card response {actual:02X}, expected {expected:02X}")
             }
-            Self::BlockCount(count) => write!(f, "block count {count} is outside 1..=12"),
+            Self::BlockCount(count) => {
+                write!(f, "block count {count} is outside 1..={MAX_READ_BLOCKS}")
+            }
             Self::IdentityMismatch { expected, actual } => {
                 write!(f, "card identity {actual}, expected {expected}")
             }
@@ -102,7 +106,7 @@ impl fmt::Display for CardError {
     }
 }
 
-impl std::error::Error for CardError {}
+impl core::error::Error for CardError {}
 
 /// Validated six-byte polling command, including its FeliCa length byte.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -192,7 +196,7 @@ pub fn read_without_encryption(
     service_code: u16,
     blocks: &[u16],
 ) -> Result<Vec<u8>, CardError> {
-    if blocks.is_empty() || blocks.len() > 12 {
+    if !(1..=MAX_READ_BLOCKS).contains(&blocks.len()) {
         return Err(CardError::BlockCount(blocks.len()));
     }
     let mut packet = Vec::with_capacity(14 + blocks.len() * 3);
@@ -231,7 +235,7 @@ impl ReadResponse {
     /// Returns card status with both flags intact. Rejects another identity,
     /// malformed byte lengths and a block count different from the request.
     pub fn parse(input: &[u8], idm: Idm, expected_blocks: usize) -> Result<Self, CardError> {
-        if !(1..=12).contains(&expected_blocks) {
+        if !(1..=MAX_READ_BLOCKS).contains(&expected_blocks) {
             return Err(CardError::BlockCount(expected_blocks));
         }
         validate_packet(input, 0x07, 12)?;
@@ -313,6 +317,7 @@ fn validate_packet(input: &[u8], command: u8, minimum: usize) -> Result<(), Card
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     #[test]
     fn polling_known_answer() -> Result<(), CardError> {

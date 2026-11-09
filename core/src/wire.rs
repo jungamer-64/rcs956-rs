@@ -3,8 +3,7 @@
 //! A successful decode establishes frame integrity, not command completion.
 //! Transaction code must still match the response command to its request.
 
-#![forbid(unsafe_code)]
-
+use alloc::vec::Vec;
 use core::fmt;
 
 /// Largest frame accepted by this RC-S956 profile, including its envelope.
@@ -111,7 +110,7 @@ impl fmt::Display for FrameError {
     }
 }
 
-impl std::error::Error for FrameError {}
+impl core::error::Error for FrameError {}
 
 /// Encode a host command, choosing normal or extended format by payload length.
 ///
@@ -262,6 +261,7 @@ pub fn parse(input: &[u8], direction: Direction) -> Result<Frame<'_>, FrameError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     #[test]
     fn known_firmware_and_poll_commands() -> Result<(), FrameError> {

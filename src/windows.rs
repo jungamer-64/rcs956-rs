@@ -7,13 +7,14 @@ mod metadata;
 #[cfg(test)]
 mod registry_tests;
 
-use crate::transport::Transport;
+use rcs956_core::transport::Transport;
 use std::{
     fmt, io,
     mem::{offset_of, size_of},
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     ptr::{null, null_mut},
-    time::Duration,
+    thread,
+    time::{Duration, Instant},
 };
 use windows_sys::{
     Win32::{
@@ -357,6 +358,7 @@ pub struct WinUsb {
     file: OwnedHandle,
     input: u8,
     output: u8,
+    clock_origin: Instant,
 }
 impl fmt::Debug for WinUsb {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -400,6 +402,7 @@ impl WinUsb {
             file,
             input: 0,
             output: 0,
+            clock_origin: Instant::now(),
         };
         owner.configure()?;
         Ok(owner)
@@ -493,6 +496,16 @@ impl WinUsb {
     }
 }
 impl Transport for WinUsb {
+    type Error = io::Error;
+
+    fn monotonic_time(&self) -> Duration {
+        self.clock_origin.elapsed()
+    }
+
+    fn wait(&mut self, duration: Duration) {
+        thread::sleep(duration);
+    }
+
     fn write(&mut self, frame: &[u8], timeout: Duration) -> io::Result<usize> {
         self.timeout(self.output, timeout)?;
         let mut n = 0;
