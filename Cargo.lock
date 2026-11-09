@@ -36,8 +36,15 @@ dependencies = [
 name = "rcs956"
 version = "0.1.0"
 dependencies = [
- "serde_json",
+ "rcs956-core",
  "windows-sys",
+]
+
+[[package]]
+name = "rcs956-core"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
