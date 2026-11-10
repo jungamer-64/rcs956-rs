@@ -1979,6 +1979,76 @@ fn type_two_ndef_read_skips_reserved_bytes_in_the_message() -> Result<(), Box<dy
     Ok(())
 }
 
+fn type_two_before_sector_select() -> Vec<Step> {
+    let mut steps = initialization(&ab_config_image());
+    steps.extend(ab_mode(false));
+    let selection = &[1, 7, 4, 0, 0, 7, 1, 2, 3, 4, 5, 6, 7];
+    steps.extend([
+        command(0x4a, &[1, 0], selection),
+        command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
+        command(
+            0x40,
+            &[7, 0x30, 0],
+            &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xe1, 0x10, 127, 0],
+        ),
+    ]);
+    for address in (4..=248u8).step_by(4) {
+        steps.push(command(0x40, &[7, 0x30, address], &[0; 17]));
+    }
+    let mut last_window = [0; 17];
+    last_window[15..].copy_from_slice(&[3, 4]);
+    steps.extend([
+        command(0x40, &[7, 0x30, 252], &last_window),
+        command(0x40, &[7, 0xc2, 0xff], &[0, 0x0a]),
+    ]);
+    steps
+}
+
+#[test]
+fn type_two_ndef_switches_sectors_and_resets_the_field_before_reselection()
+-> Result<(), Box<dyn Error>> {
+    let mut steps = type_two_before_sector_select();
+    steps.extend([
+        command(0x40, &[7, 1, 0, 0, 0], &[1]),
+        command(
+            0x40,
+            &[7, 0x30, 0],
+            &[0, 0xd5, 0, 1, 0x42, 0xfe, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        ),
+        command(0x32, &[1, 0], &[]),
+    ]);
+    steps.extend(ab_mode(false));
+    steps.push(command(0x4a, &[1, 0], &[0]));
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut card = reader.poll_type_a(timeout()?)?.ok_or("Type 2 tag absent")?;
+    assert_eq!(card.read_type2_ndef()?, Some(vec![0xd5, 0, 1, 0x42]));
+    assert!(reader.poll_type_a(timeout()?)?.is_none());
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn type_two_ndef_revokes_selection_on_sector_select_nak() -> Result<(), Box<dyn Error>> {
+    let mut steps = type_two_before_sector_select();
+    steps.push(command(0x40, &[7, 1, 0, 0, 0], &[0, 0]));
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut card = reader.poll_type_a(timeout()?)?.ok_or("Type 2 tag absent")?;
+    assert!(matches!(
+        card.read_type2_ndef(),
+        Err(ndef::Error::Type2Nak(0))
+    ));
+    assert!(matches!(
+        card.read_type2_ndef(),
+        Err(ndef::Error::Exchange(TypeAExchangeError::SessionInvalid))
+    ));
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
 #[test]
 fn type_two_ndef_write_preserves_reserved_bytes_and_publishes_length_last()
 -> Result<(), Box<dyn Error>> {

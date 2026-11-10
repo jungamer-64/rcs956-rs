@@ -305,6 +305,7 @@ enum RfMode {
     Configured {
         protocol: RfProtocol,
         timer: ReaderTimer,
+        type2_sector: u8,
     },
     RawTypeA(RawTypeAResponse),
 }
@@ -424,7 +425,11 @@ impl<T: Transport> Reader<T> {
         if matches!(
             self.state,
             State::Ready {
-                rf: RfMode::RawTypeA(_),
+                rf: RfMode::RawTypeA(_)
+                    | RfMode::Configured {
+                        type2_sector: 1..,
+                        ..
+                    },
                 ..
             }
         ) {
@@ -437,6 +442,7 @@ impl<T: Transport> Reader<T> {
                     RfMode::Configured {
                         protocol: applied,
                         timer: old,
+                        ..
                     },
                 ..
             } if *applied == protocol && *old == timer => return Ok(()),
@@ -470,7 +476,11 @@ impl<T: Transport> Reader<T> {
         }
         self.state = State::Ready {
             info,
-            rf: RfMode::Configured { protocol, timer },
+            rf: RfMode::Configured {
+                protocol,
+                timer,
+                type2_sector: 0,
+            },
             response_timeout,
         };
         Ok(())
@@ -482,12 +492,13 @@ impl<T: Transport> Reader<T> {
         timeout: ResponseTimeout,
     ) -> Result<(), Error<T::Error>> {
         let desired_timer = ReaderTimer::for_rf_timeout(RfTimeout::new(timeout.wait())?);
-        let (info, applied_timer, applied_timeout) = match &self.state {
+        let (info, applied_timer, applied_timeout, type2_sector) = match &self.state {
             State::Ready {
                 rf:
                     RfMode::Configured {
                         protocol: applied_protocol,
                         timer,
+                        ..
                     },
                 response_timeout: Some(applied),
                 ..
@@ -503,9 +514,10 @@ impl<T: Transport> Reader<T> {
                     RfMode::Configured {
                         protocol: applied,
                         timer,
+                        type2_sector,
                     },
                 response_timeout,
-            } if *applied == protocol => (info.clone(), *timer, *response_timeout),
+            } if *applied == protocol => (info.clone(), *timer, *response_timeout, *type2_sector),
             _ => return Err(Error::NotInitialized),
         };
         // Do not publish a partial pair. Even if 32/02 succeeds, failure of 1C
@@ -522,6 +534,7 @@ impl<T: Transport> Reader<T> {
             rf: RfMode::Configured {
                 protocol,
                 timer: desired_timer,
+                type2_sector,
             },
             response_timeout: Some(timeout),
         };
@@ -646,6 +659,7 @@ impl<T: Transport> Reader<T> {
                     rf: RfMode::Configured {
                         protocol,
                         timer: ReaderTimer::for_rf_timeout(timeout),
+                        type2_sector: 0,
                     },
                     response_timeout,
                 };
@@ -855,6 +869,30 @@ pub struct TypeACard<'a, T: Transport> {
     timeout: RfTimeout,
 }
 impl<'a, T: Transport> TypeACard<'a, T> {
+    pub(crate) fn type2_sector(&self) -> u8 {
+        match self.reader.state {
+            State::Ready {
+                rf: RfMode::Configured { type2_sector, .. },
+                ..
+            } => type2_sector,
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn record_type2_sector(&mut self, selected: u8) {
+        if let State::Ready {
+            rf: RfMode::Configured { type2_sector, .. },
+            ..
+        } = &mut self.reader.state
+        {
+            *type2_sector = selected;
+        }
+    }
+
+    pub(crate) fn invalidate(&mut self) {
+        self.reader.state = State::NeedsInitialization;
+    }
+
     /// Validated activation data for this selection.
     pub fn observation(&self) -> &nfca::Observation {
         &self.observation

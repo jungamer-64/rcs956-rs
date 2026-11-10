@@ -1,6 +1,6 @@
 use super::{Error, UpdateStage, WriteError, control_range};
 use crate::{
-    reader::{TypeACard, TypeAExchangeError},
+    reader::{self, TypeACard, TypeAExchangeError},
     transport::Transport,
 };
 use alloc::{collections::BTreeMap, vec::Vec};
@@ -13,7 +13,7 @@ pub type Type2WriteError<E> = WriteError<TypeAExchangeError<E>>;
 pub type Type2Error<E> = Error<TypeAExchangeError<E>>;
 
 impl<T: Transport> TypeACard<'_, T> {
-    /// Read the NDEF message from a Type 2 tag's first physical sector.
+    /// Read the NDEF message across the tag's Type 2 memory sectors.
     /// Reserved bytes and dynamic lock bytes are skipped. An empty mapped
     /// message is returned as an empty vector. No write is performed.
     pub fn read_type2_ndef(&mut self) -> Result<Option<Vec<u8>>, Type2Error<T::Error>> {
@@ -29,7 +29,7 @@ impl<T: Transport> TypeACard<'_, T> {
     }
 
     /// Replace the first NDEF TLV in an initialized, publicly writable Type 2
-    /// mapping. Only addresses in sector zero are supported. The Terminator
+    /// mapping. The Terminator
     /// after the new message supersedes any TLVs that followed the old message.
     /// An empty slice clears the message.
     pub fn write_type2_ndef(&mut self, message: &[u8]) -> Result<(), Type2WriteError<T::Error>> {
@@ -61,17 +61,22 @@ struct Type2Data<'card, 'reader, T: Transport> {
 }
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
-struct Type2Page(u8);
+struct Type2Page(u16);
 
 impl Type2Page {
     fn containing<E>(address: usize) -> Result<Self, Error<E>> {
-        u8::try_from(address / 4)
+        u16::try_from(address / 4)
             .map(Self)
             .map_err(|_| Error::Address(address))
     }
 
     fn offset(self) -> usize {
         usize::from(self.0) * 4
+    }
+
+    fn wire_address(self) -> (u8, u8) {
+        let [sector, page] = self.0.to_be_bytes();
+        (sector, page)
     }
 }
 
@@ -288,7 +293,9 @@ impl<'card, 'reader, T: Transport> Type2Data<'card, 'reader, T> {
 
     fn write_page(&mut self, page: Type2Page, data: [u8; 4]) -> Result<(), Type2Error<T::Error>> {
         let [a, b, c, d] = data;
-        match type2_exchange(self.card, &[0xa2, page.0, a, b, c, d])?.as_slice() {
+        let (sector, address) = page.wire_address();
+        select_sector(self.card, sector)?;
+        match type2_exchange(self.card, &[0xa2, address, a, b, c, d])?.as_slice() {
             [0x0a] => Ok(()),
             [] => {
                 // A status-only completion carries no card ACK to inspect.
@@ -308,9 +315,44 @@ fn type2_read_window<T: Transport>(
     card: &mut TypeACard<'_, T>,
     page: Type2Page,
 ) -> Result<[u8; 16], Type2Error<T::Error>> {
-    type2_exchange(card, &[0x30, page.0])?
+    let (sector, address) = page.wire_address();
+    select_sector(card, sector)?;
+    type2_exchange(card, &[0x30, address])?
         .try_into()
         .map_err(|_| Error::Layout("Type 2 READ length"))
+}
+
+fn select_sector<T: Transport>(
+    card: &mut TypeACard<'_, T>,
+    sector: u8,
+) -> Result<(), Type2Error<T::Error>> {
+    if card.type2_sector() == sector {
+        return Ok(());
+    }
+    let selected = (|| {
+        match type2_exchange(card, &[0xc2, 0xff])?.as_slice() {
+            [0x0a] => {}
+            [nak @ (0 | 1 | 4 | 5)] => return Err(Error::Type2Nak(*nak)),
+            _ => return Err(Error::Layout("Type 2 SECTOR SELECT first response")),
+        }
+        // The second packet succeeds with a passive ACK. Only a reader RF
+        // timeout demonstrates silence; a lost USB response leaves it unknown.
+        match card.exchange(&[sector, 0, 0, 0]) {
+            Err(TypeAExchangeError::Exchange(reader::Error::RfStatus(1))) => Ok(()),
+            Ok(reply) if reply.status == 0 => match reply.data.as_slice() {
+                [nak @ (0 | 1 | 4 | 5)] => Err(Error::Type2Nak(*nak)),
+                _ => Err(Error::Layout("Type 2 SECTOR SELECT second response")),
+            },
+            Ok(reply) => Err(Error::Type2ReaderStatus(reply.status)),
+            Err(error) => Err(Error::Exchange(error)),
+        }
+    })();
+    if selected.is_ok() {
+        card.record_type2_sector(sector);
+    } else {
+        card.invalidate();
+    }
+    selected
 }
 
 fn type2_exchange<T: Transport>(
