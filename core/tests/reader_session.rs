@@ -3,7 +3,7 @@
 //! These model command/response contracts, not physical device operation.
 
 use rcs956_core::{
-    felica::{Idm, PollRequest},
+    felica::{BitRate, BlockWrite, CardError, Idm, PollRequest, ServiceEntry},
     isodep,
     reader::{
         ConfigurationError, Error as ReaderError, Reader, RfTimeout, TimeoutRange,
@@ -264,6 +264,122 @@ fn poll_response() -> Vec<u8> {
     packet
 }
 
+#[test]
+fn felica_424_selects_card_and_exchanges_discovery_and_write_packets() -> Result<(), Box<dyn Error>>
+{
+    let mut steps = initialization(&config_image());
+    steps.extend(mode_configuration());
+    steps.extend([
+        command(0x4a, &[1, 2, 0, 0x12, 0x34, 1, 0], &poll_response()),
+        command(
+            0xa0,
+            &[0xc8, 0, 10, 0x0c, 1, 2, 3, 4, 5, 6, 7, 8],
+            &[
+                0, 15, 0x0d, 1, 2, 3, 4, 5, 6, 7, 8, 2, 0x12, 0x34, 0x88, 0xb4,
+            ],
+        ),
+        command(
+            0xa0,
+            &[0xc8, 0, 12, 0x0a, 1, 2, 3, 4, 5, 6, 7, 8, 0x34, 0x12],
+            &[0, 14, 0x0b, 1, 2, 3, 4, 5, 6, 7, 8, 0x00, 0x10, 0xff, 0x10],
+        ),
+        command(
+            0xa0,
+            &[0xc8, 0, 12, 0x0a, 1, 2, 3, 4, 5, 6, 7, 8, 0x35, 0x12],
+            &[0, 12, 0x0b, 1, 2, 3, 4, 5, 6, 7, 8, 0xff, 0xff],
+        ),
+    ]);
+    let mut request = vec![
+        0xc8, 0, 33, 0x08, 1, 2, 3, 4, 5, 6, 7, 8, 1, 9, 0, 1, 0, 1, 1,
+    ];
+    request.extend([0x5a; 16]);
+    steps.extend([
+        command(
+            0xa0,
+            &request,
+            &[0, 12, 0x09, 1, 2, 3, 4, 5, 6, 7, 8, 1, 0xa2],
+        ),
+        command(0xa0, &request, &[0, 12, 0x09, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0]),
+    ]);
+    let (transport, journal) = Script::new(steps);
+    let mut reader = Reader::new(transport);
+    reader.initialize()?;
+    let mut card = reader
+        .poll_felica(BitRate::Kbps424, poll_request()?, timeout()?)?
+        .ok_or("card absent")?;
+    assert_eq!(card.request_system_codes()?, [0x1234, 0x88b4]);
+    assert_eq!(
+        card.search_service_code(0x1234)?,
+        Some(ServiceEntry::Area {
+            code: 0x1000,
+            end: 0x10ff
+        })
+    );
+    assert_eq!(card.search_service_code(0x1235)?, None);
+    let write = BlockWrite {
+        block: 257,
+        data: [0x5a; 16],
+    };
+    assert!(matches!(
+        card.write_without_encryption(9, &[write; 13]),
+        Err(ReaderError::Card(CardError::Length { .. }))
+    ));
+    assert!(matches!(
+        card.write_without_encryption(9, &[write]),
+        Err(ReaderError::Card(CardError::Status {
+            flag1: 1,
+            flag2: 0xa2
+        }))
+    ));
+    card.write_without_encryption(9, &[write])?;
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn raw_felica_uses_separate_profile_and_checks_packet_length_before_io()
+-> Result<(), Box<dyn Error>> {
+    let mut config = config_image();
+    config[0xcb..=0xce].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+    let mut steps = initialization(&config);
+    let poll = [6, 0, 0xff, 0xff, 0, 0];
+    let raw_response = [
+        0, 18, 1, 1, 2, 3, 4, 5, 6, 7, 8, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+    ];
+    steps.extend([
+        command(0x1c, &[0, 0, 0], &[]),
+        command(0x32, &[0x0b, 1, 0x11, 0x22, 0x33, 5, 6, 7, 0x44], &[]),
+        command(8, &[0x63, 0x0d, 8], &[0]),
+        command(0x32, &[0x80, 2], &[]),
+        command(0xa0, &[0xc8, 0, 6, 0, 0xff, 0xff, 0, 0], &raw_response),
+        command(0xa0, &[0xc8, 0, 6, 0, 0xff, 0xff, 0, 0], &[0, 5, 1]),
+    ]);
+    steps.extend(mode_configuration());
+    steps.push(command(0x4a, &[1, 1, 0, 0x12, 0x34, 1, 0], &[0]));
+    let (transport, journal) = Script::new(steps);
+    let mut reader = Reader::new(transport);
+    reader.initialize()?;
+    assert!(matches!(
+        reader.exchange_raw_felica(BitRate::Kbps424, &[3, 0], timeout()?),
+        Err(ReaderError::Card(CardError::Length { .. }))
+    ));
+    assert_eq!(
+        reader.exchange_raw_felica(BitRate::Kbps424, &poll, timeout()?)?,
+        raw_response[1..]
+    );
+    assert!(matches!(
+        reader.exchange_raw_felica(BitRate::Kbps424, &poll, timeout()?),
+        Err(ReaderError::Card(CardError::Length { .. }))
+    ));
+    assert!(
+        reader
+            .poll_felica(BitRate::Kbps212, poll_request()?, timeout()?)?
+            .is_none()
+    );
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
 fn timeout() -> Result<RfTimeout, TimeoutRange> {
     RfTimeout::new(Duration::from_millis(100))
 }
@@ -311,10 +427,14 @@ fn polling_read_and_rf_off_keep_identity_and_configuration_boundaries() -> Resul
     let (script, journal) = Script::new(steps);
     let mut reader = Reader::new(script);
     reader.initialize()?;
-    assert!(reader.poll_felica(poll_request()?, timeout()?)?.is_none());
+    assert!(
+        reader
+            .poll_felica(BitRate::Kbps212, poll_request()?, timeout()?)?
+            .is_none()
+    );
     {
         let mut card = reader
-            .poll_felica(poll_request()?, timeout()?)?
+            .poll_felica(BitRate::Kbps212, poll_request()?, timeout()?)?
             .ok_or("expected selected FeliCa card")?;
         assert_eq!(card.target(), 7);
         assert_eq!(card.observation().idm, Idm::new(IDENTITY));
@@ -326,7 +446,11 @@ fn polling_read_and_rf_off_keep_identity_and_configuration_boundaries() -> Resul
         );
     }
     reader.rf_off()?;
-    assert!(reader.poll_felica(poll_request()?, timeout()?)?.is_none());
+    assert!(
+        reader
+            .poll_felica(BitRate::Kbps212, poll_request()?, timeout()?)?
+            .is_none()
+    );
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
 }
@@ -353,7 +477,7 @@ fn partial_configuration_failure_keeps_reader_uninitialized() -> Result<(), Box<
     ));
     let sent = journal.borrow().requests.len();
     assert!(matches!(
-        reader.poll_felica(poll_request()?, timeout()?),
+        reader.poll_felica(BitRate::Kbps212, poll_request()?, timeout()?),
         Err(ReaderError::NotInitialized)
     ));
     assert!(matches!(reader.rf_off(), Err(ReaderError::NotInitialized)));
@@ -380,7 +504,7 @@ fn short_configuration_bank_is_rejected_without_publishing_readiness() -> Result
         Err(ReaderError::Response("configuration bank length"))
     ));
     assert!(matches!(
-        reader.poll_felica(poll_request()?, timeout()?),
+        reader.poll_felica(BitRate::Kbps212, poll_request()?, timeout()?),
         Err(ReaderError::NotInitialized)
     ));
     assert_eq!(journal.borrow().remaining, 0);
@@ -406,7 +530,7 @@ fn invalid_configuration_checksum_is_not_published() -> Result<(), Box<dyn Error
         }))
     ));
     assert!(matches!(
-        reader.poll_felica(poll_request()?, timeout()?),
+        reader.poll_felica(BitRate::Kbps212, poll_request()?, timeout()?),
         Err(ReaderError::NotInitialized)
     ));
     assert_eq!(journal.borrow().remaining, 0);
@@ -423,12 +547,12 @@ fn mode_register_failure_does_not_publish_a_configured_reader() -> Result<(), Bo
     let mut reader = Reader::new(script);
     reader.initialize()?;
     assert!(matches!(
-        reader.poll_felica(poll_request()?, timeout()?),
+        reader.poll_felica(BitRate::Kbps212, poll_request()?, timeout()?),
         Err(ReaderError::RegisterStatus(1))
     ));
     let sent = journal.borrow().requests.len();
     assert!(matches!(
-        reader.poll_felica(poll_request()?, timeout()?),
+        reader.poll_felica(BitRate::Kbps212, poll_request()?, timeout()?),
         Err(ReaderError::NotInitialized)
     ));
     assert_eq!(journal.borrow().requests.len(), sent);
@@ -456,7 +580,7 @@ fn recovery_rf_status_revokes_the_selected_cards_operation_authority() -> Result
     reader.initialize()?;
     {
         let mut card = reader
-            .poll_felica(poll_request()?, timeout()?)?
+            .poll_felica(BitRate::Kbps212, poll_request()?, timeout()?)?
             .ok_or("expected selected FeliCa card")?;
         assert!(matches!(
             card.read_without_encryption(0x1a8b, &[0]),
@@ -498,10 +622,15 @@ fn changing_rf_wait_updates_reader_timer_without_reapplying_mode() -> Result<(),
     let (script, journal) = Script::new(steps);
     let mut reader = Reader::new(script);
     reader.initialize()?;
-    assert!(reader.poll_felica(poll_request()?, timeout()?)?.is_none());
+    assert!(
+        reader
+            .poll_felica(BitRate::Kbps212, poll_request()?, timeout()?)?
+            .is_none()
+    );
     {
         let mut card = reader
             .poll_felica(
+                BitRate::Kbps212,
                 poll_request()?,
                 RfTimeout::new(Duration::from_millis(1500))?,
             )?
@@ -511,7 +640,11 @@ fn changing_rf_wait_updates_reader_timer_without_reapplying_mode() -> Result<(),
             &[[0x5a; 16]]
         );
     }
-    assert!(reader.poll_felica(poll_request()?, timeout()?)?.is_none());
+    assert!(
+        reader
+            .poll_felica(BitRate::Kbps212, poll_request()?, timeout()?)?
+            .is_none()
+    );
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
 }
@@ -528,9 +661,14 @@ fn failed_timer_change_revokes_preceding_mode() -> Result<(), Box<dyn Error>> {
     let (script, journal) = Script::new(steps);
     let mut reader = Reader::new(script);
     reader.initialize()?;
-    assert!(reader.poll_felica(poll_request()?, timeout()?)?.is_none());
+    assert!(
+        reader
+            .poll_felica(BitRate::Kbps212, poll_request()?, timeout()?)?
+            .is_none()
+    );
     assert!(matches!(
         reader.poll_felica(
+            BitRate::Kbps212,
             poll_request()?,
             RfTimeout::new(Duration::from_millis(1500))?
         ),
@@ -538,7 +676,7 @@ fn failed_timer_change_revokes_preceding_mode() -> Result<(), Box<dyn Error>> {
     ));
     let sent = journal.borrow().requests.len();
     assert!(matches!(
-        reader.poll_felica(poll_request()?, timeout()?),
+        reader.poll_felica(BitRate::Kbps212, poll_request()?, timeout()?),
         Err(ReaderError::NotInitialized)
     ));
     assert_eq!(journal.borrow().requests.len(), sent);
@@ -568,7 +706,7 @@ fn rf_error_0b_settles_before_a_following_exchange() -> Result<(), Box<dyn Error
     let mut reader = Reader::new(script);
     reader.initialize()?;
     let mut card = reader
-        .poll_felica(poll_request()?, timeout()?)?
+        .poll_felica(BitRate::Kbps212, poll_request()?, timeout()?)?
         .ok_or("expected card")?;
     assert!(matches!(
         card.read_without_encryption(0x1a8b, &[0]),
@@ -734,7 +872,11 @@ fn protocol_changes_reapply_rf_settings_and_absence_is_not_activation() -> Resul
     reader.initialize()?;
     assert!(reader.poll_type_a(timeout()?)?.is_none());
     assert!(reader.poll_type_b(timeout()?)?.is_none());
-    assert!(reader.poll_felica(poll_request()?, timeout()?)?.is_none());
+    assert!(
+        reader
+            .poll_felica(BitRate::Kbps212, poll_request()?, timeout()?)?
+            .is_none()
+    );
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
 }

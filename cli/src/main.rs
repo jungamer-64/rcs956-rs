@@ -6,7 +6,7 @@ use rcs956::windows::WinUsb;
 #[cfg(windows)]
 use rcs956_core::reader::Reader;
 use rcs956_core::{
-    felica::{MAX_READ_BLOCKS, PollRequest},
+    felica::{BitRate, BlockWrite, MAX_READ_BLOCKS, MAX_WRITE_BLOCKS, PollRequest},
     isodep::MAX_APDU_BYTES,
     reader::{MAX_TYPE_A_COMMAND_BYTES, RfTimeout},
     wire,
@@ -24,7 +24,7 @@ fn main() -> std::process::ExitCode {
 }
 fn help() {
     println!(
-        "rcs956 devices\nrcs956 probe [--path DEVICE_INTERFACE]\nrcs956 poll [--type felica|a|b] [--timeout-ms 500] [--path PATH]\nrcs956 poll --type felica [--system FFFF] [--request 1] [--slots 0]\nrcs956 read --service HEX --blocks DECIMAL[,DECIMAL...] [FeliCa poll options]\nrcs956 exchange --type a|b --data HEX [--timeout-ms 500] [--path PATH]\nrcs956 sequence --type a|b --data HEX --data HEX [...] [--timeout-ms 500] [--path PATH]\nrcs956 decode READER_FRAME_HEX\n\nHardware commands require an existing WinUSB binding. exchange sends one caller-supplied card command (A) or ISO-DEP APDU (B); sequence sends each supplied command in order within one card selection. Their effects belong to the caller. No automatic application-command replay."
+        "rcs956 devices\nrcs956 probe [--path DEVICE_INTERFACE]\nrcs956 poll [--type felica|a|b] [--timeout-ms 500] [--path PATH]\nFeliCa poll options: [--rate 212|424] [--system FFFF] [--request 1] [--slots 0]\nrcs956 read --service HEX --blocks DECIMAL[,DECIMAL...] [FeliCa poll options]\nrcs956 write --service HEX --block-data DECIMAL:HEX [--block-data DECIMAL:HEX ...] [FeliCa poll options]\nrcs956 systems [FeliCa poll options]\nrcs956 service-at --index DECIMAL [FeliCa poll options]\nrcs956 raw-felica --data LENGTH_PREFIXED_HEX [--data LENGTH_PREFIXED_HEX ...] [--rate 212|424]\nrcs956 exchange --type a|b --data HEX [--timeout-ms 500] [--path PATH]\nrcs956 sequence --type a|b --data HEX --data HEX [...] [--timeout-ms 500] [--path PATH]\nrcs956 decode READER_FRAME_HEX\n\nHardware commands require an existing WinUSB binding. exchange sends one caller-supplied card command (A) or ISO-DEP APDU (B); sequence sends each supplied command in order within one card selection. Their effects belong to the caller. No automatic application-command replay."
     );
 }
 fn run() -> Result<(), Box<dyn Error>> {
@@ -51,7 +51,15 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     if !matches!(
         command.as_str(),
-        "probe" | "poll" | "read" | "exchange" | "sequence"
+        "probe"
+            | "poll"
+            | "read"
+            | "write"
+            | "systems"
+            | "service-at"
+            | "raw-felica"
+            | "exchange"
+            | "sequence"
     ) {
         return Err(format!("unknown command: {command}").into());
     }
@@ -62,6 +70,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut timeout = 500u64;
     let mut service = None;
     let mut blocks = None;
+    let mut writes = Vec::new();
+    let mut index = None;
+    let mut rate = None;
     let mut technology = Technology::Felica;
     let mut data: Vec<Vec<u8>> = Vec::new();
     let mut felica_options = false;
@@ -84,6 +95,25 @@ fn run() -> Result<(), Box<dyn Error>> {
                 felica_options = true;
             }
             "--type" => technology = Technology::parse(&value)?,
+            "--rate" => {
+                rate = Some(match value.as_str() {
+                    "212" => BitRate::Kbps212,
+                    "424" => BitRate::Kbps424,
+                    _ => return Err("--rate must be 212 or 424".into()),
+                })
+            }
+            "--index" => index = Some(value.parse::<u16>()?),
+            "--block-data" => {
+                let (block, bytes) = value
+                    .split_once(':')
+                    .ok_or("--block-data requires DECIMAL:HEX")?;
+                writes.push(BlockWrite {
+                    block: block.parse()?,
+                    data: hex_bytes(bytes)?
+                        .try_into()
+                        .map_err(|_| "--block-data requires 16 data bytes")?,
+                });
+            }
             "--data" => data.push(hex_bytes(&value)?),
             "--timeout-ms" => timeout = value.parse()?,
             "--service" => service = Some(hex_u16(&value)?),
@@ -107,11 +137,35 @@ fn run() -> Result<(), Box<dyn Error>> {
     {
         return Err(format!("read requires 1..{MAX_READ_BLOCKS} block numbers").into());
     }
-    if command != "read" && (service.is_some() || blocks.is_some()) {
-        return Err("--service/--blocks require read".into());
+    if (service.is_some() && !matches!(command.as_str(), "read" | "write"))
+        || (blocks.is_some() && command != "read")
+        || (!writes.is_empty() && command != "write")
+        || (index.is_some() && command != "service-at")
+    {
+        return Err("unexpected FeliCa operation option".into());
     }
-    if technology != Technology::Felica && (felica_options || command == "read") {
-        return Err("--system/--request/--slots and read require --type felica".into());
+    if command == "write" && (service.is_none() || !(1..=MAX_WRITE_BLOCKS).contains(&writes.len()))
+    {
+        return Err(format!(
+            "write requires --service and 1..={MAX_WRITE_BLOCKS} --block-data options"
+        )
+        .into());
+    }
+    if command == "service-at" && index.is_none() {
+        return Err("service-at requires --index".into());
+    }
+    if technology != Technology::Felica
+        && (felica_options
+            || rate.is_some()
+            || matches!(
+                command.as_str(),
+                "read" | "write" | "systems" | "service-at" | "raw-felica"
+            ))
+    {
+        return Err("FeliCa options and commands require --type felica".into());
+    }
+    if felica_options && command == "raw-felica" {
+        return Err("raw-felica takes the full packet in --data".into());
     }
     validate_data_options(&command, technology, &data)?;
     let request = PollRequest::new(system, request, slots)?;
@@ -131,10 +185,38 @@ fn run() -> Result<(), Box<dyn Error>> {
         );
         let result = if command == "probe" {
             Ok(())
+        } else if command == "raw-felica" {
+            data.iter().try_for_each(|packet| {
+                let response = reader.exchange_raw_felica(
+                    rate.unwrap_or(BitRate::Kbps212),
+                    packet,
+                    timeout,
+                )?;
+                println!("Response: {}", hex(&response));
+                Ok(())
+            })
         } else {
             match technology {
                 Technology::Felica => {
-                    card_operation(&mut reader, request, timeout, service, blocks.as_deref())
+                    let operation = match (command.as_str(), service, blocks.as_deref(), index) {
+                        ("read", Some(service), Some(blocks), _) => {
+                            FelicaOperation::Read { service, blocks }
+                        }
+                        ("write", Some(service), _, _) => FelicaOperation::Write {
+                            service,
+                            blocks: &writes,
+                        },
+                        ("systems", _, _, _) => FelicaOperation::Systems,
+                        ("service-at", _, _, Some(index)) => FelicaOperation::ServiceAt(index),
+                        _ => FelicaOperation::Poll,
+                    };
+                    card_operation(
+                        &mut reader,
+                        rate.unwrap_or(BitRate::Kbps212),
+                        request,
+                        timeout,
+                        operation,
+                    )
                 }
                 Technology::TypeA => {
                     type_a_operation(&mut reader, timeout, &data, command == "sequence")
@@ -188,6 +270,17 @@ fn validate_data_options(
         }
         "sequence" if data.is_empty() => {
             return Err("sequence requires at least one --data".into());
+        }
+        "raw-felica" => {
+            if data.is_empty()
+                || data
+                    .iter()
+                    .any(|packet| packet.len() < 2 || usize::from(packet[0]) != packet.len())
+            {
+                return Err(
+                    "raw-felica requires one or more length-prefixed packets in --data".into(),
+                );
+            }
         }
         "exchange" | "sequence" => {
             for apdu in data {
@@ -277,14 +370,29 @@ fn type_b_operation(
 }
 
 #[cfg(windows)]
+enum FelicaOperation<'a> {
+    Poll,
+    Read {
+        service: u16,
+        blocks: &'a [u16],
+    },
+    Write {
+        service: u16,
+        blocks: &'a [BlockWrite],
+    },
+    Systems,
+    ServiceAt(u16),
+}
+
+#[cfg(windows)]
 fn card_operation(
     reader: &mut Reader<WinUsb>,
+    rate: BitRate,
     request: PollRequest,
     timeout: RfTimeout,
-    service: Option<u16>,
-    blocks: Option<&[u16]>,
+    operation: FelicaOperation<'_>,
 ) -> Result<(), Box<dyn Error>> {
-    let Some(mut card) = reader.poll_felica(request, timeout)? else {
+    let Some(mut card) = reader.poll_felica(rate, request, timeout)? else {
         println!("No card");
         return Ok(());
     };
@@ -298,11 +406,32 @@ fn card_operation(
     if let Some(data) = observation.request_data {
         println!("Polling request data: {}", hex(&data));
     }
-    if let (Some(service), Some(blocks)) = (service, blocks) {
-        let response = card.read_without_encryption(service, blocks)?;
-        for (block, data) in blocks.iter().zip(response.blocks()) {
-            println!("Block {block}: {}", hex(data));
+    match operation {
+        FelicaOperation::Poll => {}
+        FelicaOperation::Read { service, blocks } => {
+            let response = card.read_without_encryption(service, blocks)?;
+            for (block, data) in blocks.iter().zip(response.blocks()) {
+                println!("Block {block}: {}", hex(data));
+            }
         }
+        FelicaOperation::Write { service, blocks } => {
+            card.write_without_encryption(service, blocks)?;
+            println!("Written blocks: {}", blocks.len());
+        }
+        FelicaOperation::Systems => {
+            for code in card.request_system_codes()? {
+                println!("System: {code:04X}");
+            }
+        }
+        FelicaOperation::ServiceAt(index) => match card.search_service_code(index)? {
+            Some(rcs956_core::felica::ServiceEntry::Service(code)) => {
+                println!("Service: {code:04X}")
+            }
+            Some(rcs956_core::felica::ServiceEntry::Area { code, end }) => {
+                println!("Area: {code:04X}..={end:04X}")
+            }
+            None => println!("End of service list"),
+        },
     }
     Ok(())
 }

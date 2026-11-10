@@ -30,7 +30,7 @@ WinUSBでないserviceが列挙された場合、`devices`の結果で実際のb
 
 ## 設定とカードsession
 
-初期化はreset／host ACK、設定bank読取、checksum／model検査、register設定、RF offを順に行う。失敗した初期化を成功状態として公開しない。RF modeはprotocolと適用済みtimerを保持し、protocol変更時には対応する設定imageのtableを適用する。FeliCaは212 kbps、NFC-A／Bは106 kbpsで`4A`による1 targetの検出を行う。
+初期化はreset／host ACK、設定bank読取、checksum／model検査、register設定、RF offを順に行う。失敗した初期化を成功状態として公開しない。RF modeはprotocolと適用済みtimerを保持し、protocol変更時には対応する設定imageのtableを適用する。`4A`はFeliCaを212または424 kbps、NFC-A／Bを106 kbpsで1 target検出する。
 
 NFC-AはUID（4／7／10 bytes）、SAK、optional ATSのTLとinterface byte境界を検査する。カード交換は`40 target`で最大262 bytesを送り、成功したreader statusの上位bitsも保持する。別controllerのMI処理を仮定した自動継続は行わない。ATSがないカードの検出は、ISO-DEPのactivation成立と同一ではない。
 
@@ -46,7 +46,9 @@ APDUの入力と最低frame数を検査してからreader設定を始める。�
 
 カードhandleはreaderの排他的borrowを保持する。transport失敗後にはRF readinessが失効する。RF statusのmask後の値が0Dの場合も再初期化を要求する。0Bの場合はraw値を保持してエラーを返す前に10 msの待機を入れる。readerへの`initialize`は明示的な再同期であり、失敗したカード操作の再実行や結果照合ではない。`rf_off`の失敗はcallerが観測する。DropはOS resourceの解放だけを担当する。
 
-FeliCaのRF待機には`A0`のhalf-ms fieldと`1C`のreader timerを両方設定する。reader timerはRF待機を秒単位へ切り上げてから`(ms-10)/10`をLE16で送り、成功した設定だけをRF modeに保持する。同じ設定の再送は省略し、待機時間を変えた場合はカード交換より先に更新する。NFC-A／Bの`1C`は各protocolの応答設定に従い、`32/02`とは独立して保持する。
+選択済みFeliCaのRF待機には`A0`のhalf-ms fieldと`1C`のreader timerを設定する。reader timerはRF待機を秒単位へ切り上げてから`(ms-10)/10`をLE16で送り、成功した設定だけをRF modeに保持する。raw FeliCaはtable4を適用し、`1C`のtimerを無効にして`A0`の待機を使う。raw packetは送受信ともFeliCaの長さbyteを含み、カードの選択・アドレス解釈は呼出側が行う。
+
+`systems`と`service-at`はカードが公開するsystem codeと選択system内のservice／areaを照会する。`write`は指定した単一の非暗号化サービスに16 bytes単位で送信する。13ブロック以下でも、block listとデータの合計がpacket長上限を超える要求は拒否する。カード固有の書込み制限はカードが判定する。送信後のエラーでは書込み結果が不明な場合があり、自動再送や読戻しは行わない。認証・暗号化の処理を持つ呼出側は`FelicaCard::exchange_command`で選択済みIDm宛てにコマンドを交換できる。
 
 取引のACKと応答は、それぞれの期限より前に完了した読み取りのbytesだけを受理する。同期I/Oの回収に必要な時間はbackendの契約に従う。
 

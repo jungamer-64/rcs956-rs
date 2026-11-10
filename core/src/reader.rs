@@ -1,7 +1,9 @@
 //! Reader configuration and lifetime-bound NFC card access.
 
 use crate::{
-    felica::{self, CardError, PollRequest, PollResponse, ReadResponse},
+    felica::{
+        self, BitRate, BlockWrite, CardError, PollRequest, PollResponse, ReadResponse, ServiceEntry,
+    },
     isodep, nfca, nfcb,
     transport::{Link, TransactionError, Transport},
 };
@@ -188,6 +190,17 @@ impl ConfigImage {
                 item.extend_from_slice(&self.bytes[0x1b..=0x22]);
                 vec![item]
             }
+            RfProtocol::RawFelica(_) => vec![vec![
+                0x0b,
+                self.bytes[0x1b],
+                self.bytes[0xcb],
+                self.bytes[0xcc],
+                self.bytes[0xcd],
+                self.bytes[0x1f],
+                self.bytes[0x20],
+                self.bytes[0x21],
+                self.bytes[0xce],
+            ]],
             RfProtocol::TypeB => {
                 let mut analog = vec![
                     0x0a,
@@ -222,17 +235,25 @@ pub struct ReaderInfo {
 /// Parameter of the reader's 1C timer, derived only from a validated RF wait.
 /// This timer and the A0 half-ms field are different protocol representations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ReaderTimer(u16);
+enum ReaderTimer {
+    Off,
+    Timed(u16),
+}
 impl ReaderTimer {
     fn for_rf_timeout(timeout: RfTimeout) -> Self {
         // The accepted tick range is 1..=65535, so this conversion yields
         // 1..=33 whole seconds and a parameter in 99..=3299.
-        Self(timeout.ticks.div_ceil(2000) * 100 - 1)
+        Self::Timed(timeout.ticks.div_ceil(2000) * 100 - 1)
     }
 
     fn args(self) -> [u8; 3] {
-        let [lo, hi] = self.0.to_le_bytes();
-        [0x80, lo, hi]
+        match self {
+            Self::Off => [0, 0, 0],
+            Self::Timed(value) => {
+                let [lo, hi] = value.to_le_bytes();
+                [0x80, lo, hi]
+            }
+        }
     }
 }
 
@@ -289,6 +310,7 @@ impl ResponseTimeout {
 enum RfProtocol {
     TypeA,
     Felica,
+    RawFelica(BitRate),
     TypeB,
 }
 
@@ -408,7 +430,10 @@ impl<T: Transport> Reader<T> {
         protocol: RfProtocol,
         timeout: RfTimeout,
     ) -> Result<(), Error<T::Error>> {
-        let timer = ReaderTimer::for_rf_timeout(timeout);
+        let timer = match protocol {
+            RfProtocol::RawFelica(_) => ReaderTimer::Off,
+            _ => ReaderTimer::for_rf_timeout(timeout),
+        };
         let (info, apply_mode, response_timeout) = match &self.state {
             State::Ready {
                 rf:
@@ -434,16 +459,24 @@ impl<T: Transport> Reader<T> {
         self.state = State::NeedsInitialization;
         self.command(0x1c, &timer.args(), Duration::from_secs(1))?;
         if apply_mode {
-            let (retry, timing) = match protocol {
-                RfProtocol::Felica => (0, 0xb7),
-                RfProtocol::TypeA | RfProtocol::TypeB => (4, 0x8f),
-            };
-            self.command(0x32, &[5, 0, 0, retry], Duration::from_secs(1))?;
-            self.command(0x32, &[0x81, timing], Duration::from_secs(1))?;
+            if !matches!(protocol, RfProtocol::RawFelica(_)) {
+                let (retry, timing) = if protocol == RfProtocol::Felica {
+                    (0, 0xb7)
+                } else {
+                    (4, 0x8f)
+                };
+                self.command(0x32, &[5, 0, 0, retry], Duration::from_secs(1))?;
+                self.command(0x32, &[0x81, timing], Duration::from_secs(1))?;
+            }
             for item in info.configuration.rf_configuration(protocol) {
                 self.command(0x32, &item, Duration::from_secs(1))?;
             }
-            self.write_register(0x630d, 0)?;
+            if let RfProtocol::RawFelica(rate) = protocol {
+                self.write_register(0x630d, 8)?;
+                self.command(0x32, &[0x80, rate.selector()], Duration::from_secs(1))?;
+            } else {
+                self.write_register(0x630d, 0)?;
+            }
         }
         self.state = State::Ready {
             info,
@@ -505,22 +538,23 @@ impl<T: Transport> Reader<T> {
         Ok(())
     }
 
-    /// Select one FeliCa card at 212 kbps. The returned card exclusively borrows
+    /// Select one FeliCa card at the supplied rate. The returned card exclusively borrows
     /// this reader, so its identity cannot survive a reset/mode change through it.
     /// Unsupported Polling request data may be absent and is preserved as such.
     pub fn poll_felica(
         &mut self,
+        rate: BitRate,
         request: PollRequest,
         timeout: RfTimeout,
     ) -> Result<Option<FelicaCard<'_, T>>, Error<T::Error>> {
         self.configure_rf(RfProtocol::Felica, timeout)?;
         let poll = request.encode();
-        let mut args = vec![1, 1];
+        let mut args = vec![1, rate.selector()];
         args.extend_from_slice(&poll[1..]);
         let response = self.command(0x4a, &args, timeout.host_wait())?;
         match response.as_slice() {
             [0] => Ok(None),
-            [1, target, packet @ ..] => {
+            [1, target, packet @ ..] if *target != 0 => {
                 let observation = PollResponse::parse(packet)?;
                 Ok(Some(FelicaCard {
                     reader: self,
@@ -531,6 +565,22 @@ impl<T: Transport> Reader<T> {
             }
             _ => Err(Error::Response("poll target count/layout")),
         }
+    }
+
+    /// Exchange a length-prefixed FeliCa RF packet using raw mode. No reader
+    /// target is selected. The caller owns addressing and effects.
+    pub fn exchange_raw_felica(
+        &mut self,
+        rate: BitRate,
+        packet: &[u8],
+        timeout: RfTimeout,
+    ) -> Result<Vec<u8>, Error<T::Error>> {
+        felica::validate_length(packet, 2)?;
+        let protocol = RfProtocol::RawFelica(rate);
+        self.configure_rf(protocol, timeout)?;
+        let response = self.exchange_rf(packet, timeout, protocol)?;
+        felica::validate_length(&response, 2)?;
+        Ok(response)
     }
 
     /// Activate one NFC-A target at 106 kbps. UID, SAK and optional ATS are
@@ -859,7 +909,6 @@ impl<T: Transport> FelicaCard<'_, T> {
         blocks: &[u16],
     ) -> Result<ReadResponse, Error<T::Error>> {
         let request = felica::read_without_encryption(self.observation.idm, service, blocks)?;
-        self.reader.configure_rf(RfProtocol::Felica, self.timeout)?;
         let response = self
             .reader
             .exchange_rf(&request, self.timeout, RfProtocol::Felica)?;
@@ -868,6 +917,60 @@ impl<T: Transport> FelicaCard<'_, T> {
             self.observation.idm,
             blocks.len(),
         )?)
+    }
+
+    /// Write blocks to one service with Write Without Encryption. Card-specific
+    /// limits still apply. A failure after sending can leave the write outcome
+    /// uncertain. Inspect card status or transport progress before retrying.
+    pub fn write_without_encryption(
+        &mut self,
+        service: u16,
+        blocks: &[BlockWrite],
+    ) -> Result<(), Error<T::Error>> {
+        let idm = self.observation.idm;
+        let request = felica::write_without_encryption(idm, service, blocks)?;
+        let response = self
+            .reader
+            .exchange_rf(&request, self.timeout, RfProtocol::Felica)?;
+        Ok(felica::write_response(&response, idm)?)
+    }
+
+    /// Request the system codes exposed by this card. Card products can omit this command.
+    pub fn request_system_codes(&mut self) -> Result<Vec<u16>, Error<T::Error>> {
+        let idm = self.observation.idm;
+        let response = self.exchange_addressed(0x0c, &[])?;
+        Ok(felica::system_codes(&response, idm)?)
+    }
+
+    /// Look up one service or area index within the selected system.
+    /// The end-of-list marker returns `None`; an RF failure remains an error.
+    pub fn search_service_code(
+        &mut self,
+        index: u16,
+    ) -> Result<Option<ServiceEntry>, Error<T::Error>> {
+        let idm = self.observation.idm;
+        let response = self.exchange_addressed(0x0a, &index.to_le_bytes())?;
+        Ok(felica::service_entry(&response, idm)?)
+    }
+
+    /// Send a caller-supplied FeliCa command with the selected IDm. `parameters`
+    /// starts after IDm. Returns the payload after checking the length, response
+    /// code and IDm. The caller owns command semantics and any cryptography.
+    pub fn exchange_command(
+        &mut self,
+        command: u8,
+        parameters: &[u8],
+        response_code: u8,
+    ) -> Result<Vec<u8>, Error<T::Error>> {
+        let idm = self.observation.idm;
+        let response = self.exchange_addressed(command, parameters)?;
+        Ok(felica::addressed_response(&response, idm, response_code)?.to_vec())
+    }
+
+    fn exchange_addressed(&mut self, command: u8, data: &[u8]) -> Result<Vec<u8>, Error<T::Error>> {
+        let request = felica::addressed_command(self.observation.idm, command, data)?;
+        self.reader
+            .exchange_rf(&request, self.timeout, RfProtocol::Felica)
     }
 }
 

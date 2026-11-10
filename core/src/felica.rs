@@ -7,8 +7,29 @@
 use alloc::vec::Vec;
 use core::fmt;
 
+/// RF rate selected for FeliCa polling and subsequent exchange.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BitRate {
+    /// 212 kbps.
+    Kbps212,
+    /// 424 kbps.
+    Kbps424,
+}
+
+impl BitRate {
+    pub(crate) fn selector(self) -> u8 {
+        match self {
+            Self::Kbps212 => 1,
+            Self::Kbps424 => 2,
+        }
+    }
+}
+
 /// Maximum blocks in one supported Read Without Encryption command.
 pub const MAX_READ_BLOCKS: usize = 12;
+
+/// Maximum write blocks that fit a single-service packet with short addresses.
+pub const MAX_WRITE_BLOCKS: usize = 13;
 
 /// Eight-byte card identity returned by the selected system's polling response.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,6 +79,8 @@ pub enum CardError {
     },
     /// Read block count is outside the supported baseline range `1..=12`.
     BlockCount(usize),
+    /// Write block count is outside `1..=13`.
+    WriteBlockCount(usize),
     /// A response belongs to a different selected identity.
     IdentityMismatch {
         /// Identity selected by the caller.
@@ -65,7 +88,7 @@ pub enum CardError {
         /// Identity received from the card.
         actual: Idm,
     },
-    /// Card-reported read failure; both status flags are preserved.
+    /// Card-reported operation failure; both status flags are preserved.
     Status {
         /// First status flag.
         flag1: u8,
@@ -94,6 +117,12 @@ impl fmt::Display for CardError {
             }
             Self::BlockCount(count) => {
                 write!(f, "block count {count} is outside 1..={MAX_READ_BLOCKS}")
+            }
+            Self::WriteBlockCount(count) => {
+                write!(
+                    f,
+                    "write block count {count} is outside 1..={MAX_WRITE_BLOCKS}"
+                )
             }
             Self::IdentityMismatch { expected, actual } => {
                 write!(f, "card identity {actual}, expected {expected}")
@@ -199,12 +228,48 @@ pub fn read_without_encryption(
     if !(1..=MAX_READ_BLOCKS).contains(&blocks.len()) {
         return Err(CardError::BlockCount(blocks.len()));
     }
+    let mut packet = block_list(0x06, idm, service_code, blocks.iter().copied());
+    set_length(&mut packet)?;
+    Ok(packet)
+}
+
+/// A block address and the 16 bytes to replace at that address.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockWrite {
+    /// Block number within the selected service.
+    pub block: u16,
+    /// Replacement bytes in wire order.
+    pub data: [u8; 16],
+}
+
+pub(crate) fn write_without_encryption(
+    idm: Idm,
+    service: u16,
+    blocks: &[BlockWrite],
+) -> Result<Vec<u8>, CardError> {
+    if !(1..=MAX_WRITE_BLOCKS).contains(&blocks.len()) {
+        return Err(CardError::WriteBlockCount(blocks.len()));
+    }
+    let mut packet = block_list(0x08, idm, service, blocks.iter().map(|entry| entry.block));
+    for entry in blocks {
+        packet.extend_from_slice(&entry.data);
+    }
+    set_length(&mut packet)?;
+    Ok(packet)
+}
+
+fn block_list(
+    command: u8,
+    idm: Idm,
+    service: u16,
+    blocks: impl ExactSizeIterator<Item = u16>,
+) -> Vec<u8> {
     let mut packet = Vec::with_capacity(14 + blocks.len() * 3);
-    packet.extend_from_slice(&[0, 0x06]);
+    packet.extend_from_slice(&[0, command]);
     packet.extend_from_slice(idm.as_bytes());
     packet.push(1);
-    packet.extend_from_slice(&service_code.to_le_bytes());
-    packet.push(u8::try_from(blocks.len()).map_err(|_| CardError::BlockCount(blocks.len()))?);
+    packet.extend_from_slice(&service.to_le_bytes());
+    packet.push(blocks.len() as u8);
     for block in blocks {
         let [low, high] = block.to_le_bytes();
         if high == 0 {
@@ -213,12 +278,110 @@ pub fn read_without_encryption(
             packet.extend_from_slice(&[0, low, high]);
         }
     }
-    let length = u8::try_from(packet.len()).map_err(|_| CardError::Length {
+    packet
+}
+
+fn set_length(packet: &mut [u8]) -> Result<(), CardError> {
+    packet[0] = u8::try_from(packet.len()).map_err(|_| CardError::Length {
         expected: 255,
         actual: packet.len(),
     })?;
-    packet[0] = length;
+    Ok(())
+}
+
+/// A service or area registered at the requested search index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceEntry {
+    /// A service code.
+    Service(u16),
+    /// An area and the inclusive upper end of its code range.
+    Area {
+        /// Area code.
+        code: u16,
+        /// Last code in the area.
+        end: u16,
+    },
+}
+
+pub(crate) fn addressed_command(idm: Idm, command: u8, data: &[u8]) -> Result<Vec<u8>, CardError> {
+    if data.len() > 245 {
+        return Err(CardError::Length {
+            expected: 255,
+            actual: data.len().saturating_add(10),
+        });
+    }
+    let mut packet = Vec::with_capacity(10 + data.len());
+    packet.extend_from_slice(&[0, command]);
+    packet.extend_from_slice(idm.as_bytes());
+    packet.extend_from_slice(data);
+    set_length(&mut packet)?;
     Ok(packet)
+}
+
+pub(crate) fn addressed_response(input: &[u8], idm: Idm, code: u8) -> Result<&[u8], CardError> {
+    validate_packet(input, code, 10)?;
+    let mut actual = [0; 8];
+    actual.copy_from_slice(&input[2..10]);
+    let actual = Idm::new(actual);
+    if actual != idm {
+        return Err(CardError::IdentityMismatch {
+            expected: idm,
+            actual,
+        });
+    }
+    Ok(&input[10..])
+}
+
+pub(crate) fn write_response(input: &[u8], idm: Idm) -> Result<(), CardError> {
+    let status = addressed_response(input, idm, 0x09)?;
+    match status {
+        [0, 0] => Ok(()),
+        [flag1, flag2] => Err(CardError::Status {
+            flag1: *flag1,
+            flag2: *flag2,
+        }),
+        _ => Err(CardError::Length {
+            expected: 12,
+            actual: input.len(),
+        }),
+    }
+}
+
+pub(crate) fn system_codes(input: &[u8], idm: Idm) -> Result<Vec<u16>, CardError> {
+    let body = addressed_response(input, idm, 0x0d)?;
+    let count = body.first().copied().unwrap_or(0);
+    let expected = 11 + usize::from(count) * 2;
+    if input.len() != expected {
+        return Err(CardError::Length {
+            expected,
+            actual: input.len(),
+        });
+    }
+    Ok(body[1..]
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .copied()
+        .map(u16::from_be_bytes)
+        .collect())
+}
+
+pub(crate) fn service_entry(input: &[u8], idm: Idm) -> Result<Option<ServiceEntry>, CardError> {
+    let body = addressed_response(input, idm, 0x0b)?;
+    Ok(match body {
+        [0xff, 0xff] => None,
+        [a, b] => Some(ServiceEntry::Service(u16::from_le_bytes([*a, *b]))),
+        [a, b, c, d] => Some(ServiceEntry::Area {
+            code: u16::from_le_bytes([*a, *b]),
+            end: u16::from_le_bytes([*c, *d]),
+        }),
+        _ => {
+            return Err(CardError::Length {
+                expected: 12,
+                actual: input.len(),
+            });
+        }
+    })
 }
 
 /// Successful read response whose identities, status and block count are checked.
@@ -238,21 +401,21 @@ impl ReadResponse {
         if !(1..=MAX_READ_BLOCKS).contains(&expected_blocks) {
             return Err(CardError::BlockCount(expected_blocks));
         }
-        validate_packet(input, 0x07, 12)?;
-        let mut actual = [0; 8];
-        actual.copy_from_slice(&input[2..10]);
-        let actual = Idm::new(actual);
-        if actual != idm {
-            return Err(CardError::IdentityMismatch {
-                expected: idm,
-                actual,
-            });
-        }
-        if input[10] != 0 || input[11] != 0 {
-            return Err(CardError::Status {
-                flag1: input[10],
-                flag2: input[11],
-            });
+        let body = addressed_response(input, idm, 0x07)?;
+        match body {
+            [0, 0, ..] => {}
+            [flag1, flag2, ..] => {
+                return Err(CardError::Status {
+                    flag1: *flag1,
+                    flag2: *flag2,
+                });
+            }
+            _ => {
+                return Err(CardError::Length {
+                    expected: 12,
+                    actual: input.len(),
+                });
+            }
         }
         let actual_blocks = input.get(12).copied().ok_or(CardError::Length {
             expected: 13,
@@ -291,7 +454,7 @@ impl ReadResponse {
     }
 }
 
-fn validate_packet(input: &[u8], command: u8, minimum: usize) -> Result<(), CardError> {
+pub(crate) fn validate_length(input: &[u8], minimum: usize) -> Result<(), CardError> {
     if input.len() < minimum {
         return Err(CardError::Length {
             expected: minimum,
@@ -305,6 +468,11 @@ fn validate_packet(input: &[u8], command: u8, minimum: usize) -> Result<(), Card
             actual: input.len(),
         });
     }
+    Ok(())
+}
+
+fn validate_packet(input: &[u8], command: u8, minimum: usize) -> Result<(), CardError> {
+    validate_length(input, minimum)?;
     if input[1] != command {
         return Err(CardError::ResponseCode {
             expected: command,
