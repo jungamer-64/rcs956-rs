@@ -38,8 +38,6 @@ pub enum Error<E> {
     TypeA(nfca::Error),
     /// NFC-B activation data failed validation.
     TypeB(nfcb::Error),
-    /// ATQB advertises a protocol type other than the supported ISO-DEP type 1.
-    TypeBProtocol(u8),
     /// Activated NFC-B parameters cannot construct a supported ISO-DEP session.
     IsoDepParameters(isodep::ParameterError),
     /// Payload exceeds the selected reader command's supported limit.
@@ -201,21 +199,22 @@ impl ConfigImage {
                 self.bytes[0x21],
                 self.bytes[0xce],
             ]],
-            RfProtocol::TypeB => {
+            RfProtocol::TypeB(profile) => {
+                let options = match profile {
+                    nfcb::RfProfile::Standard => &self.bytes[0x23..=0x25],
+                    nfcb::RfProfile::Alternate => &self.bytes[0xcf..=0xd1],
+                };
                 let mut analog = vec![
                     0x0a,
                     self.bytes[0xc0],
-                    self.bytes[0x23],
+                    options[0],
                     self.bytes[0xc1],
-                    self.bytes[0x24],
+                    options[1],
                     self.bytes[0xc2],
-                    self.bytes[0x25],
+                    options[2],
                 ];
                 analog.extend_from_slice(&self.bytes[0x16..=0x1a]);
-                vec![
-                    analog,
-                    vec![0x0c, self.bytes[0x23], self.bytes[0x24], self.bytes[0x25]],
-                ]
+                vec![analog, vec![0x0c, options[0], options[1], options[2]]]
             }
         }
     }
@@ -311,7 +310,7 @@ enum RfProtocol {
     TypeA,
     Felica,
     RawFelica(BitRate),
-    TypeB,
+    TypeB(nfcb::RfProfile),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -606,21 +605,30 @@ impl<T: Transport> Reader<T> {
         }
     }
 
-    /// Activate one NFC-B ISO-DEP target at 106 kbps, using the normal RF table
-    /// and AFI wildcard. A card requiring another protocol is detected as an
-    /// unsupported activation rather than granted ISO-DEP operation authority.
+    /// Activate one NFC-B target at 106 kbps. ATQB determines which exchange
+    /// authority the result grants. The caller chooses the RF table and AFI.
     pub fn poll_type_b(
         &mut self,
+        options: nfcb::PollOptions,
         timeout: RfTimeout,
-    ) -> Result<Option<TypeBCard<'_, T>>, Error<T::Error>> {
-        self.configure_rf(RfProtocol::TypeB, timeout)?;
-        let response = self.command(0x4a, &[1, 3, 0, 1], timeout.host_wait())?;
+    ) -> Result<Option<TypeBSelection<'_, T>>, Error<T::Error>> {
+        let protocol = RfProtocol::TypeB(options.profile);
+        self.configure_rf(protocol, timeout)?;
+        let response = self.command(0x4a, &[1, 3, options.afi, 1], timeout.host_wait())?;
         match response.as_slice() {
             [0] => Ok(None),
             [1, target, data @ ..] if *target != 0 => {
                 let observation = nfcb::Observation::parse(data).map_err(Error::TypeB)?;
                 if !observation.supports_iso_dep() {
-                    return Err(Error::TypeBProtocol(observation.protocol_info()[1] & 0x0f));
+                    return Ok(Some(TypeBSelection::Frame(TypeBFrameCard {
+                        target: TypeBTarget {
+                            reader: self,
+                            number: *target,
+                            observation,
+                            profile: options.profile,
+                        },
+                        timeout,
+                    })));
                 }
                 let wait = isodep::block_frame_wait(observation.fwi());
                 let cid = match observation.cid() {
@@ -652,17 +660,20 @@ impl<T: Transport> Reader<T> {
                 self.state = State::Ready {
                     info,
                     rf: RfMode::Configured {
-                        protocol: RfProtocol::TypeB,
+                        protocol,
                         timer: ReaderTimer::for_rf_timeout(timeout),
                     },
                     response_timeout,
                 };
-                Ok(Some(TypeBCard {
-                    reader: self,
-                    observation,
-                    target: *target,
+                Ok(Some(TypeBSelection::IsoDep(TypeBCard {
+                    target: TypeBTarget {
+                        reader: self,
+                        number: *target,
+                        observation,
+                        profile: options.profile,
+                    },
                     session,
-                }))
+                })))
             }
             _ => Err(Error::Response("NFC-B target count/layout")),
         }
@@ -707,6 +718,24 @@ impl<T: Transport> Reader<T> {
             }
             None => Err(Error::Response("missing RF status")),
         }
+    }
+
+    fn exchange_target(
+        &mut self,
+        target: u8,
+        data: &[u8],
+        timeout: ResponseTimeout,
+    ) -> Result<TargetResponse, Error<T::Error>> {
+        let mut args = Vec::with_capacity(data.len() + 1);
+        args.push(target);
+        args.extend_from_slice(data);
+        let response = self.command(0x40, &args, timeout.host_wait())?;
+        let status = response
+            .first()
+            .copied()
+            .ok_or(Error::Response("missing RF status"))?;
+        let data = self.rf_response(response)?;
+        Ok(TargetResponse { status, data })
     }
 
     /// Disable RF and invalidate the configured mode. Call explicitly to observe
@@ -819,28 +848,13 @@ impl<T: Transport> TypeACard<'_, T> {
         ) {
             return Err(TypeAExchangeError::SessionInvalid);
         }
-        let mut args = Vec::with_capacity(data.len() + 1);
-        args.push(self.target);
-        args.extend_from_slice(data);
         let timeout = ResponseTimeout::for_request(self.timeout);
         self.reader
             .prepare_exchange_timing(RfProtocol::TypeA, timeout)
             .map_err(TypeAExchangeError::Preparation)?;
-        let response = self
-            .reader
-            .command(0x40, &args, timeout.host_wait())
-            .map_err(TypeAExchangeError::Exchange)?;
-        let status = response
-            .first()
-            .copied()
-            .ok_or(TypeAExchangeError::Exchange(Error::Response(
-                "missing RF status",
-            )))?;
-        let data = self
-            .reader
-            .rf_response(response)
-            .map_err(TypeAExchangeError::Exchange)?;
-        Ok(TargetResponse { status, data })
+        self.reader
+            .exchange_target(self.target, data, timeout)
+            .map_err(TypeAExchangeError::Exchange)
     }
 }
 
@@ -848,19 +862,17 @@ impl<T: Transport> TypeACard<'_, T> {
 /// reader selection. Protocol failure poisons the session; it never replays APDUs.
 #[derive(Debug)]
 pub struct TypeBCard<'a, T: Transport> {
-    reader: &'a mut Reader<T>,
-    observation: nfcb::Observation,
-    target: u8,
+    target: TypeBTarget<'a, T>,
     session: isodep::Session,
 }
 impl<T: Transport> TypeBCard<'_, T> {
     /// Validated activation data, including ATQB and negotiated CID.
     pub fn observation(&self) -> &nfcb::Observation {
-        &self.observation
+        &self.target.observation
     }
     /// Target identifier returned by the reader.
     pub fn target(&self) -> u8 {
-        self.target
+        self.target.number
     }
     /// Exchange one APDU, handling ISO-DEP chaining, R-blocks and bounded WTX.
     /// Errors distinguish reader setup (zero application progress) from RF
@@ -871,16 +883,81 @@ impl<T: Transport> TypeBCard<'_, T> {
         &mut self,
         apdu: &[u8],
     ) -> Result<Vec<u8>, isodep::Error<Error<T::Error>>> {
-        let reader = &mut self.reader;
+        let reader = &mut self.target.reader;
+        let protocol = RfProtocol::TypeB(self.target.profile);
         let exchange = self.session.prepare(apdu)?;
         // The APDU guard requests at least 9896 ms, saturating 32/02 to its
         // 3280 ms step. A0 keeps its independent FWI/WTX wait; individual
         // blocks do not reprogram 1C.
-        let setup = reader.prepare_exchange_timing(RfProtocol::TypeB, ResponseTimeout::Ms3280);
+        let setup = reader.prepare_exchange_timing(protocol, ResponseTimeout::Ms3280);
         exchange.exchange(setup, |block, wait| {
             let timeout = RfTimeout::new(wait)?;
-            reader.exchange_rf(block, timeout, RfProtocol::TypeB)
+            reader.exchange_rf(block, timeout, protocol)
         })
+    }
+}
+
+/// An NFC-B selection granting the operations of its advertised protocol.
+#[derive(Debug)]
+pub enum TypeBSelection<'a, T: Transport> {
+    /// The card advertises ISO-DEP block exchange.
+    IsoDep(TypeBCard<'a, T>),
+    /// The card advertises another protocol. The caller supplies its frames.
+    Frame(TypeBFrameCard<'a, T>),
+}
+
+impl<'a, T: Transport> TypeBSelection<'a, T> {
+    /// Validated ATQB and ATTRIB data common to both selections.
+    pub fn observation(&self) -> &nfcb::Observation {
+        &self.target().observation
+    }
+
+    /// Target identifier returned by the reader.
+    pub fn target_number(&self) -> u8 {
+        self.target().number
+    }
+
+    fn target(&self) -> &TypeBTarget<'a, T> {
+        match self {
+            Self::IsoDep(card) => &card.target,
+            Self::Frame(card) => &card.target,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TypeBTarget<'a, T: Transport> {
+    reader: &'a mut Reader<T>,
+    number: u8,
+    observation: nfcb::Observation,
+    profile: nfcb::RfProfile,
+}
+
+/// A selected NFC-B target for caller-defined non-ISO-DEP commands.
+#[derive(Debug)]
+pub struct TypeBFrameCard<'a, T: Transport> {
+    target: TypeBTarget<'a, T>,
+    timeout: RfTimeout,
+}
+
+impl<T: Transport> TypeBFrameCard<'_, T> {
+    /// Send one target command through `40`. The reader's Type B command
+    /// limit is 63 bytes. Card-specific command semantics belong to the caller.
+    pub fn exchange(&mut self, data: &[u8]) -> Result<TargetResponse, Error<T::Error>> {
+        if !(1..=63).contains(&data.len()) {
+            return Err(Error::InputLength {
+                maximum: 63,
+                actual: data.len(),
+            });
+        }
+        let protocol = RfProtocol::TypeB(self.target.profile);
+        let timeout = ResponseTimeout::for_request(self.timeout);
+        self.target
+            .reader
+            .prepare_exchange_timing(protocol, timeout)?;
+        self.target
+            .reader
+            .exchange_target(self.target.number, data, timeout)
     }
 }
 
