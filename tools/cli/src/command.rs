@@ -4,13 +4,16 @@
 #[cfg(windows)]
 use crate::windows::{self, Device, Usb};
 #[cfg(windows)]
-use rcs956::reader::{Reader, TypeBSelection};
+use rcs956::reader::{DepActivation, DepRate, Reader, Type2Event, TypeBSelection};
 use rcs956::{
     felica::{BitRate, BlockWrite, MAX_READ_BLOCKS, MAX_WRITE_BLOCKS, PollRequest},
     isodep::MAX_APDU_BYTES,
     ndef::{Message, RecordType},
     nfcb::{PollOptions as TypeBPollOptions, RfProfile},
-    reader::{MAX_TYPE_A_COMMAND_BYTES, RfTimeout},
+    reader::{
+        DepMode, MAX_DEP_MESSAGE_BYTES, MAX_TYPE_A_COMMAND_BYTES, MAX_TYPE2_EMULATED_NDEF_BYTES,
+        RfTimeout,
+    },
     wire,
 };
 use std::{error::Error, time::Duration};
@@ -18,6 +21,9 @@ use std::{error::Error, time::Duration};
 fn help() {
     println!(
         "rcs956 devices\nrcs956 probe [--path DEVICE_INTERFACE]\nrcs956 poll [--type felica|a|b] [--timeout-ms 500] [--path PATH]\nFeliCa poll options: [--rate 212|424] [--system FFFF] [--request 1] [--slots 0]\nrcs956 read --service HEX --blocks DECIMAL[,DECIMAL...] [FeliCa poll options]\nrcs956 write --service HEX --block-data DECIMAL:HEX [--block-data DECIMAL:HEX ...] [FeliCa poll options]\nrcs956 systems [FeliCa poll options]\nrcs956 service-at --index DECIMAL [FeliCa poll options]\nrcs956 raw-felica --data LENGTH_PREFIXED_HEX [--data LENGTH_PREFIXED_HEX ...] [FeliCa poll options]\nNFC-B options: [--b-profile standard|alternate] [--afi HEX] [--nad HEX]\nrcs956 exchange --type a|a-apdu|b|b-frame --data HEX [--timeout-ms 500] [--path PATH]\nrcs956 sequence --type a|a-apdu|b|b-frame --data HEX --data HEX [...] [--timeout-ms 500] [--path PATH]\nrcs956 ndef-read --type type1|a|felica|b [--rate 212|424] [--timeout-ms 500] [--path PATH]\nrcs956 ndef-write --type type1|a|felica|b --data NDEF_HEX [--rate 212|424] [--timeout-ms 500] [--path PATH]\nrcs956 ndef-decode NDEF_HEX\nrcs956 dep-echo --data SIX_BYTE_IDENTITY_SUFFIX_HEX [--timeout-ms 500] [--path PATH]\nrcs956 decode READER_FRAME_HEX\n\nHardware commands require an existing UMDF USB binding. exchange sends one caller-supplied card command (A) or ISO-DEP APDU (a-apdu or b) or a non-ISO-DEP card command (b-frame); sequence sends each supplied command in order within one card selection. Their effects belong to the caller. No automatic application-command replay."
+    );
+    println!(
+        "rcs956 dep-send --data HEX [--type a|felica] [--rate 212|424] [--mode passive|active] [--timeout-ms 500] [--path PATH]\nrcs956 type2-emulate --uid THREE_BYTE_UID_SUFFIX_HEX --data NDEF_HEX [--timeout-ms 500] [--path PATH]"
     );
 }
 pub(super) fn run() -> Result<(), Box<dyn Error>> {
@@ -58,6 +64,8 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
             | "ndef-read"
             | "ndef-write"
             | "dep-echo"
+            | "dep-send"
+            | "type2-emulate"
             | "exchange"
             | "sequence"
     ) {
@@ -78,6 +86,8 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
     let mut technology = Technology::Felica;
     let mut data: Vec<Vec<u8>> = Vec::new();
     let mut felica_options = false;
+    let mut dep_mode = DepMode::Passive;
+    let mut type2_uid: Option<[u8; 3]> = None;
     while let Some(key) = args.next() {
         let value = args
             .next()
@@ -96,7 +106,21 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
                 slots = u8::try_from(hex_u16(&value)?)?;
                 felica_options = true;
             }
-            "--type" => technology = Technology::parse(&value)?,
+            "--type" if command != "type2-emulate" => technology = Technology::parse(&value)?,
+            "--mode" if command == "dep-send" => {
+                dep_mode = match value.as_str() {
+                    "passive" => DepMode::Passive,
+                    "active" => DepMode::Active,
+                    _ => return Err("--mode must be passive or active".into()),
+                }
+            }
+            "--uid" if command == "type2-emulate" => {
+                type2_uid = Some(
+                    hex_bytes(&value)?
+                        .try_into()
+                        .map_err(|_| "--uid requires three suffix bytes")?,
+                );
+            }
             "--rate" => {
                 rate = Some(match value.as_str() {
                     "212" => BitRate::Kbps212,
@@ -209,6 +233,14 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
     {
         return Err("dep-echo uses its own passive NFC-DEP activation parameters".into());
     }
+    if command == "dep-send"
+        && (!matches!(technology, Technology::TypeA | Technology::Felica) || felica_options)
+    {
+        return Err("dep-send requires --type a or felica and uses NFC-DEP discovery".into());
+    }
+    if command == "type2-emulate" && (type2_uid.is_none() || felica_options || rate.is_some()) {
+        return Err("type2-emulate requires --uid and uses a fixed NFC-A target profile".into());
+    }
     validate_data_options(&command, technology, &data)?;
     let request = PollRequest::new(system, request, slots)?;
     let timeout = RfTimeout::new(Duration::from_millis(timeout))?;
@@ -223,6 +255,23 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
                 return Err("dep-echo requires one identity suffix".into());
             };
             return dep_echo(&mut reader, identity.as_slice().try_into()?, timeout);
+        }
+        if command == "dep-send" {
+            let [payload] = data.as_slice() else {
+                return Err("dep-send requires one payload".into());
+            };
+            let rate = match (technology, rate) {
+                (Technology::TypeA, _) => DepRate::Kbps106,
+                (_, Some(BitRate::Kbps424)) => DepRate::Kbps424,
+                _ => DepRate::Kbps212,
+            };
+            return dep_send(&mut reader, dep_mode, rate, payload, timeout);
+        }
+        if command == "type2-emulate" {
+            let (Some(uid), [message]) = (type2_uid, data.as_slice()) else {
+                return Err("type2-emulate requires a UID suffix and one NDEF message".into());
+            };
+            return type2_emulate(&mut reader, uid, message, timeout);
         }
         let info = reader.initialize()?;
         println!(
@@ -290,7 +339,9 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
     }
     #[cfg(not(windows))]
     {
-        let _ = (path, request, timeout, service, blocks, technology, data);
+        let _ = (
+            path, request, timeout, service, blocks, technology, data, dep_mode,
+        );
         Err("hardware binding is currently Windows UMDF USB; portable library and codec are available".into())
     }
 }
@@ -341,10 +392,16 @@ fn validate_data_options(
                 );
             }
         }
-        "ndef-write" => {
+        "ndef-write" | "type2-emulate" => {
             let [message] = data else {
-                return Err("ndef-write requires exactly one --data".into());
+                return Err(format!("{command} requires exactly one --data").into());
             };
+            if command == "type2-emulate" && message.len() > MAX_TYPE2_EMULATED_NDEF_BYTES {
+                return Err(format!(
+                    "type2-emulate accepts up to {MAX_TYPE2_EMULATED_NDEF_BYTES} NDEF bytes"
+                )
+                .into());
+            }
             if !message.is_empty() {
                 Message::parse(message)?;
             }
@@ -352,6 +409,14 @@ fn validate_data_options(
         "dep-echo" => {
             if !matches!(data, [identity] if identity.len() == 6) {
                 return Err("dep-echo requires one six-byte identity suffix in --data".into());
+            }
+        }
+        "dep-send" => {
+            if !matches!(data, [payload] if payload.len() <= MAX_DEP_MESSAGE_BYTES) {
+                return Err(format!(
+                    "dep-send requires one --data of at most {MAX_DEP_MESSAGE_BYTES} bytes"
+                )
+                .into());
             }
         }
         "exchange" | "sequence" => {
@@ -615,15 +680,69 @@ fn dep_echo(
         println!("Request: {}", hex(&payload));
         request.respond(&payload)
     })();
-    let shutdown = target.finish();
-    if let Err(error) = exchange {
-        if let Err(reset) = shutdown {
-            eprintln!("NFC-DEP cleanup: {reset}");
+    finish_target(exchange, target.finish())
+}
+
+#[cfg(windows)]
+fn dep_send(
+    reader: &mut Reader<Usb>,
+    mode: DepMode,
+    rate: DepRate,
+    payload: &[u8],
+    timeout: RfTimeout,
+) -> Result<(), Box<dyn Error>> {
+    let activation = DepActivation {
+        mode,
+        rate,
+        nfcid3: None,
+        general_bytes: &[],
+        node_address: None,
+    };
+    let mut link = match reader.activate_dep(activation, timeout) {
+        Ok(link) => link,
+        Err(error) => return finish_target(Err(error), reader.initialize().map(|_| ())),
+    };
+    println!("NFCID3: {}", hex(&link.peer().nfcid3));
+    let result = link
+        .exchange(payload)
+        .map(|reply| println!("Response: {}", hex(&reply.payload)));
+    finish_target(result, link.finish())
+}
+
+#[cfg(windows)]
+fn type2_emulate(
+    reader: &mut Reader<Usb>,
+    uid: [u8; 3],
+    message: &[u8],
+    timeout: RfTimeout,
+) -> Result<(), Box<dyn Error>> {
+    let mut target = match reader.listen_type2_ndef(uid, message, timeout) {
+        Ok(target) => target,
+        Err(error) => return finish_target(Err(error), reader.initialize().map(|_| ())),
+    };
+    let result = loop {
+        match target.serve_next(timeout) {
+            Ok(Type2Event::Read(page)) => println!("Read page {page}"),
+            Ok(Type2Event::Ignored(command)) => println!("Ignored: {}", hex(&command)),
+            Ok(Type2Event::Halted) => break Ok(()),
+            Err(error) => break Err(error),
+        }
+    };
+    finish_target(result, target.finish())
+}
+
+#[cfg(windows)]
+fn finish_target(
+    operation: Result<(), impl Error + 'static>,
+    cleanup: Result<(), impl Error + 'static>,
+) -> Result<(), Box<dyn Error>> {
+    if let Err(error) = operation {
+        if let Err(reset) = cleanup {
+            eprintln!("Reader cleanup: {reset}");
         }
         return Err(error.into());
     }
-    shutdown?;
-    Ok(())
+    Ok(cleanup?)
 }
 
 #[cfg(windows)]
@@ -865,6 +984,34 @@ mod sequence_tests {
                 "ndef-write",
                 Technology::TypeA,
                 &[vec![0xd0, 0, 0], vec![0xd0, 0, 0]]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn peer_commands_admit_only_one_bounded_payload() {
+        assert!(validate_data_options("dep-send", Technology::TypeA, &[vec![1]]).is_ok());
+        assert!(validate_data_options("dep-send", Technology::TypeA, &[]).is_err());
+        assert!(
+            validate_data_options(
+                "dep-send",
+                Technology::TypeA,
+                &[vec![0; MAX_DEP_MESSAGE_BYTES + 1]],
+            )
+            .is_err()
+        );
+        assert!(
+            validate_data_options("type2-emulate", Technology::Felica, &[vec![0xd0, 0, 0]]).is_ok()
+        );
+        assert!(
+            validate_data_options("type2-emulate", Technology::Felica, &[vec![0xd0, 0]]).is_err()
+        );
+        assert!(
+            validate_data_options(
+                "type2-emulate",
+                Technology::Felica,
+                &[vec![0; MAX_TYPE2_EMULATED_NDEF_BYTES + 1]],
             )
             .is_err()
         );

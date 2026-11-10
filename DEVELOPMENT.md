@@ -107,11 +107,11 @@ MIFARE Classicはcallerが指定したkeyでreaderが認証し、成功したsec
 
 `Reader::activate_dep`は指定された速度・通信モードでイニシエーターとして相手を選択する。`Reader::listen_passive_dep`は106／212／424 kbpsでパッシブターゲットとして待機する。ATRとDEPのRFフレーム処理はreader firmwareが担う。要求・応答は`MAX_DEP_MESSAGE_BYTES`以内で、継続フラグに基づいて分割・再結合する。NADは連結の先頭だけに付け、ターゲットは要求と同じアドレスで応答する。途中失敗ではコマンド投入済み・受理済みの長さと受信済みデータを返し、セッションを失効させる。ホストの待機時間は各フラグメントに適用する。LLCP等の上位protocolはcallerが処理する。
 
-`dep-echo --data HEX`は6-byteの識別子suffixを指定して1要求を反射する。終了時の`finish`はresetと再初期化を行う。起動に失敗した場合は`initialize`で再同期する。
+`dep-echo --data HEX`は6-byteの識別子suffixを指定して1要求を反射する。`dep-send --data HEX`は1要求を送り、応答を表示する。NFC-A 106 kbpsは`--type a`、NFC-F 212／424 kbpsは`--type felica --rate 212|424`で選択する。終了時の`finish`はresetと再初期化を行う。起動に失敗した場合は`initialize`で再同期する。
 
 ## Type 2 ターゲット
 
-`Reader::listen_type2_ndef`は、08で始まる4-byte UIDと読み取り専用のNDEFを持つ106 kbpsのType 2ターゲットを起動する。`serve_next`はREADに応答し、HALTでセッションを終了する。他のコマンドには応答せず、データも変更しない。応答の結果が不明になった場合はセッションを失効させる。`finish`でreaderをRF-off状態に戻す。
+`Reader::listen_type2_ndef`は、08で始まる4-byte UIDと読み取り専用のNDEFを持つ106 kbpsのType 2ターゲットを起動する。`serve_next`はREADに応答し、HALTでセッションを終了する。他のコマンドには応答せず、データも変更しない。応答の結果が不明になった場合はセッションを失効させる。`finish`でreaderをRF-off状態に戻す。CLIでは`type2-emulate --uid 010203 --data D00000`で起動する。
 
 ## 検証境界
 
