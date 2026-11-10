@@ -1,11 +1,14 @@
 use super::{Error, UpdateStage, WriteError};
 use crate::{
     isodep,
-    reader::{self, TypeACard, TypeBCard},
+    reader::{self, MAX_TYPE_A_COMMAND_BYTES, TypeACard, TypeBCard},
     transport::Transport,
 };
 use alloc::vec::Vec;
 use core::ops::Range;
+
+const UPDATE_BINARY_HEADER_BYTES: usize = 5;
+const CAPABILITY_CONTAINER_ID: u16 = 0xe103;
 
 /// Failure while retrieving a Type 4 message over NFC-A or NFC-B.
 pub type Type4Error<E> = Error<isodep::Error<reader::Error<E>>>;
@@ -23,7 +26,11 @@ impl<T: Transport> TypeACard<'_, T> {
     /// Replace the NDEF message in the first publicly readable Type 4A file
     /// if it is also publicly writable. An empty slice clears the file.
     pub fn write_type4_ndef(&mut self, message: &[u8]) -> Result<(), Type4WriteError<T::Error>> {
-        write_type4(|command| self.exchange_apdu(command), message)
+        write_type4(
+            |command| self.exchange_apdu(command),
+            MAX_TYPE_A_COMMAND_BYTES,
+            message,
+        )
     }
 }
 
@@ -36,8 +43,14 @@ impl<T: Transport> TypeBCard<'_, T> {
 
     /// Replace the NDEF message in the first publicly readable Type 4B file
     /// if it is also publicly writable. An empty slice clears the file.
+    /// The write size per APDU respects both MLc and the ISO-DEP session limit.
     pub fn write_type4_ndef(&mut self, message: &[u8]) -> Result<(), Type4WriteError<T::Error>> {
-        write_type4(|command| self.exchange_apdu(command), message)
+        let max_apdu_bytes = self.maximum_apdu_bytes();
+        write_type4(
+            |command| self.exchange_apdu(command),
+            max_apdu_bytes,
+            message,
+        )
     }
 }
 
@@ -55,16 +68,20 @@ fn read_type4<E>(
 
 fn write_type4<E>(
     mut exchange: impl FnMut(&[u8]) -> Result<Vec<u8>, E>,
+    max_apdu_bytes: usize,
     message: &[u8],
 ) -> Result<(), WriteError<E>> {
     let file = select_ndef_file(&mut exchange).map_err(WriteError::Preparation)?;
     if !file.control.writable {
         return Err(WriteError::Preparation(Error::WriteAccess));
     }
-    if file.max_write < 2 {
+    let max_write = file
+        .max_write
+        .min(max_apdu_bytes.saturating_sub(UPDATE_BINARY_HEADER_BYTES));
+    if max_write < 2 {
         // Both bytes of NLEN must be published in the same UPDATE BINARY.
         return Err(WriteError::Preparation(Error::Layout(
-            "Type 4 MLc cannot update NLEN",
+            "Type 4 UPDATE BINARY cannot fit NLEN",
         )));
     }
     let available = file.control.capacity.min(0x8000) - 2;
@@ -82,7 +99,7 @@ fn write_type4<E>(
     update_binary(&mut exchange, 0, &[0, 0])
         .map_err(|cause| WriteError::update(UpdateStage::Begin, 0, cause))?;
     let mut written = 0;
-    for chunk in message.chunks(file.max_write) {
+    for chunk in message.chunks(max_write) {
         // Admission bounds all offsets to the short READ/UPDATE BINARY range.
         update_binary(&mut exchange, (written + 2) as u16, chunk)
             .map_err(|cause| WriteError::update(UpdateStage::Data, written, cause))?;
@@ -111,7 +128,7 @@ fn select_ndef_file<E>(
         exchange,
         &[0, 0xa4, 4, 0, 7, 0xd2, 0x76, 0, 0, 0x85, 1, 1, 0],
     )?;
-    select_file(exchange, [0xe1, 3])?;
+    select_file(exchange, CAPABILITY_CONTAINER_ID.to_be_bytes())?;
     let header = read_binary(exchange, 0, 7)?;
     let length = usize::from(u16::from_be_bytes([header[0], header[1]]));
     if header[2] >> 4 != 2 {
@@ -144,13 +161,20 @@ fn ndef_file<E>(mut tlvs: &[u8]) -> Result<FileControl, Error<E>> {
             let [id_hi, id_lo, size_hi, size_lo, read, write] = value else {
                 return Err(Error::Layout("Type 4 NDEF file control length"));
             };
+            let id = [*id_hi, *id_lo];
+            if matches!(
+                u16::from_be_bytes(id),
+                0 | 0x3f00 | 0x3fff | 0xe102 | CAPABILITY_CONTAINER_ID | 0xffff
+            ) {
+                return Err(Error::Layout("Type 4 NDEF file identifier"));
+            }
             if *read == 0 {
                 let capacity = usize::from(u16::from_be_bytes([*size_hi, *size_lo]));
                 if capacity < 2 {
                     return Err(Error::Layout("Type 4 file cannot hold NLEN"));
                 }
                 return Ok(FileControl {
-                    id: [*id_hi, *id_lo],
+                    id,
                     capacity,
                     writable: *write == 0,
                 });
@@ -167,7 +191,7 @@ fn update_binary<E>(
     data: &[u8],
 ) -> Result<(), Error<E>> {
     let [hi, lo] = offset.to_be_bytes();
-    let mut command = Vec::with_capacity(5 + data.len());
+    let mut command = Vec::with_capacity(UPDATE_BINARY_HEADER_BYTES + data.len());
     command.extend_from_slice(&[0, 0xd6, hi, lo, data.len() as u8]);
     command.extend_from_slice(data);
     if !checked_apdu(exchange, &command)?.is_empty() {

@@ -2163,6 +2163,91 @@ fn type_four_ndef_write_checks_access_and_capacity_then_publishes_nlen()
 }
 
 #[test]
+fn type_four_rejects_reserved_ndef_file_identifiers_before_selecting_them()
+-> Result<(), Box<dyn Error>> {
+    let mut steps = initialization(&ab_config_image());
+    steps.extend(ab_mode(false));
+    steps.extend([
+        command(0x4a, &[1, 0], &type_a_response(7)),
+        command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
+    ]);
+    let reserved_ids = [
+        [0xe1, 3], // The Capability Container itself.
+        [0, 0],
+        [0x3f, 0],
+        [0x3f, 0xff],
+        [0xe1, 2],
+        [0xff, 0xff],
+    ];
+    for [hi, lo] in reserved_ids {
+        let [app, cc, header, _, _] = type_four_file_selection(0);
+        steps.extend([
+            app,
+            cc,
+            header,
+            command(
+                0x40,
+                &[7, 0, 0xb0, 0, 7, 8],
+                &[0, 4, 6, hi, lo, 0, 0x80, 0, 0, 0x90, 0],
+            ),
+        ]);
+    }
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut card = reader
+        .poll_type_a(timeout()?)?
+        .ok_or("Type 4A card absent")?;
+    for _ in reserved_ids {
+        assert!(matches!(
+            card.write_type4_ndef(&[]),
+            Err(ndef::WriteError::Preparation(ndef::Error::Layout(
+                "Type 4 NDEF file identifier"
+            )))
+        ));
+    }
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn type_four_b_ndef_write_fits_each_apdu_within_the_card_buffer() -> Result<(), Box<dyn Error>> {
+    let mut activation = type_b_response();
+    activation[15] = 0x10; // FSC=64 and MBLI=1 permit 64 command bytes.
+    let mut steps = type_b_exchange_steps(&activation);
+    let exchanges: [(&[u8], &[u8]); 6] = [
+        (&[0, 0xa4, 4, 0, 7, 0xd2, 0x76, 0, 0, 0x85, 1, 1, 0], &[]),
+        (&[0, 0xa4, 0, 0x0c, 2, 0xe1, 3], &[]),
+        (&[0, 0xb0, 0, 0, 7], &[0, 15, 0x20, 0, 15, 0, 0xff]),
+        (&[0, 0xb0, 0, 7, 8], &[4, 6, 0xe1, 4, 0, 0x80, 0, 0]),
+        (&[0, 0xa4, 0, 0x0c, 2, 0xe1, 4], &[]),
+        (&[0, 0xd6, 0, 0, 2, 0, 0], &[]),
+    ];
+    for (index, (apdu, data)) in exchanges.into_iter().enumerate() {
+        let pcb = if index % 2 == 0 { 2 } else { 3 };
+        let request = [&[11, 0, pcb][..], apdu].concat();
+        let response = [&[0, pcb][..], data, &[0x90, 0]].concat();
+        steps.push(command(0xa0, &request, &response));
+    }
+    let mut message = [0x42; 60];
+    message[..3].copy_from_slice(&[0xd5, 0, 57]);
+    let first_block = [&[11, 0, 0x12, 0, 0xd6, 0, 2, 59][..], &message[..56]].concat();
+    steps.extend([
+        command(0xa0, &first_block, &[0, 0xa2]),
+        command(0xa0, &[11, 0, 3, 0x42, 0x42, 0x42], &[0, 3, 0x90, 0]),
+        command(0xa0, &[11, 0, 2, 0, 0xd6, 0, 61, 1, 0x42], &[0, 2, 0x90, 0]),
+        command(0xa0, &[11, 0, 3, 0, 0xd6, 0, 0, 2, 0, 60], &[0, 3, 0x90, 0]),
+    ]);
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut card = poll_iso_dep(&mut reader)?.ok_or("Type 4B card absent")?;
+    card.write_type4_ndef(&message)?;
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
 fn type_a_timeout_applies_the_official_500ms_selector_before_exchange() -> Result<(), Box<dyn Error>>
 {
     let mut steps = initialization(&ab_config_image());

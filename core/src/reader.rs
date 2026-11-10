@@ -1051,6 +1051,10 @@ pub struct TypeBCard<'a, T: Transport> {
     session: isodep::Session,
 }
 impl<T: Transport> TypeBCard<'_, T> {
+    pub(crate) fn maximum_apdu_bytes(&self) -> usize {
+        self.session.maximum_apdu_bytes()
+    }
+
     /// Validated activation data, including ATQB and negotiated CID.
     pub fn observation(&self) -> &nfcb::Observation {
         &self.target.observation

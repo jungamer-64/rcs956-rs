@@ -231,6 +231,15 @@ impl Session {
         self.maximum_frame_bytes - 1 - usize::from(self.cid.is_some())
     }
 
+    fn frame_budget_capacity(&self) -> usize {
+        self.first_capacity() + (MAX_FRAMES - 1) * self.capacity()
+    }
+
+    pub(crate) fn maximum_apdu_bytes(&self) -> usize {
+        self.maximum_application_bytes
+            .min(self.frame_budget_capacity())
+    }
+
     fn first_i_block(&self, pcb: u8, data: &[u8]) -> Vec<u8> {
         if let Some(address) = self.nad {
             let mut block = self.frame(pcb | 4, &[address.0]);
@@ -265,8 +274,7 @@ impl Session {
                 partial_response: Vec::new(),
             });
         }
-        let rest = apdu.len().saturating_sub(self.first_capacity());
-        if 1 + rest.div_ceil(self.capacity()) > MAX_FRAMES {
+        if apdu.len() > self.frame_budget_capacity() {
             return Err(Error {
                 cause: Cause::Budget(Budget::Frames),
                 progress: Progress::default(),
