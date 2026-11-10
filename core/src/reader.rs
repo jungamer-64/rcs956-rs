@@ -327,7 +327,7 @@ enum RawTypeAResponse {
 enum RfSelection {
     Ordinary,
     Type2Sector(NonZeroU8),
-    #[cfg(feature = "felica-lite-s")]
+    #[cfg(any(feature = "felica-lite-s", feature = "felica-standard-aes"))]
     FelicaAuthentication,
 }
 
@@ -1232,8 +1232,8 @@ pub struct FelicaCard<'a, T: Transport> {
     timeout: RfTimeout,
 }
 impl<'a, T: Transport> FelicaCard<'a, T> {
-    #[cfg(feature = "felica-lite-s")]
-    pub(crate) fn begin_lite_s_authentication(&mut self) {
+    #[cfg(any(feature = "felica-lite-s", feature = "felica-standard-aes"))]
+    pub(crate) fn begin_felica_authentication(&mut self) {
         if let State::Ready {
             rf: RfMode::Configured { selection, .. },
             ..

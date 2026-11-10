@@ -9,6 +9,8 @@ use core::fmt;
 
 #[cfg(feature = "felica-lite-s")]
 pub mod lite_s;
+#[cfg(feature = "felica-standard-aes")]
+pub mod standard_aes;
 
 /// RF rate selected for FeliCa polling and subsequent exchange.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

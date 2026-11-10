@@ -7,11 +7,14 @@ description = "RC-S956 reader framing, transactions, and NFC card protocols"
 
 [features]
 felica-lite-s = ["dep:des", "dep:subtle", "dep:zeroize"]
+felica-standard-aes = ["dep:aes", "dep:cmac", "dep:subtle", "dep:zeroize"]
 
 [dependencies]
+aes = { version = "0.9", features = ["zeroize"], optional = true }
+cmac = { version = "0.8", features = ["zeroize"], optional = true }
 des = { version = "0.9", features = ["zeroize"], optional = true }
 subtle = { version = "2.6", default-features = false, optional = true }
-zeroize = { version = "1", default-features = false, optional = true }
+zeroize = { version = "1", default-features = false, features = ["alloc"], optional = true }
 
 [dev-dependencies]
 serde_json = "1"

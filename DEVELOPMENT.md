@@ -95,11 +95,13 @@ MIFARE Classicはcallerが指定したkeyでreaderが認証し、成功したsec
 
 回復ではpipeの状態整理に加え、未完了commandを中断するhost ACKを送り、10 ms待って受信cacheを再整理する。ACKが直前のresetを確定する可能性もあるため、resetの最小待機時間を確保する。その後に許可するのはresetだけで、空本文のreset応答と確定ACKの完了・10 ms待機まで通常commandを許可しない。USB pipe resetだけをfirmware commandの中断として扱わない。中断前のカード操作の結果不明はcallerに残る。
 
-### FeliCa Lite-S
+### FeliCa の認証セッション
 
 `felica-lite-s` feature は、system 88B4で選択したLite-Sカード（IC Type F1）に対する相互認証と、MAC_A付きのユーザーブロック読取・書込みを提供する。カード鍵と、認証ごとにCSPRNGで生成した新しい16-byte challengeは呼出側が供給する。認証は通常のカードhandleを消費し、以降の選択前にRFを切ってカードの認証状態を解消する。MAC不一致や交換失敗後は再選択と認証が必要。書込みはカードが報告した結果を返し、送信後に失敗した場合は書込み済みの可能性がある。Lite-SのMAC_Aは通信データを暗号化しない。
 
 コアはLite-Sのプロトコル、MACの入力構成、session状態を所有する。2-key TDESは`des`、MACの比較は`subtle`、鍵用バッファの消去は`zeroize`に委譲する。TDES実装のメモリアクセスには鍵依存性があり、同一ホスト上のタイミング観測を排除する要件には別途対処が必要。
+
+`felica-standard-aes` feature はFeliCa StandardのAES-128相互認証と、Read v2／Write v2による暗号化ブロックアクセスを提供する。選択したシステムに対応するノード鍵を認証順に渡し、個別化コードと認証ごとに新しいCSPRNG challengeを指定する。応答はMACと取引番号を検査してから公開する。送信後の失敗でセッションは失効し、書込み結果は再認証して確認する。AESとCMACはRustCryptoへ委譲し、暗号フレームと取引番号はコアが管理する。フレーム形式の参照は[FeliCa Card User's Manual (Unofficial Edition)](https://soltia48.github.io/felica-users-manual-unofficial/en/)のMutual Authentication and Secure Messaging Algorithms。
 
 ## NFC-DEP
 
