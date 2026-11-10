@@ -76,7 +76,7 @@ pub enum Budget {
     Frames,
     /// WTX requests accepted during this exchange.
     WaitExtensions,
-    /// Protocol-requested duplicate block transfers.
+    /// Duplicate transfers for one block; accepted block progress resets the count.
     Retransmissions,
     /// Accumulated response application bytes.
     ResponseBytes,
@@ -522,6 +522,7 @@ impl PreparedExchange<'_, '_> {
                                 return Err(Cause::InvalidBlock("R-ACK without command chaining"));
                             }
                             progress.acknowledged_application_bytes = end;
+                            retransmissions = 0;
                             number ^= 1;
                             let next_end = (end + capacity).min(apdu.len());
                             phase = Phase::Sending {
@@ -585,6 +586,7 @@ impl PreparedExchange<'_, '_> {
                         }
                         output.extend_from_slice(body);
                         progress.received_application_bytes = output.len();
+                        retransmissions = 0;
                         number ^= 1;
                         if pcb & 0x10 == 0 {
                             return Ok(());

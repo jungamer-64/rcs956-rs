@@ -74,7 +74,7 @@ pub enum Error<E> {
     },
     /// The returned block data and addresses did not authenticate.
     MacMismatch(Stage),
-    /// The authenticated identity differs from the selected IDm and PMm.
+    /// The authenticated ID block does not begin with the selected IDm.
     IdentityMismatch,
     /// The counter block has nonzero reserved bytes.
     CounterLayout,
@@ -129,7 +129,8 @@ impl<'a, T: Transport> FelicaCard<'a, T> {
             }],
         )?;
         let [id, counter] = keys.read(&mut self, Stage::CardProof, [IDENTITY, WRITE_COUNTER])?;
-        if &id[..8] != identity.idm.as_bytes() || id[8..] != identity.pmm {
+        // The ID block holds IDm, DFC and an issuer-defined value; PMm is not part of it.
+        if &id[..8] != identity.idm.as_bytes() {
             return Err(Error::IdentityMismatch);
         }
         let mut state = [0; 16];
@@ -240,6 +241,8 @@ impl SessionKeys {
         stage: Stage,
         blocks: [u16; N],
     ) -> Result<[[u8; 16]; N], Error<T::Error>> {
+        // One MAC_A block follows at most three data blocks in a four-block read.
+        const { assert!(N >= 1 && N <= 3) };
         let mut request = [MAC_A; 4];
         request[..N].copy_from_slice(&blocks);
         let request = &request[..=N];
