@@ -7,8 +7,8 @@ use rcs956_core::{
     isodep, mifare, ndef,
     nfcb::{PollOptions, RfProfile},
     reader::{
-        ConfigurationError, Error as ReaderError, Reader, RfTimeout, TimeoutRange,
-        TypeAExchangeError, TypeBCard, TypeBSelection,
+        ConfigurationError, DepError, DepRate, Error as ReaderError, Reader, RfTimeout,
+        TimeoutRange, TypeAExchangeError, TypeBCard, TypeBSelection,
     },
     transport::{Progress, TransactionError, Transport},
     wire::{self, Direction, Frame},
@@ -1835,6 +1835,64 @@ fn type_one_dynamic_memory_is_rejected_before_read_or_write() -> Result<(), Box<
             ndef::Error::UnsupportedMapping
         ))
     ));
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn passive_dep_owns_activation_and_one_response_at_a_time() -> Result<(), Box<dyn Error>> {
+    let configuration = ab_config_image();
+    let mut steps = initialization(&configuration);
+    steps.extend([
+        command(8, &[0x63, 0x0b, 0x80], &[0]),
+        command(0x32, &[0x82, 8, 2, 8], &[]),
+        command(0x12, &[8], &[]),
+        command(8, &[0x63, 1, 0x7b], &[0]),
+        command(8, &[0x63, 2, 0xb0], &[0]),
+        command(8, &[0x63, 3, 0xb0], &[0]),
+        command(
+            0x8c,
+            &[
+                2, 1, 1, 0x31, 0x32, 0x33, 0x40, 1, 0xfe, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0, 0,
+                0, 0, 0, 0, 0, 0, 0xff, 0xff, 1, 0xfe, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0, 0,
+            ],
+            &[
+                0x10, 19, 0xd4, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 0, 0, 0, 2, 0x46, 0x66,
+            ],
+        ),
+        command(0x92, &[0x46, 0x66, 0x6d], &[0]),
+        command(0x86, &[], &[0, 0x11, 0x22]),
+        command(0x8e, &[0x33], &[0]),
+        command(0x86, &[], &[0x40, 0x44]),
+    ]);
+    steps.extend(initialization(&configuration));
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    let mut target = reader.listen_passive_dep(*b"123456", b"Ffm", timeout()?)?;
+    assert_eq!(target.initiator().rate, DepRate::Kbps212);
+    assert_eq!(target.initiator().general_bytes, [0x46, 0x66]);
+    {
+        let mut request = target.receive(timeout()?)?;
+        assert_eq!(request.payload(), [0x11, 0x22]);
+        assert!(matches!(
+            request.respond(&[0; 61]),
+            Err(DepError::ResponseLength(61))
+        ));
+        request.respond(&[0x33])?;
+        assert!(matches!(
+            request.respond(&[0x33]),
+            Err(DepError::SessionUnavailable)
+        ));
+    }
+    assert!(matches!(
+        target.receive(timeout()?),
+        Err(DepError::UnsupportedRequest { status: 0x40, prefix }) if prefix == [0x44]
+    ));
+    assert!(matches!(
+        target.receive(timeout()?),
+        Err(DepError::SessionUnavailable)
+    ));
+    target.finish()?;
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
 }

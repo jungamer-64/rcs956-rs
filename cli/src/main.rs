@@ -26,7 +26,7 @@ fn main() -> std::process::ExitCode {
 }
 fn help() {
     println!(
-        "rcs956 devices\nrcs956 probe [--path DEVICE_INTERFACE]\nrcs956 poll [--type felica|a|b] [--timeout-ms 500] [--path PATH]\nFeliCa poll options: [--rate 212|424] [--system FFFF] [--request 1] [--slots 0]\nrcs956 read --service HEX --blocks DECIMAL[,DECIMAL...] [FeliCa poll options]\nrcs956 write --service HEX --block-data DECIMAL:HEX [--block-data DECIMAL:HEX ...] [FeliCa poll options]\nrcs956 systems [FeliCa poll options]\nrcs956 service-at --index DECIMAL [FeliCa poll options]\nrcs956 raw-felica --data LENGTH_PREFIXED_HEX [--data LENGTH_PREFIXED_HEX ...] [FeliCa poll options]\nNFC-B options: [--b-profile standard|alternate] [--afi HEX] [--nad HEX]\nrcs956 exchange --type a|a-apdu|b|b-frame --data HEX [--timeout-ms 500] [--path PATH]\nrcs956 sequence --type a|a-apdu|b|b-frame --data HEX --data HEX [...] [--timeout-ms 500] [--path PATH]\nrcs956 ndef-read --type type1|a|felica|b [--rate 212|424] [--timeout-ms 500] [--path PATH]\nrcs956 ndef-write --type type1|a|felica|b --data NDEF_HEX [--rate 212|424] [--timeout-ms 500] [--path PATH]\nrcs956 ndef-decode NDEF_HEX\nrcs956 decode READER_FRAME_HEX\n\nHardware commands require an existing WinUSB binding. exchange sends one caller-supplied card command (A) or ISO-DEP APDU (a-apdu or b) or a non-ISO-DEP card command (b-frame); sequence sends each supplied command in order within one card selection. Their effects belong to the caller. No automatic application-command replay."
+        "rcs956 devices\nrcs956 probe [--path DEVICE_INTERFACE]\nrcs956 poll [--type felica|a|b] [--timeout-ms 500] [--path PATH]\nFeliCa poll options: [--rate 212|424] [--system FFFF] [--request 1] [--slots 0]\nrcs956 read --service HEX --blocks DECIMAL[,DECIMAL...] [FeliCa poll options]\nrcs956 write --service HEX --block-data DECIMAL:HEX [--block-data DECIMAL:HEX ...] [FeliCa poll options]\nrcs956 systems [FeliCa poll options]\nrcs956 service-at --index DECIMAL [FeliCa poll options]\nrcs956 raw-felica --data LENGTH_PREFIXED_HEX [--data LENGTH_PREFIXED_HEX ...] [FeliCa poll options]\nNFC-B options: [--b-profile standard|alternate] [--afi HEX] [--nad HEX]\nrcs956 exchange --type a|a-apdu|b|b-frame --data HEX [--timeout-ms 500] [--path PATH]\nrcs956 sequence --type a|a-apdu|b|b-frame --data HEX --data HEX [...] [--timeout-ms 500] [--path PATH]\nrcs956 ndef-read --type type1|a|felica|b [--rate 212|424] [--timeout-ms 500] [--path PATH]\nrcs956 ndef-write --type type1|a|felica|b --data NDEF_HEX [--rate 212|424] [--timeout-ms 500] [--path PATH]\nrcs956 ndef-decode NDEF_HEX\nrcs956 dep-echo --data SIX_BYTE_IDENTITY_SUFFIX_HEX [--timeout-ms 500] [--path PATH]\nrcs956 decode READER_FRAME_HEX\n\nHardware commands require an existing WinUSB binding. exchange sends one caller-supplied card command (A) or ISO-DEP APDU (a-apdu or b) or a non-ISO-DEP card command (b-frame); sequence sends each supplied command in order within one card selection. Their effects belong to the caller. No automatic application-command replay."
     );
 }
 fn run() -> Result<(), Box<dyn Error>> {
@@ -66,6 +66,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             | "raw-felica"
             | "ndef-read"
             | "ndef-write"
+            | "dep-echo"
             | "exchange"
             | "sequence"
     ) {
@@ -212,6 +213,11 @@ fn run() -> Result<(), Box<dyn Error>> {
     if technology == Technology::Type1 && !is_ndef {
         return Err("--type type1 requires an NDEF operation".into());
     }
+    if command == "dep-echo"
+        && (technology != Technology::Felica || felica_options || rate.is_some())
+    {
+        return Err("dep-echo uses its own passive NFC-DEP activation parameters".into());
+    }
     validate_data_options(&command, technology, &data)?;
     let request = PollRequest::new(system, request, slots)?;
     let timeout = RfTimeout::new(Duration::from_millis(timeout))?;
@@ -221,6 +227,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         let usb = WinUsb::open(&path)?;
         println!("Interface: {path}");
         let mut reader = Reader::new(usb);
+        if command == "dep-echo" {
+            let [identity] = data.as_slice() else {
+                return Err("dep-echo requires one identity suffix".into());
+            };
+            return dep_echo(&mut reader, identity.as_slice().try_into()?, timeout);
+        }
         let info = reader.initialize()?;
         println!(
             "Firmware: {}\nModel: {:04X}\nReader flags: {:02X}\nConfiguration: 256 bytes; signature/checksums passed",
@@ -344,6 +356,11 @@ fn validate_data_options(
             };
             if !message.is_empty() {
                 Message::parse(message)?;
+            }
+        }
+        "dep-echo" => {
+            if !matches!(data, [identity] if identity.len() == 6) {
+                return Err("dep-echo requires one six-byte identity suffix in --data".into());
             }
         }
         "exchange" | "sequence" => {
@@ -576,6 +593,45 @@ fn decode_ndef(bytes: &[u8]) -> Result<(), Box<dyn Error>> {
             hex(&record.payload),
         );
     }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn dep_echo(
+    reader: &mut Reader<WinUsb>,
+    identity: [u8; 6],
+    timeout: RfTimeout,
+) -> Result<(), Box<dyn Error>> {
+    let mut target = match reader.listen_passive_dep(identity, &[], timeout) {
+        Ok(target) => target,
+        Err(error) => {
+            if let Err(reset) = reader.initialize() {
+                eprintln!("NFC-DEP cleanup: {reset}");
+            }
+            return Err(error.into());
+        }
+    };
+    let initiator = target.initiator();
+    println!(
+        "Rate: {:?}\nNFCID3: {}\nGeneral bytes: {}",
+        initiator.rate,
+        hex(&initiator.nfcid3),
+        hex(&initiator.general_bytes),
+    );
+    let exchange = (|| {
+        let mut request = target.receive(timeout)?;
+        let payload = request.payload().to_vec();
+        println!("Request: {}", hex(&payload));
+        request.respond(&payload)
+    })();
+    let shutdown = target.finish();
+    if let Err(error) = exchange {
+        if let Err(reset) = shutdown {
+            eprintln!("NFC-DEP cleanup: {reset}");
+        }
+        return Err(error.into());
+    }
+    shutdown?;
     Ok(())
 }
 

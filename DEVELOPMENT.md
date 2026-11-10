@@ -71,6 +71,12 @@ MIFARE Classicはcallerが指定したkeyでreaderが認証し、成功したsec
 
 回復ではpipeの状態整理に加え、未完了commandを中断するhost ACKを送り、10 ms待って受信cacheを再整理する。ACKが直前のresetを確定する可能性もあるため、resetの最小待機時間を確保する。その後に許可するのはresetだけで、空本文のreset応答と確定ACKの完了・10 ms待機まで通常commandを許可しない。USB pipe resetだけをfirmware commandの中断として扱わない。中断前のカード操作の結果不明はcallerに残る。
 
+## パッシブ NFC-DEP
+
+`Reader::listen_passive_dep`はNFC-A 106 kbpsまたはNFC-F 212／424 kbpsでパッシブターゲットとして待機する。発見用の識別子とGeneral Bytesはcallerが指定し、ATR_RESとDEP frame処理はreader firmwareが担う。callerは`receive`で取得した要求に1回応答できる。応答は60 bytes以下で、NAD付きの要求やfirmwareが継続を報告した要求は拒否する。LLCP等の上位protocolはcallerが処理する。
+
+`dep-echo --data HEX`は6-byteの識別子suffixを指定して1要求を反射する。ターゲットの終了は`finish`がresetと再初期化を行う。listenの失敗後は`initialize`で再同期する。
+
 ## 検証境界
 
 固定packet vectorは実機captureではない。registry取得のtestは隔離したvolatile HKCU keyを作成し、取得・型・アクセスエラーを実際のWindows APIで確認して終了時に削除する。deviceの登録やbindingには書き込まない。

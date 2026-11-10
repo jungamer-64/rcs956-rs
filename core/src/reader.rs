@@ -1,7 +1,9 @@
 //! Reader configuration and lifetime-bound NFC card access.
 
+mod dep;
 mod type1;
 
+pub use dep::{DepError, DepInitiator, DepRate, DepRequest, PassiveDepTarget};
 pub use type1::Type1Tag;
 
 use crate::{
