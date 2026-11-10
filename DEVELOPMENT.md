@@ -1,15 +1,24 @@
 # Build and device validation
 
-`Cargo.toml`がworkspace構成、`Cargo.lock`が解決済み依存、`verify.ps1`がWindows上の正規検証手順を所有する。
-
 `rcs956-core`はフレーム、取引状態、RF設定、カードプロトコルを所有する。`no_std`と`alloc`で動作し、crate全体で`unsafe_code`を禁止する。Rustからは`rcs956_core::reader::Reader`などを使用する。coreが定義する`Transport`へ同期転送、pipe回復、単調時計、待機を委譲し、期限・待機時間とエラー時の状態遷移はcoreで決める。`rcs956`は`rcs956::windows::WinUsb`を提供し、`rcs956-cli`が両ライブラリを組み合わせて`rcs956`コマンドを提供する。
 
-正規検証にはcoreのベアメタル向けコンパイルに使うRust targetが必要。
+## Windowsでのビルドと検証
+
+リポジトリのルートで実行する。coreの`no_std`検証にはベアメタル向けRust targetが必要。 rustdocの検証は、環境変数やターゲット別設定で`rustdocflags`を上書きしていない状態で行う。
 
 ```powershell
 rustup target add x86_64-unknown-none
 cargo build --workspace --locked
-.\verify.ps1
+cargo fmt --all --check
+cargo check --locked -p rcs956-core --lib --target x86_64-unknown-none
+cargo test --locked --workspace
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo doc --locked --workspace --no-deps --config "build.rustdocflags=['-Dwarnings']"
+```
+
+## 実機での実行例
+
+```powershell
 cargo run --locked -p rcs956-cli -- devices
 cargo run --locked -p rcs956-cli -- probe
 cargo run --locked -p rcs956-cli -- poll --type felica --system FFFF --request 1 --slots 0
@@ -58,7 +67,7 @@ MIFARE Classicはcallerが指定したkeyでreaderが認証し、成功したsec
 
 ## 検証境界
 
-`verify.ps1`はworkspaceのテスト・lint、ライブラリの公開API、coreの`no_std`ビルドを確認する。固定packet vectorは実機captureではない。registry取得のtestは隔離したvolatile HKCU keyを作成し、取得・型・アクセスエラーを実際のWindows APIで確認して終了時に削除する。deviceの登録やbindingには書き込まない。
+固定packet vectorは実機captureではない。registry取得のtestは隔離したvolatile HKCU keyを作成し、取得・型・アクセスエラーを実際のWindows APIで確認して終了時に削除する。deviceの登録やbindingには書き込まない。
 
 実機検証では、`devices`による対象／service／path、`probe`のfirmware／model／設定checksum、`poll`のidentity／PMm、対象serviceを指定した`read`を別々に記録する。CLI出力はAPIの観測結果であり、USB bus上のZLPやRF timingのcaptureとは区別する。全firmware、PC/SC完全互換、全カードcommand／APDUの意味と副作用の成立は、この検証の対象に含めない。NFC-A／Bの固定vectorはカード実機の成功証拠ではない。
 
