@@ -338,40 +338,35 @@ fn felica_424_selects_card_and_exchanges_discovery_and_write_packets() -> Result
 }
 
 #[test]
-fn raw_felica_uses_separate_profile_and_checks_packet_length_before_io()
--> Result<(), Box<dyn Error>> {
-    let mut config = config_image();
-    config[0xcb..=0xce].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
-    let mut steps = initialization(&config);
-    let poll = [6, 0, 0xff, 0xff, 0, 0];
-    let raw_response = [
-        0, 18, 1, 1, 2, 3, 4, 5, 6, 7, 8, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
-    ];
-    steps.extend([
-        command(0x1c, &[0, 0, 0], &[]),
-        command(0x32, &[0x0b, 1, 0x11, 0x22, 0x33, 5, 6, 7, 0x44], &[]),
-        command(8, &[0x63, 0x0d, 8], &[0]),
-        command(0x32, &[0x80, 2], &[]),
-        command(0xa0, &[0xc8, 0, 6, 0, 0xff, 0xff, 0, 0], &raw_response),
-        command(0xa0, &[0xc8, 0, 6, 0, 0xff, 0xff, 0, 0], &[0, 5, 1]),
-    ]);
+fn raw_felica_exchanges_opaque_packets_after_selection() -> Result<(), Box<dyn Error>> {
+    let mut steps = initialization(&config_image());
     steps.extend(mode_configuration());
+    let packet = [4, 0xe0, 0x32, 0xc1];
+    let raw_response = [0, 3, 0xa0, 0x12];
+    steps.extend([
+        command(0x4a, &[1, 2, 0, 0x12, 0x34, 1, 0], &poll_response()),
+        command(0xa0, &[0xc8, 0, 4, 0xe0, 0x32, 0xc1], &raw_response),
+        command(0xa0, &[0xc8, 0, 4, 0xe0, 0x32, 0xc1], &[0, 5, 1]),
+    ]);
     steps.push(command(0x4a, &[1, 1, 0, 0x12, 0x34, 1, 0], &[0]));
     let (transport, journal) = Script::new(steps);
     let mut reader = Reader::new(transport);
     reader.initialize()?;
-    assert!(matches!(
-        reader.exchange_raw_felica(BitRate::Kbps424, &[3, 0], timeout()?),
-        Err(ReaderError::Card(CardError::Length { .. }))
-    ));
-    assert_eq!(
-        reader.exchange_raw_felica(BitRate::Kbps424, &poll, timeout()?)?,
-        raw_response[1..]
-    );
-    assert!(matches!(
-        reader.exchange_raw_felica(BitRate::Kbps424, &poll, timeout()?),
-        Err(ReaderError::Card(CardError::Length { .. }))
-    ));
+    {
+        let mut raw = reader
+            .poll_felica(BitRate::Kbps424, poll_request()?, timeout()?)?
+            .ok_or("expected FeliCa card")?
+            .into_raw();
+        assert!(matches!(
+            raw.exchange_packet(&[3, 0]),
+            Err(ReaderError::Card(CardError::Length { .. }))
+        ));
+        assert_eq!(raw.exchange_packet(&packet)?, raw_response[1..]);
+        assert!(matches!(
+            raw.exchange_packet(&packet),
+            Err(ReaderError::Card(CardError::Length { .. }))
+        ));
+    }
     assert!(
         reader
             .poll_felica(BitRate::Kbps212, poll_request()?, timeout()?)?

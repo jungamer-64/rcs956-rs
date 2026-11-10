@@ -57,7 +57,7 @@ APDUの入力と最低frame数を検査してからreader設定を始める。�
 
 MIFARE Classicはcallerが指定したkeyでreaderが認証し、成功したsector内のブロックに限り読取・書込みを許す。ブロック交換失敗でsector handleは失効する。`ndef-read`はNFC-AのType 2 tagまたはNFC-A／BのType 4 tagから公開読取可能なNDEF messageのbytesを取得する。Type 2の物理アドレスは先頭sectorに限り、Type 4はmapping 2.xのshort APDUで参照できるfileを扱う。
 
-選択済みFeliCaのRF待機には`A0`のhalf-ms fieldと`1C`のreader timerを設定する。reader timerはRF待機を秒単位へ切り上げてから`(ms-10)/10`をLE16で送り、成功した設定だけをRF modeに保持する。raw FeliCaはtable4を適用し、`1C`のtimerを無効にして`A0`の待機を使う。raw packetは送受信ともFeliCaの長さbyteを含み、カードの選択・アドレス解釈は呼出側が行う。
+選択済みFeliCaのRF待機には`A0`のhalf-ms fieldと`1C`のreader timerを設定する。reader timerはRF待機を秒単位へ切り上げてから`(ms-10)/10`をLE16で送り、成功した設定だけをRF modeに保持する。`raw-felica`は`4A`で選択を成立させてから`A0`で任意のpacketを交換する。送受信ともFeliCaの長さbyteを含み、アドレス・コマンド・暗号化の解釈は呼出側が行う。任意packetを許可した時点でtyped card handleのIDm authorityは消費される。
 
 `systems`と`service-at`はカードが公開するsystem codeと選択system内のservice／areaを照会する。`write`は指定した単一の非暗号化サービスに16 bytes単位で送信する。13ブロック以下でも、block listとデータの合計がpacket長上限を超える要求は拒否する。カード固有の書込み制限はカードが判定する。送信後のエラーでは書込み結果が不明な場合があり、自動再送や読戻しは行わない。認証・暗号化の処理を持つ呼出側は`FelicaCard::exchange_command`で選択済みIDm宛てにコマンドを交換できる。
 

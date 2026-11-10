@@ -25,7 +25,7 @@ fn main() -> std::process::ExitCode {
 }
 fn help() {
     println!(
-        "rcs956 devices\nrcs956 probe [--path DEVICE_INTERFACE]\nrcs956 poll [--type felica|a|b] [--timeout-ms 500] [--path PATH]\nFeliCa poll options: [--rate 212|424] [--system FFFF] [--request 1] [--slots 0]\nrcs956 read --service HEX --blocks DECIMAL[,DECIMAL...] [FeliCa poll options]\nrcs956 write --service HEX --block-data DECIMAL:HEX [--block-data DECIMAL:HEX ...] [FeliCa poll options]\nrcs956 systems [FeliCa poll options]\nrcs956 service-at --index DECIMAL [FeliCa poll options]\nrcs956 raw-felica --data LENGTH_PREFIXED_HEX [--data LENGTH_PREFIXED_HEX ...] [--rate 212|424]\nNFC-B options: [--b-profile standard|alternate] [--afi HEX] [--nad HEX]\nrcs956 exchange --type a|a-apdu|b|b-frame --data HEX [--timeout-ms 500] [--path PATH]\nrcs956 sequence --type a|a-apdu|b|b-frame --data HEX --data HEX [...] [--timeout-ms 500] [--path PATH]\nrcs956 ndef-read --type a|b [--timeout-ms 500] [--path PATH]\nrcs956 decode READER_FRAME_HEX\n\nHardware commands require an existing WinUSB binding. exchange sends one caller-supplied card command (A) or ISO-DEP APDU (a-apdu or b) or a non-ISO-DEP card command (b-frame); sequence sends each supplied command in order within one card selection. Their effects belong to the caller. No automatic application-command replay."
+        "rcs956 devices\nrcs956 probe [--path DEVICE_INTERFACE]\nrcs956 poll [--type felica|a|b] [--timeout-ms 500] [--path PATH]\nFeliCa poll options: [--rate 212|424] [--system FFFF] [--request 1] [--slots 0]\nrcs956 read --service HEX --blocks DECIMAL[,DECIMAL...] [FeliCa poll options]\nrcs956 write --service HEX --block-data DECIMAL:HEX [--block-data DECIMAL:HEX ...] [FeliCa poll options]\nrcs956 systems [FeliCa poll options]\nrcs956 service-at --index DECIMAL [FeliCa poll options]\nrcs956 raw-felica --data LENGTH_PREFIXED_HEX [--data LENGTH_PREFIXED_HEX ...] [FeliCa poll options]\nNFC-B options: [--b-profile standard|alternate] [--afi HEX] [--nad HEX]\nrcs956 exchange --type a|a-apdu|b|b-frame --data HEX [--timeout-ms 500] [--path PATH]\nrcs956 sequence --type a|a-apdu|b|b-frame --data HEX --data HEX [...] [--timeout-ms 500] [--path PATH]\nrcs956 ndef-read --type a|b [--timeout-ms 500] [--path PATH]\nrcs956 decode READER_FRAME_HEX\n\nHardware commands require an existing WinUSB binding. exchange sends one caller-supplied card command (A) or ISO-DEP APDU (a-apdu or b) or a non-ISO-DEP card command (b-frame); sequence sends each supplied command in order within one card selection. Their effects belong to the caller. No automatic application-command replay."
     );
 }
 fn run() -> Result<(), Box<dyn Error>> {
@@ -186,9 +186,6 @@ fn run() -> Result<(), Box<dyn Error>> {
     {
         return Err("FeliCa options and commands require --type felica".into());
     }
-    if felica_options && command == "raw-felica" {
-        return Err("raw-felica takes the full packet in --data".into());
-    }
     if b_options_specified && !matches!(technology, Technology::TypeB | Technology::TypeBFrame) {
         return Err("NFC-B options require --type b or b-frame".into());
     }
@@ -216,16 +213,6 @@ fn run() -> Result<(), Box<dyn Error>> {
         );
         let result = if command == "probe" {
             Ok(())
-        } else if command == "raw-felica" {
-            data.iter().try_for_each(|packet| {
-                let response = reader.exchange_raw_felica(
-                    rate.unwrap_or(BitRate::Kbps212),
-                    packet,
-                    timeout,
-                )?;
-                println!("Response: {}", hex(&response));
-                Ok(())
-            })
         } else {
             match technology {
                 Technology::Felica => {
@@ -239,6 +226,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         },
                         ("systems", _, _, _) => FelicaOperation::Systems,
                         ("service-at", _, _, Some(index)) => FelicaOperation::ServiceAt(index),
+                        ("raw-felica", _, _, _) => FelicaOperation::Raw(&data),
                         _ => FelicaOperation::Poll,
                     };
                     card_operation(
@@ -451,6 +439,7 @@ enum FelicaOperation<'a> {
     },
     Systems,
     ServiceAt(u16),
+    Raw(&'a [Vec<u8>]),
 }
 
 #[cfg(windows)]
@@ -501,6 +490,12 @@ fn card_operation(
             }
             None => println!("End of service list"),
         },
+        FelicaOperation::Raw(packets) => {
+            let mut raw = card.into_raw();
+            for packet in packets {
+                println!("Response: {}", hex(&raw.exchange_packet(packet)?));
+            }
+        }
     }
     Ok(())
 }
