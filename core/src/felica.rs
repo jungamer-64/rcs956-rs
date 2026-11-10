@@ -7,6 +7,9 @@
 use alloc::vec::Vec;
 use core::fmt;
 
+#[cfg(feature = "felica-lite-s")]
+pub mod lite_s;
+
 /// RF rate selected for FeliCa polling and subsequent exchange.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BitRate {

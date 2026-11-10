@@ -271,6 +271,148 @@ fn poll_response() -> Vec<u8> {
     packet
 }
 
+#[cfg(feature = "felica-lite-s")]
+mod lite_s {
+    use super::*;
+    use rcs956::felica::lite_s::{Error as LiteSError, Stage, UserBlock};
+
+    const CHALLENGE: [u8; 16] = [
+        0xf1, 0x87, 0x5a, 0x01, 0xf9, 0xb2, 0x9e, 0x4c, 0x06, 0xa1, 0xce, 0xc4, 0x16, 0x55, 0x85,
+        0xcf,
+    ];
+    const KEY: [u8; 16] = [
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+        0xff,
+    ];
+    const PMM: [u8; 8] = [0, 0xf1, 0, 0, 0, 0, 0, 0];
+    const COUNTER: [u8; 16] = [0x10, 0x20, 0x30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    const STATE: [u8; 16] = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+    fn read(blocks: &[u8], data: &[[u8; 16]], mac: [u8; 8]) -> Step {
+        let mut request = vec![0xc8, 0, 14 + 2 * blocks.len() as u8, 6];
+        request.extend(IDENTITY);
+        request.extend([1, 0x0b, 0, blocks.len() as u8]);
+        for &block in blocks {
+            request.extend([0x80, block]);
+        }
+        let mut reply = vec![0, 13 + 16 * blocks.len() as u8, 7];
+        reply.extend(IDENTITY);
+        reply.extend([0, 0, blocks.len() as u8]);
+        reply.extend(data.as_flattened());
+        reply.extend(mac);
+        reply.extend([0; 8]);
+        command(0xa0, &request, &reply)
+    }
+
+    fn write(block: u8, data: [u8; 16], mac: Option<[u8; 8]>) -> Step {
+        let mut request = vec![0xc8, 0, if mac.is_some() { 50 } else { 32 }, 8];
+        request.extend(IDENTITY);
+        request.extend([1, 9, 0, if mac.is_some() { 2 } else { 1 }, 0x80, block]);
+        if let Some(mac) = mac {
+            request.extend([0x80, 0x91]);
+            request.extend(data);
+            request.extend(mac);
+            request.extend(&COUNTER[..8]);
+        } else {
+            request.extend(data);
+        }
+        let mut reply = vec![0, 12, 9];
+        reply.extend(IDENTITY);
+        reply.extend([0, 0]);
+        command(0xa0, &request, &reply)
+    }
+
+    fn authentication(card_mac: [u8; 8]) -> Vec<Step> {
+        let mut steps = initialization(&config_image());
+        steps.extend(mode_configuration());
+        let mut identity = [0; 16];
+        identity[..8].copy_from_slice(&IDENTITY);
+        identity[8..].copy_from_slice(&PMM);
+        let mut poll = vec![1, 7, 18, 1];
+        poll.extend(identity);
+        steps.extend([
+            command(0x4a, &[1, 1, 0, 0x88, 0xb4, 0, 0], &poll),
+            write(0x80, CHALLENGE, None),
+            read(&[0x82, 0x90, 0x91], &[identity, COUNTER], card_mac),
+        ]);
+        steps
+    }
+
+    #[test]
+    fn mutually_authenticated_write_uses_the_authenticated_counter() -> Result<(), Box<dyn Error>> {
+        // The full trace uses fixed answers computed independently with
+        // DES3-CBC, reversing each 8-byte FeliCa field at the cipher boundary.
+        let mut steps = authentication(0x1f2787ed70615b68u64.to_be_bytes());
+        steps.extend([
+            write(0x92, STATE, Some(0x6326508df35e3a07u64.to_be_bytes())),
+            read(&[0x92, 0x91], &[STATE], 0x3ea6cbb6e7d3b470u64.to_be_bytes()),
+            read(
+                &[0x90, 0x91],
+                &[COUNTER],
+                0x37b2d88e659c8b38u64.to_be_bytes(),
+            ),
+            write(0, [0x5a; 16], Some(0x4b34193263b09c15u64.to_be_bytes())),
+            read(
+                &[0, 0x91],
+                &[[0x5a; 16]],
+                0xe99b8454a6b433adu64.to_be_bytes(),
+            ),
+            read(
+                &[0, 0x91],
+                &[[0x5b; 16]],
+                0xe99b8454a6b433adu64.to_be_bytes(),
+            ),
+        ]);
+        let (transport, journal) = Script::new(steps);
+        let mut reader = Reader::new(transport);
+        reader.initialize()?;
+        let poll = PollRequest::new(0x88b4, 0, 0)?;
+        let card = reader
+            .poll_felica(BitRate::Kbps212, poll, timeout()?)?
+            .ok_or("card absent")?;
+        let mut card = card.authenticate_lite_s(&KEY, CHALLENGE)?;
+        let block = UserBlock::new(0).ok_or("user block")?;
+        card.write_block(block, [0x5a; 16])?;
+        assert_eq!(card.read_block(block)?, [0x5a; 16]);
+        assert!(matches!(
+            card.read_block(block),
+            Err(LiteSError::MacMismatch(Stage::Read))
+        ));
+        assert!(matches!(
+            card.read_block(block),
+            Err(LiteSError::SessionUnavailable)
+        ));
+        assert_eq!(journal.borrow().remaining, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_card_proof_never_sends_the_host_proof() -> Result<(), Box<dyn Error>> {
+        let mut steps = authentication([0; 8]);
+        steps.push(command(0x32, &[1, 0], &[]));
+        steps.extend(mode_configuration());
+        steps.push(command(0x4a, &[1, 1, 0, 0x88, 0xb4, 0, 0], &[0]));
+        let (transport, journal) = Script::new(steps);
+        let mut reader = Reader::new(transport);
+        reader.initialize()?;
+        let poll = PollRequest::new(0x88b4, 0, 0)?;
+        let card = reader
+            .poll_felica(BitRate::Kbps212, poll, timeout()?)?
+            .ok_or("card absent")?;
+        assert!(matches!(
+            card.authenticate_lite_s(&KEY, CHALLENGE),
+            Err(LiteSError::MacMismatch(Stage::CardProof))
+        ));
+        assert!(
+            reader
+                .poll_felica(BitRate::Kbps212, poll, timeout()?)?
+                .is_none()
+        );
+        assert_eq!(journal.borrow().remaining, 0);
+        Ok(())
+    }
+}
+
 fn type_three_attribute(block: [u8; 16]) -> Step {
     let mut reply = vec![0, 29, 7, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 1];
     reply.extend(block);

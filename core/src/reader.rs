@@ -14,7 +14,7 @@ use crate::{
     transport::{Link, TransactionError, Transport},
 };
 use alloc::{vec, vec::Vec};
-use core::{error, fmt, time::Duration};
+use core::{error, fmt, num::NonZeroU8, time::Duration};
 
 /// Maximum card-command bytes accepted by the reader's NFC-A exchange.
 pub const MAX_TYPE_A_COMMAND_BYTES: usize = 262;
@@ -305,7 +305,7 @@ enum RfMode {
     Configured {
         protocol: RfProtocol,
         timer: ReaderTimer,
-        type2_sector: u8,
+        selection: RfSelection,
     },
     RawTypeA(RawTypeAResponse),
 }
@@ -314,6 +314,14 @@ enum RfMode {
 enum RawTypeAResponse {
     Idle,
     Pending { frames: usize },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RfSelection {
+    Ordinary,
+    Type2Sector(NonZeroU8),
+    #[cfg(feature = "felica-lite-s")]
+    FelicaAuthentication,
 }
 
 #[derive(Debug)]
@@ -422,17 +430,16 @@ impl<T: Transport> Reader<T> {
         protocol: RfProtocol,
         timeout: RfTimeout,
     ) -> Result<(), Error<T::Error>> {
-        if matches!(
-            self.state,
-            State::Ready {
-                rf: RfMode::RawTypeA(_)
+        if let State::Ready { rf, .. } = self.state
+            && !matches!(
+                rf,
+                RfMode::Off
                     | RfMode::Configured {
-                        type2_sector: 1..,
+                        selection: RfSelection::Ordinary,
                         ..
-                    },
-                ..
-            }
-        ) {
+                    }
+            )
+        {
             self.rf_off()?;
         }
         let timer = ReaderTimer::for_rf_timeout(timeout);
@@ -479,7 +486,7 @@ impl<T: Transport> Reader<T> {
             rf: RfMode::Configured {
                 protocol,
                 timer,
-                type2_sector: 0,
+                selection: RfSelection::Ordinary,
             },
             response_timeout,
         };
@@ -492,7 +499,7 @@ impl<T: Transport> Reader<T> {
         timeout: ResponseTimeout,
     ) -> Result<(), Error<T::Error>> {
         let desired_timer = ReaderTimer::for_rf_timeout(RfTimeout::new(timeout.wait())?);
-        let (info, applied_timer, applied_timeout, type2_sector) = match &self.state {
+        let (info, applied_timer, applied_timeout, selection) = match &self.state {
             State::Ready {
                 rf:
                     RfMode::Configured {
@@ -514,10 +521,10 @@ impl<T: Transport> Reader<T> {
                     RfMode::Configured {
                         protocol: applied,
                         timer,
-                        type2_sector,
+                        selection,
                     },
                 response_timeout,
-            } if *applied == protocol => (info.clone(), *timer, *response_timeout, *type2_sector),
+            } if *applied == protocol => (info.clone(), *timer, *response_timeout, *selection),
             _ => return Err(Error::NotInitialized),
         };
         // Do not publish a partial pair. Even if 32/02 succeeds, failure of 1C
@@ -534,7 +541,7 @@ impl<T: Transport> Reader<T> {
             rf: RfMode::Configured {
                 protocol,
                 timer: desired_timer,
-                type2_sector,
+                selection,
             },
             response_timeout: Some(timeout),
         };
@@ -659,7 +666,7 @@ impl<T: Transport> Reader<T> {
                     rf: RfMode::Configured {
                         protocol,
                         timer: ReaderTimer::for_rf_timeout(timeout),
-                        type2_sector: 0,
+                        selection: RfSelection::Ordinary,
                     },
                     response_timeout,
                 };
@@ -872,20 +879,25 @@ impl<'a, T: Transport> TypeACard<'a, T> {
     pub(crate) fn type2_sector(&self) -> u8 {
         match self.reader.state {
             State::Ready {
-                rf: RfMode::Configured { type2_sector, .. },
+                rf:
+                    RfMode::Configured {
+                        selection: RfSelection::Type2Sector(sector),
+                        ..
+                    },
                 ..
-            } => type2_sector,
+            } => sector.get(),
             _ => 0,
         }
     }
 
     pub(crate) fn record_type2_sector(&mut self, selected: u8) {
         if let State::Ready {
-            rf: RfMode::Configured { type2_sector, .. },
+            rf: RfMode::Configured { selection, .. },
             ..
         } = &mut self.reader.state
         {
-            *type2_sector = selected;
+            *selection =
+                NonZeroU8::new(selected).map_or(RfSelection::Ordinary, RfSelection::Type2Sector);
         }
     }
 
@@ -1213,6 +1225,17 @@ pub struct FelicaCard<'a, T: Transport> {
     timeout: RfTimeout,
 }
 impl<'a, T: Transport> FelicaCard<'a, T> {
+    #[cfg(feature = "felica-lite-s")]
+    pub(crate) fn begin_lite_s_authentication(&mut self) {
+        if let State::Ready {
+            rf: RfMode::Configured { selection, .. },
+            ..
+        } = &mut self.reader.state
+        {
+            *selection = RfSelection::FelicaAuthentication;
+        }
+    }
+
     /// Polling information. IDm is a session address, not a universal persistent ID.
     pub fn observation(&self) -> &PollResponse {
         &self.observation
