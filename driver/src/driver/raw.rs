@@ -13,6 +13,7 @@ use super::{
 pub(crate) struct Frontend {
     transport: UsbTransport,
     queues: Queues,
+    release: u16,
     control: Rc<Control>,
 }
 
@@ -20,11 +21,13 @@ impl Frontend {
     pub(crate) fn new(
         transport: UsbTransport,
         queues: Queues,
+        release: u16,
         control: Rc<Control>,
     ) -> Result<Self, Status> {
         Ok(Self {
             transport,
             queues,
+            release,
             control,
         })
     }
@@ -59,6 +62,7 @@ impl Frontend {
                     self.transport.recover()?;
                     Ok(Vec::new())
                 }
+                Command::DeviceRelease => Ok(self.release.to_le_bytes().to_vec()),
             }
         });
         match result {
@@ -73,6 +77,7 @@ enum Command<'a> {
     Write { wait: Duration, bytes: &'a [u8] },
     Read { wait: Duration, bytes: usize },
     Recover,
+    DeviceRelease,
 }
 
 impl<'a> Command<'a> {
@@ -101,6 +106,9 @@ impl<'a> Command<'a> {
             }
             abi::RECOVER if input.is_empty() && capacity == 0 => Ok(Self::Recover),
             abi::RECOVER => Err(invalid),
+            abi::DEVICE_RELEASE if !input.is_empty() => Err(invalid),
+            abi::DEVICE_RELEASE if capacity < abi::RELEASE => Err(Status(status::BUFFER_TOO_SMALL)),
+            abi::DEVICE_RELEASE => Ok(Self::DeviceRelease),
             _ => Err(Status(status::NOT_SUPPORTED)),
         }
     }
@@ -137,6 +145,18 @@ mod tests {
         assert_eq!(Command::parse(abi::RECOVER, &[], 0), Ok(Command::Recover));
         assert_eq!(
             Command::parse(abi::RECOVER, &[0], 0),
+            Err(Status(status::INVALID_PARAMETER))
+        );
+        assert_eq!(
+            Command::parse(abi::DEVICE_RELEASE, &[], abi::RELEASE),
+            Ok(Command::DeviceRelease)
+        );
+        assert_eq!(
+            Command::parse(abi::DEVICE_RELEASE, &[], abi::RELEASE - 1),
+            Err(Status(status::BUFFER_TOO_SMALL))
+        );
+        assert_eq!(
+            Command::parse(abi::DEVICE_RELEASE, &[0], abi::RELEASE),
             Err(Status(status::INVALID_PARAMETER))
         );
     }

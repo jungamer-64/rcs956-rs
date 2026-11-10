@@ -249,6 +249,9 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
         let path = select_path(path)?;
         let usb = Usb::open(&path)?;
         println!("Interface: {path}");
+        if command == "probe" {
+            println!("USB bcdDevice: {:04X}", usb.device_release()?);
+        }
         let mut reader = Reader::new(usb);
         if command == "dep-echo" {
             let [identity] = data.as_slice() else {

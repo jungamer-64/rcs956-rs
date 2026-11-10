@@ -26,6 +26,12 @@ pub const WRITE: u32 = ioctl(0x800);
 pub const READ: u32 = ioctl(0x801);
 /// Reset both USB pipes. Input and output are empty.
 pub const RECOVER: u32 = ioctl(0x802);
+/// Read `bcdDevice` from the USB device descriptor obtained when the driver
+/// bound the device. Input is empty. Output is [`RELEASE`] bytes, little-endian.
+/// The request issues no USB transfer and does not touch the reader stream.
+pub const DEVICE_RELEASE: u32 = ioctl(0x803);
+/// Size of the [`DEVICE_RELEASE`] output, in bytes.
+pub const RELEASE: usize = 2;
 /// Maximum USB transfer size admitted by this interface, in bytes.
 pub const MAX_TRANSFER: usize = 4096;
 /// Encoded timeout and write completion count size, in bytes.

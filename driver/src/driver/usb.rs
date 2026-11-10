@@ -21,6 +21,15 @@ const PACKET_SIZE: usize = 64;
 pub(crate) struct UsbDevice {
     device: WDFUSBDEVICE,
     pub(crate) pipes: Pipes,
+    /// `bcdDevice` of the descriptor validated when the target was opened.
+    #[cfg_attr(
+        feature = "pcsc",
+        expect(
+            dead_code,
+            reason = "only the USB interface publishes the device release"
+        )
+    )]
+    pub(crate) release: u16,
 }
 
 // SAFETY: The framework handle is used by serialized PnP callbacks. Its
@@ -55,7 +64,11 @@ impl UsbDevice {
             )
         })?;
         match Self::select(device) {
-            Ok(pipes) => Ok(Self { device, pipes }),
+            Ok((pipes, release)) => Ok(Self {
+                device,
+                pipes,
+                release,
+            }),
             Err(error) => {
                 delete(device);
                 Err(error)
@@ -63,7 +76,7 @@ impl UsbDevice {
         }
     }
 
-    fn select(device: WDFUSBDEVICE) -> Result<Pipes, Status> {
+    fn select(device: WDFUSBDEVICE) -> Result<(Pipes, u16), Status> {
         let mut descriptor = USB_DEVICE_DESCRIPTOR::default();
         // SAFETY: The USB target owns a descriptor and writes it into this buffer.
         unsafe {
@@ -130,7 +143,7 @@ impl UsbDevice {
         unsafe {
             call_unsafe_wdf_function_binding!(WdfUsbTargetPipeSetNoMaximumPacketSizeCheck, input)
         };
-        Ok(Pipes { input, output })
+        Ok((Pipes { input, output }, descriptor.bcdDevice))
     }
 
     pub(crate) fn release(self) {

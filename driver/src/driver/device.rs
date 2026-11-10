@@ -181,6 +181,8 @@ extern "C" fn d0_entry(device: WDFDEVICE, _: WDF_DEVICE_POWER_STATE) -> NTSTATUS
         match Worker::start(
             usb.pipes,
             queues,
+            #[cfg(feature = "usb")]
+            usb.release,
             #[cfg(feature = "pcsc")]
             state.unit,
         ) {

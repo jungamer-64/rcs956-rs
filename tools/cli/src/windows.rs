@@ -304,6 +304,18 @@ impl Usb {
         })
     }
 
+    /// `bcdDevice` of the bound USB device. No USB transfer is issued.
+    pub(super) fn device_release(&self) -> io::Result<u16> {
+        let mut release = [0; abi::RELEASE];
+        if self.control(abi::DEVICE_RELEASE, &[], &mut release)? != abi::RELEASE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid device release length",
+            ));
+        }
+        Ok(u16::from_le_bytes(release))
+    }
+
     fn control(&self, code: u32, input: &[u8], output: &mut [u8]) -> io::Result<usize> {
         let mut count = 0;
         let input_bytes = u32::try_from(input.len()).map_err(io::Error::other)?;

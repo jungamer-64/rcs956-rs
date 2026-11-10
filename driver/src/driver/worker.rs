@@ -52,6 +52,7 @@ impl Worker {
     pub(crate) fn start(
         pipes: Pipes,
         queues: Queues,
+        #[cfg(feature = "usb")] release: u16,
         #[cfg(feature = "pcsc")] unit: u32,
     ) -> Result<Self, Status> {
         let stop = Arc::new(AtomicBool::new(false));
@@ -69,6 +70,8 @@ impl Worker {
                 let mut frontend = match Frontend::new(
                     transport,
                     queues,
+                    #[cfg(feature = "usb")]
+                    release,
                     #[cfg(feature = "pcsc")]
                     unit,
                     Rc::clone(&control),

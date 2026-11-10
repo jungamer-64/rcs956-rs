@@ -50,7 +50,7 @@ read例のservice／systemは対象カードに存在するものを指定する
 
 両モードは USB ID `054C:02E1` と 64-byte Bulk IN／OUT を検査する。同じ USB function にインストールするドライバパッケージは一つ。CLI の `devices` は接続中のデバイスと、USB モードで開けるパスを表示する。
 
-USB モードは単一のクライアントに USB 転送を許可する。reader の初期化、取引の回復、NDEF と各カードプロトコルはクライアントで動作する。ドライバは転送長とタイムアウトを検査して USB I/O を直列化する。アプリケーションコマンドをドライバ内で再実行しない。
+USB モードは単一のクライアントに USB 転送を許可する。reader の初期化、取引の回復、NDEF と各カードプロトコルはクライアントで動作する。ドライバは転送長とタイムアウトを検査して USB I/O を直列化する。デバイス記述子の `bcdDevice` は、bind 時に検査した記述子の値を USB 転送なしで返す。アプリケーションコマンドをドライバ内で再実行しない。
 
 PC/SC モードでは Smart Card Resource Manager が USB デバイスを NFC-A／NFC-B の ISO-DEP リーダーとして利用する。T=1 の ATR を生成し、WinSCard から最大262 bytesの APDU を選択中のカードに送る。カードの待機中は挿入と離脱をポーリングする。接続中のカードの離脱は APDU 交換の失敗、または電源解除後の再ポーリングで検出する。FeliCa とストレージカードの疑似 APDU は PC/SC モードの対象外。
 
@@ -117,7 +117,7 @@ MIFARE Classicはcallerが指定したkeyでreaderが認証し、成功したsec
 
 固定packet vectorはデバイスに送るフレームと応答の解釈を検証する。実機captureはUSBとRFの観測範囲を別途記録する。
 
-実機検証では、`devices`による対象／service／path、`probe`のfirmware／model／製品名／機器名／設定checksum、`poll`のidentity／PMm、対象serviceを指定した`read`を別々に記録する。CLI出力はAPIの観測結果であり、USB bus上のZLPやRF timingのcaptureとは区別する。全firmware、PC/SC完全互換、全カードcommand／APDUの意味と副作用の成立は、この検証の対象に含めない。NFC-A／Bの固定vectorはカード実機の成功証拠ではない。
+実機検証では、`devices`による対象／service／path、`probe`のbcdDevice／firmware／model／製品名／機器名／設定checksum、`poll`のidentity／PMm、対象serviceを指定した`read`を別々に記録する。CLI出力はAPIの観測結果であり、USB bus上のZLPやRF timingのcaptureとは区別する。全firmware、PC/SC完全互換、全カードcommand／APDUの意味と副作用の成立は、この検証の対象に含めない。NFC-A／Bの固定vectorはカード実機の成功証拠ではない。
 
 ## 外部実装へ委譲する責務
 
