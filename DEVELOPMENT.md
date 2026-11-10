@@ -34,7 +34,7 @@ WinUSBでないserviceが列挙された場合、`devices`の結果で実際のb
 
 NFC-AはUID（4／7／10 bytes）、SAK、optional ATSのTLとinterface byte境界を検査する。カード交換は`40 target`で最大262 bytesを送り、成功したreader statusの上位bitsも保持する。別controllerのMI処理を仮定した自動継続は行わない。ATSがないカードの検出は、ISO-DEPのactivation成立と同一ではない。
 
-NFC-Aの`40`交換では、要求待機を整数msへ切り上げ、`32 02 0B 0B code`の段階値へ変換する。RF応答待機は最大3280 msへ制限され、`1C`にはその実効待機を使う。host待機は実効待機に1秒を加える。成功したselectorとreader timerだけを保持し、同値の設定送信を省略する。RF offやtargetの再選択でselectorは失効しないが、reset／不確定な設定失敗では失効する。設定の途中で失敗した場合、カードcommandを送らず再初期化を要求する。
+NFC-Aの`40`交換では、要求待機を整数msへ切り上げ、`32 02 0B 0B code`の段階値へ変換する。RF応答待機は最大3280 msへ制限され、`1C`にはその実効待機を使う。host待機は実効待機に1秒を加える。成功したselectorとreader timerだけを保持し、同値の設定送信を省略する。RF offやtargetの再選択でselectorは失効しないが、reset／不確定な設定失敗では失効する。`TypeAExchangeError::Preparation`はカードcommand送信前の設定失敗を示し、再初期化を要求する。`Exchange`はカード交換段階の失敗を示し、原因に応じてカードへの効果が不明になり得る。
 
 NFC-BはATQB／ATTRIBを検査し、ISO-DEP対応のtargetだけを通信sessionとして公開する。通常table3とAFI wildcardを使う。FSCIは0〜8、FWIは0〜14、CIDは0〜14を受理し、非zero CIDはカードの対応を必要とする。NAD付きblockは扱わない。送信frameはカードのFSCと64-byte reader容量の小さい方に制限する。受信はRC-S956のoptional activation extensionのFSDI（省略時5）と64-byte容量の小さい方を上限とする。MBLIが非zeroの場合は`FSC × 2^MBLI`のカードbuffer上限も送信前に検査し、zeroの場合は上限不明として扱う。CRCはreaderに委譲する。FeliCaの非暗号化読取とNFC-Bの個別block交換は`A0`を使う。
 

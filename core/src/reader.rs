@@ -753,7 +753,10 @@ impl<T: Transport> TypeACard<'_, T> {
     /// Invalid input leaves the selection unchanged. Timing setup failure
     /// revokes the selection before any card command is sent. A transport
     /// failure or RF status 0D during exchange also revokes the selection.
-    pub fn exchange(&mut self, data: &[u8]) -> Result<TargetResponse, TypeAExchangeError<T::Error>> {
+    pub fn exchange(
+        &mut self,
+        data: &[u8],
+    ) -> Result<TargetResponse, TypeAExchangeError<T::Error>> {
         if data.is_empty() || data.len() > MAX_TYPE_A_COMMAND_BYTES {
             return Err(TypeAExchangeError::InputLength(data.len()));
         }

@@ -5,7 +5,10 @@
 use rcs956_core::{
     felica::{Idm, PollRequest},
     isodep,
-    reader::{ConfigurationError, Error as ReaderError, Reader, RfTimeout, TimeoutRange},
+    reader::{
+        ConfigurationError, Error as ReaderError, Reader, RfTimeout, TimeoutRange,
+        TypeAExchangeError,
+    },
     transport::{Progress, TransactionError, Transport},
     wire::{self, Direction, Frame},
 };
@@ -653,10 +656,7 @@ fn type_a_exchange_uses_selected_target_and_preserves_status() -> Result<(), Box
     let before = journal.borrow().requests.len();
     assert!(matches!(
         card.exchange(&vec![0; 263]),
-        Err(ReaderError::InputLength {
-            maximum: 262,
-            actual: 263
-        })
+        Err(TypeAExchangeError::InputLength(263))
     ));
     assert_eq!(journal.borrow().requests.len(), before);
     let reply = card.exchange(&[0, 0xa4, 4, 0])?;
@@ -664,12 +664,12 @@ fn type_a_exchange_uses_selected_target_and_preserves_status() -> Result<(), Box
     assert_eq!(reply.data, [0x90, 0]);
     assert!(matches!(
         card.exchange(&[0x30, 0]),
-        Err(ReaderError::RfStatus(0x0d))
+        Err(TypeAExchangeError::Exchange(ReaderError::RfStatus(0x0d)))
     ));
     let before = journal.borrow().requests.len();
     assert!(matches!(
         card.exchange(&[0x30, 0]),
-        Err(ReaderError::NotInitialized)
+        Err(TypeAExchangeError::SessionInvalid)
     ));
     assert_eq!(journal.borrow().requests.len(), before);
     assert_eq!(journal.borrow().remaining, 0);
@@ -1100,21 +1100,30 @@ fn type_a_quantized_timer_and_selector_cache_have_independent_lifetimes()
 }
 
 #[test]
-fn partial_type_a_timing_setup_never_admits_a_card_command() -> Result<(), Box<dyn Error>> {
-    for lose_timer in [false, true] {
+fn type_a_failures_distinguish_timing_setup_from_card_exchange() -> Result<(), Box<dyn Error>> {
+    for lost_command in [0x32, 0x1c, 0x40] {
         let mut steps = initialization(&ab_config_image());
         let mut setup = ab_mode(false);
         setup[0] = command(0x1c, &[0x80, 0xc7, 0], &[]);
         steps.extend(setup);
         steps.push(command(0x4a, &[1, 0], &type_a_response(7)));
-        let failure = if lose_timer {
-            steps.push(command(0x32, &[2, 0x0b, 0x0b, 0x10], &[]));
-            Request::Command(0x1c, vec![0x80, 0x8f, 1])
-        } else {
-            Request::Command(0x32, vec![2, 0x0b, 0x0b, 0x10])
+        let selector = [2, 0x0b, 0x0b, 0x10];
+        let timer = [0x80, 0x8f, 1];
+        let args = match lost_command {
+            0x32 => selector.to_vec(),
+            0x1c => {
+                steps.push(command(0x32, &selector, &[]));
+                timer.to_vec()
+            }
+            _ => {
+                steps.push(command(0x32, &selector, &[]));
+                steps.push(command(0x1c, &timer, &[]));
+                vec![7, 0xa4]
+            }
         };
+        let request = Request::Command(lost_command, args);
         steps.push(Step {
-            request: failure,
+            request: request.clone(),
             answer: Answer::LostAfterAck,
         });
         let (script, journal) = Script::new(steps);
@@ -1123,17 +1132,28 @@ fn partial_type_a_timing_setup_never_admits_a_card_command() -> Result<(), Box<d
         let mut card = reader
             .poll_type_a(RfTimeout::new(Duration::from_secs(2))?)?
             .ok_or("expected NFC-A card")?;
+        let result = card.exchange(&[0xa4]);
+        let error = match result {
+            Err(TypeAExchangeError::Exchange(error)) if lost_command == 0x40 => error,
+            Err(TypeAExchangeError::Preparation(error)) if lost_command != 0x40 => error,
+            other => {
+                return Err(
+                    format!("unexpected error phase for {lost_command:02x}: {other:?}").into(),
+                );
+            }
+        };
         assert!(matches!(
-            card.exchange(&[0xa4]),
-            Err(ReaderError::Transaction(TransactionError {
+            error,
+            ReaderError::Transaction(TransactionError {
                 progress: Progress::Acknowledged,
                 ..
-            }))
+            })
         ));
+        assert_eq!(journal.borrow().requests.last(), Some(&request));
         let count = journal.borrow().requests.len();
         assert!(matches!(
             card.exchange(&[0xa4]),
-            Err(ReaderError::NotInitialized)
+            Err(TypeAExchangeError::SessionInvalid)
         ));
         assert_eq!(journal.borrow().requests.len(), count);
         assert_eq!(journal.borrow().remaining, 0);
