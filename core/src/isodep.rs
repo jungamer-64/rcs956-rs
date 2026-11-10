@@ -13,6 +13,7 @@ const MAX_RESPONSE: usize = 65_536;
 const MAX_FRAMES: usize = 2048;
 const MAX_WTX: usize = 32;
 const MAX_RETRANSMISSIONS: usize = 2;
+const MAX_BLOCK_WAIT: Duration = block_frame_wait(14);
 
 pub(crate) fn frame_size(index: u8) -> Option<u16> {
     [16, 24, 32, 40, 48, 64, 96, 128, 256]
@@ -25,7 +26,7 @@ pub(crate) fn frame_wait(index: u8) -> Duration {
     Duration::from_nanos((4_096_000_000_000u64 * (1u64 << index)).div_ceil(13_560_000))
 }
 
-pub(crate) fn block_frame_wait(index: u8) -> Duration {
+pub(crate) const fn block_frame_wait(index: u8) -> Duration {
     Duration::from_micros(330 * (1u64 << index))
 }
 
@@ -161,7 +162,7 @@ impl Session {
         {
             return Err(ParameterError::Cid(cid));
         }
-        if wait.is_zero() || wait > block_frame_wait(14) {
+        if wait.is_zero() || wait > MAX_BLOCK_WAIT {
             return Err(ParameterError::Wait);
         }
         Ok(Self {
@@ -308,21 +309,23 @@ impl PreparedExchange<'_, '_> {
                         }
                         extensions += 1;
                         let multiplier = body[0] & 0x3f;
-                        wait = session
-                            .wait
-                            .checked_mul(u32::from(multiplier))
-                            .ok_or(Cause::InvalidBlock("WTX duration overflow"))?;
+                        // Apply FWT_MAX in the same guarded reader units as the base wait.
+                        wait = (session.wait * u32::from(multiplier)).min(MAX_BLOCK_WAIT);
                         pending = session.frame(0xf2, &[multiplier]);
                     }
                     0xc2 => return Err(Cause::Deselected),
-                    0xa2 | 0xa3 | 0xb2 | 0xb3 => {
+                    0xb2 | 0xb3 => return Err(Cause::InvalidBlock("R-NAK from card")),
+                    0xa2 | 0xa3 => {
                         if !body.is_empty() {
                             return Err(Cause::InvalidBlock("R-block data"));
                         }
                         let Phase::Sending { end, more } = phase else {
                             return Err(Cause::InvalidBlock("R-block during response"));
                         };
-                        if pcb & 0x10 == 0 && pcb & 1 == number {
+                        if apdu.len() <= capacity {
+                            return Err(Cause::InvalidBlock("R-ACK for unchained command"));
+                        }
+                        if pcb & 1 == number {
                             if !more {
                                 return Err(Cause::InvalidBlock("R-ACK without command chaining"));
                             }
@@ -465,17 +468,19 @@ mod tests {
     }
 
     #[test]
-    fn protocol_nak_resends_one_block_and_duplicate_response_is_not_appended()
+    fn chained_command_and_response_retry_only_the_current_block()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut link = session(64, None)?;
+        let mut link = session(16, None)?;
+        let first = [&[0x12][..], &[0x55; 13]].concat();
         let mut steps = VecDeque::from([
-            (vec![2, 0xa4], vec![0xb2]),
-            (vec![2, 0xa4], vec![0x12, 0xaa]),
-            (vec![0xa3], vec![0x12, 0xaa]),
-            (vec![0xa3], vec![3, 0xbb]),
+            (first, vec![0xa2]),
+            (vec![3, 0x55], vec![0xa2]),
+            (vec![3, 0x55], vec![0x13, 0xaa]),
+            (vec![0xa2], vec![0x13, 0xaa]),
+            (vec![0xa2], vec![2, 0xbb]),
         ]);
         assert_eq!(
-            link.prepare::<io::Error>(&[0xa4])?
+            link.prepare::<io::Error>(&[0x55; 14])?
                 .exchange(Ok(()), |frame, _| {
                     let (expected, reply) = steps
                         .pop_front()
@@ -618,10 +623,10 @@ mod tests {
             .ok_or("expected exhaustion")?;
         assert!(matches!(error.cause, Cause::Budget(Budget::WaitExtensions)));
         assert_eq!(error.progress.frames, 33);
-        let mut link = session(64, None)?;
+        let mut link = session(16, None)?;
         let error = link
-            .prepare::<io::Error>(&[1])?
-            .exchange(Ok(()), |_, _| Ok::<_, io::Error>(vec![0xb2]))
+            .prepare::<io::Error>(&[1; 14])?
+            .exchange(Ok(()), |_, _| Ok::<_, io::Error>(vec![0xa3]))
             .err()
             .ok_or("expected exhaustion")?;
         assert!(matches!(

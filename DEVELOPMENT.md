@@ -36,13 +36,13 @@ NFC-AはUID（4／7／10 bytes）、SAK、optional ATSのTLとinterface byte境�
 
 NFC-Aの`40`交換では、要求待機を整数msへ切り上げ、`32 02 0B 0B code`の段階値へ変換する。RF応答待機は最大3280 msへ制限され、`1C`にはその実効待機を使う。host待機は実効待機に1秒を加える。成功したselectorとreader timerだけを保持し、同値の設定送信を省略する。RF offやtargetの再選択でselectorは失効しないが、reset／不確定な設定失敗では失効する。`TypeAExchangeError::Preparation`はカードcommand送信前の設定失敗を示し、再初期化を要求する。`Exchange`はカード交換段階の失敗を示し、原因に応じてカードへの効果が不明になり得る。
 
-NFC-BはATQB／ATTRIBを検査し、ISO-DEP対応のtargetだけを通信sessionとして公開する。通常table3とAFI wildcardを使う。FSCIは0〜8、FWIは0〜14、CIDは0〜14を受理し、非zero CIDはカードの対応を必要とする。NAD付きblockは扱わない。送信frameはカードのFSCと64-byte reader容量の小さい方に制限する。受信はRC-S956のoptional activation extensionのFSDI（省略時5）と64-byte容量の小さい方を上限とする。MBLIが非zeroの場合は`FSC × 2^MBLI`のカードbuffer上限も送信前に検査し、zeroの場合は上限不明として扱う。CRCはreaderに委譲する。FeliCaの非暗号化読取とNFC-Bの個別block交換は`A0`を使う。
+NFC-BはATQB／ATTRIBを検査し、ISO-DEP対応のtargetだけを通信sessionとして公開する。通常table3とAFI wildcardを使う。FSCIは0〜8、FWIは0〜14、CIDは0〜14を受理し、非zero CIDはカードの対応を必要とする。NAD付きblockは扱わない。送信frameはカードのFSCと64-byte reader容量の小さい方に制限する。受信はRC-S956のoptional activation extensionのFSDI（省略時5）と64-byte容量の小さい方を上限とする。MBLIが非zeroの場合は`FSC × 2^(MBLI − 1)`のカードbuffer上限も送信前に検査し、zeroの場合は上限不明として扱う。CRCはreaderに委譲する。FeliCaの非暗号化読取とNFC-Bの個別block交換は`A0`を使う。
 
 NFC-BのAPDU交換前には`32 02 0B 0B 10`と`1C 80 8F 01`を設定する。`32/02`の実効待機3280 msから`1C`を決め、blockごとのFWI／WTX待機は`A0`へ独立に指定する。WTXで`1C`は変更しない。成功したselectorとtimerは別々に保持し、再検出やprotocol切替でtimerが変わればAPDU前に再適用する。設定の途中で失敗した場合はapplication blockを送信せず再初期化を要求する。
 
-NFC-BのISO-DEP sessionはblock番号、送受信chaining、R-block、WTXを処理する。空のINFを持つ継続I-blockも受理し、応答bytesを増やさずblock番号とframe数を進めてR-ACKを返す。application入力は1〜65535 bytes、応答は65536 bytes、RF callbackは2048回、WTXは32回、protocol再送は2回を上限とする。最低限の送信frame数だけでbudgetを超える入力は送信前に拒否する。初期block待機はATQBのFWIに基づく`330 us × 2^FWI`で、WTX時には要求倍率を掛ける。`--timeout-ms`は検出待機を指定し、NFC-Bの各block待機を上書きしない。`A0`の待機表現を超えるWTXは短く丸めずエラーにする。
+NFC-BのISO-DEP sessionはblock番号、送受信chaining、R-block、WTXを処理する。空のINFを持つ継続I-blockも受理し、応答bytesを増やさずblock番号とframe数を進めてR-ACKを返す。application入力は1〜65535 bytes、応答は65536 bytes、RF callbackは2048回、WTXは32回、protocol再送は2回を上限とする。最低限の送信frame数だけでbudgetを超える入力は送信前に拒否する。初期block待機はATQBのFWIに基づく`330 us × 2^FWI`。WTXでは要求倍率を応答に返し、待機は倍率を掛けた値をFWI=14相当の上限に制限する。`--timeout-ms`は検出待機を指定し、NFC-Bの各block待機を上書きしない。
 
-APDUの入力と最低frame数を検査してからreader設定を始める。入力拒否はsessionを保持する。設定失敗は`Cause::Preparation`として返し、applicationの送信progressとRF frame数を0に保ってsessionを失効させる。RF交換を開始した後の失敗もsessionを失効させ、attemptした入力prefix、確認済みprefix、受信済み応答、frame数をerrorに残す。transport失敗の再送はせず、R-blockで要求された同一blockの再送だけをbudget内で行う。
+APDUの入力と最低frame数を検査してからreader設定を始める。入力拒否はsessionを保持する。設定失敗は`Cause::Preparation`として返し、applicationの送信progressとRF frame数を0に保ってsessionを失効させる。RF交換を開始した後の失敗もsessionを失効させ、attemptした入力prefix、確認済みprefix、受信済み応答、frame数をerrorに残す。送信chaining中に番号の異なるR-ACKを受けたときは直前のI-blockを再送できる。応答chaining中の重複I-blockには同じR-ACKを返す。カードからのR-NAKと、単一I-blockのcommandに対するR-ACKはprotocol errorとして扱う。
 
 カードhandleはreaderの排他的borrowを保持する。transport失敗後にはRF readinessが失効する。RF statusのmask後の値が0Dの場合も再初期化を要求する。0Bの場合はraw値を保持してエラーを返す前に10 msの待機を入れる。readerへの`initialize`は明示的な再同期であり、失敗したカード操作の再実行や結果照合ではない。`rf_off`の失敗はcallerが観測する。DropはOS resourceの解放だけを担当する。
 

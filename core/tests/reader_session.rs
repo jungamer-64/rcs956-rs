@@ -633,6 +633,16 @@ fn type_b_response() -> Vec<u8> {
     vec![1, 9, 0x50, 1, 2, 3, 4, 0, 0, 0, 0, 0, 0x51, 0x40, 1, 0]
 }
 
+fn type_b_exchange_steps(activation: &[u8]) -> Vec<Step> {
+    let mut steps = initialization(&ab_config_image());
+    steps.extend(ab_mode(true));
+    steps.push(command(0x4a, &[1, 3, 0, 1], activation));
+    steps.push(command(8, &[0x63, 3, 0x8b], &[0]));
+    steps.push(command(0x32, &[2, 0x0b, 0x0b, 0x10], &[]));
+    steps.push(command(0x1c, &[0x80, 0x8f, 1], &[]));
+    steps
+}
+
 #[test]
 fn type_a_exchange_uses_selected_target_and_preserves_status() -> Result<(), Box<dyn Error>> {
     let mut steps = initialization(&ab_config_image());
@@ -678,12 +688,7 @@ fn type_a_exchange_uses_selected_target_and_preserves_status() -> Result<(), Box
 
 #[test]
 fn type_b_apdu_uses_software_blocks_without_felica_mode() -> Result<(), Box<dyn Error>> {
-    let mut steps = initialization(&ab_config_image());
-    steps.extend(ab_mode(true));
-    steps.push(command(0x4a, &[1, 3, 0, 1], &type_b_response()));
-    steps.push(command(8, &[0x63, 3, 0x8b], &[0]));
-    steps.push(command(0x32, &[2, 0x0b, 0x0b, 0x10], &[]));
-    steps.push(command(0x1c, &[0x80, 0x8f, 1], &[]));
+    let mut steps = type_b_exchange_steps(&type_b_response());
     steps.push(command(0xa0, &[11, 0, 2, 0, 0xa4, 4, 0], &[0, 2, 0x90, 0]));
     steps.push(command(
         0xa0,
@@ -758,37 +763,115 @@ fn type_b_activation_register_failure_revokes_readiness() -> Result<(), Box<dyn 
 }
 
 #[test]
-fn type_b_wtx_changes_only_the_block_wait_after_apdu_timing_setup() -> Result<(), Box<dyn Error>> {
-    let mut response = type_b_response();
-    response[13] = 0x80; // ATQB FWI8 -> 84.48 ms block wait.
-    let mut steps = initialization(&ab_config_image());
-    steps.extend(ab_mode(true));
-    steps.push(command(0x4a, &[1, 3, 0, 1], &response));
-    steps.push(command(8, &[0x63, 3, 0x8b], &[0]));
-    steps.push(command(0x32, &[2, 0x0b, 0x0b, 0x10], &[]));
-    steps.push(command(0x1c, &[0x80, 0x8f, 1], &[]));
-    steps.push(command(0xa0, &[0xa9, 0, 2, 0xa4], &[0, 0xf2, 20]));
-    steps.push(command(0xa0, &[0x34, 0x0d, 0xf2, 20], &[0, 2, 0x90, 0]));
+fn type_b_wtx_echoes_the_multiplier_with_a_bounded_a0_wait() -> Result<(), Box<dyn Error>> {
+    for (fwi, multiplier, base, extended) in [
+        (8, 20, [0xa9, 0], [0x34, 0x0d]),
+        (14, 7, [0x3e, 0x2a], [0x3e, 0x2a]),
+    ] {
+        let mut activation = type_b_response();
+        activation[13] = fwi << 4;
+        let mut steps = type_b_exchange_steps(&activation);
+        steps.push(command(
+            0xa0,
+            &[base[0], base[1], 2, 0xa4],
+            &[0, 0xf2, multiplier],
+        ));
+        steps.push(command(
+            0xa0,
+            &[extended[0], extended[1], 0xf2, multiplier],
+            &[0, 2, 0x90, 0],
+        ));
+        let (script, journal) = Script::new(steps);
+        let mut reader = Reader::new(script);
+        reader.initialize()?;
+        let mut card = reader
+            .poll_type_b(timeout()?)?
+            .ok_or("expected NFC-B card")?;
+        assert_eq!(card.exchange_apdu(&[0xa4])?, [0x90, 0]);
+        assert_eq!(journal.borrow().remaining, 0);
+    }
+    Ok(())
+}
+
+#[test]
+fn type_b_card_buffer_limit_is_enforced_before_timing_setup() -> Result<(), Box<dyn Error>> {
+    let mut activation = type_b_response();
+    activation[15] = 0x10; // FSC=64 and MBLI=1 give a 64-byte card buffer.
+    let mut steps = type_b_exchange_steps(&activation);
+    let apdu = [0x55; 64];
+    let first = [&[11, 0, 0x12][..], &apdu[..61]].concat();
+    let last = [&[11, 0, 0x03][..], &apdu[61..]].concat();
+    steps.push(command(0xa0, &first, &[0, 0xa2]));
+    steps.push(command(0xa0, &last, &[0, 3, 0x90, 0]));
     let (script, journal) = Script::new(steps);
     let mut reader = Reader::new(script);
     reader.initialize()?;
     let mut card = reader
         .poll_type_b(timeout()?)?
         .ok_or("expected NFC-B card")?;
-    assert_eq!(card.exchange_apdu(&[0xa4])?, [0x90, 0]);
+    let before = journal.borrow().requests.len();
+    let error = card
+        .exchange_apdu(&[0x55; 65])
+        .err()
+        .ok_or("expected input rejection")?;
+    assert!(matches!(
+        error.cause,
+        isodep::Cause::InputLength {
+            maximum: 64,
+            actual: 65
+        }
+    ));
+    assert_eq!(error.progress, isodep::Progress::default());
+    assert_eq!(journal.borrow().requests.len(), before);
+    assert_eq!(card.exchange_apdu(&apdu)?, [0x90, 0]);
     assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn type_b_invalid_r_blocks_stop_without_retransmitting() -> Result<(), Box<dyn Error>> {
+    for (pcb, payload_len, sent_pcb) in [(0xb2, 1, 2), (0xa3, 1, 2), (0xb2, 57, 0x12)] {
+        let mut steps = type_b_exchange_steps(&type_b_response());
+        let apdu = [
+            &[0, 0xd6, 0, 0, payload_len][..],
+            &vec![0x5a; usize::from(payload_len)],
+        ]
+        .concat();
+        let sent_len = apdu.len().min(61);
+        let block = [&[11, 0, sent_pcb][..], &apdu[..sent_len]].concat();
+        steps.push(command(0xa0, &block, &[0, pcb]));
+        let (script, journal) = Script::new(steps);
+        let mut reader = Reader::new(script);
+        reader.initialize()?;
+        let mut card = reader
+            .poll_type_b(timeout()?)?
+            .ok_or("expected NFC-B card")?;
+        let error = card
+            .exchange_apdu(&apdu)
+            .err()
+            .ok_or("expected invalid block")?;
+        assert!(matches!(error.cause, isodep::Cause::InvalidBlock(_)));
+        assert_eq!(error.progress.frames, 1);
+        assert_eq!(error.progress.attempted_application_bytes, sent_len);
+        assert_eq!(error.progress.acknowledged_application_bytes, 0);
+        let before = journal.borrow().requests.len();
+        assert!(matches!(
+            card.exchange_apdu(&apdu),
+            Err(isodep::Error {
+                cause: isodep::Cause::SessionInvalid,
+                ..
+            })
+        ));
+        assert_eq!(journal.borrow().requests.len(), before);
+        assert_eq!(journal.borrow().remaining, 0);
+    }
     Ok(())
 }
 
 #[test]
 fn type_b_lost_exchange_keeps_transport_progress_without_apdu_replay() -> Result<(), Box<dyn Error>>
 {
-    let mut steps = initialization(&ab_config_image());
-    steps.extend(ab_mode(true));
-    steps.push(command(0x4a, &[1, 3, 0, 1], &type_b_response()));
-    steps.push(command(8, &[0x63, 3, 0x8b], &[0]));
-    steps.push(command(0x32, &[2, 0x0b, 0x0b, 0x10], &[]));
-    steps.push(command(0x1c, &[0x80, 0x8f, 1], &[]));
+    let mut steps = type_b_exchange_steps(&type_b_response());
     steps.push(Step {
         request: Request::Command(0xa0, vec![11, 0, 2, 0xa4]),
         answer: Answer::LostAfterAck,

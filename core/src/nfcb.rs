@@ -170,11 +170,11 @@ impl Observation {
         self.reader_frame_size
     }
     /// Advertised command buffer limit, or unknown when MBLI is zero.
-    /// The RC-S956 driver interprets nonzero MBLI as `FSC * 2^MBLI`.
+    /// A nonzero MBLI encodes `FSC * 2^(MBLI - 1)`.
     pub fn maximum_command_bytes(&self) -> Option<usize> {
         match self.mbli() {
             0 => None,
-            mbli => Some(usize::from(self.frame_size) << mbli),
+            mbli => Some(usize::from(self.frame_size) << (mbli - 1)),
         }
     }
 }
@@ -224,7 +224,7 @@ mod tests {
         let observation = Observation::parse(&data)?;
         assert_eq!(observation.frame_size(), 64);
         assert_eq!(observation.reader_frame_size(), 32);
-        assert_eq!(observation.maximum_command_bytes(), Some(256));
+        assert_eq!(observation.maximum_command_bytes(), Some(128));
         data[14] = 9;
         assert!(matches!(
             Observation::parse(&data),
