@@ -1,37 +1,21 @@
-//! Windows WinUSB binding. Does not install, remove, or replace an OS driver.
-//!
-//! WinUSB must already own the selected function. Synchronous pipe operations
-//! retain all buffers until completion and use a finite pipe timeout.
+//! Windows device discovery.
 
 mod metadata;
-#[cfg(test)]
-mod registry_tests;
 
-use rcs956_core::transport::Transport;
 use std::{
-    fmt, io,
+    io,
     mem::{offset_of, size_of},
-    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     ptr::{null, null_mut},
-    thread,
-    time::{Duration, Instant},
 };
 use windows_sys::{
     Win32::{
         Devices::{
             DeviceAndDriverInstallation::*,
             Properties::{DEVPKEY_Device_DeviceDesc, DEVPKEY_Device_Service, DEVPROP_TYPE_STRING},
-            Usb::*,
         },
         Foundation::{
-            DEVPROPKEY, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_KEY_DOES_NOT_EXIST,
-            ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_NOT_FOUND, ERROR_PATH_NOT_FOUND,
-            GetLastError, INVALID_HANDLE_VALUE,
-        },
-        Storage::FileSystem::{CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING},
-        System::Registry::{
-            HKEY, KEY_QUERY_VALUE, REG_ROUTINE_FLAGS, RRF_RT_REG_MULTI_SZ, RRF_RT_REG_SZ,
-            RegCloseKey, RegGetValueW,
+            DEVPROPKEY, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_ITEMS, ERROR_NOT_FOUND,
+            GetLastError,
         },
     },
     core::GUID,
@@ -46,9 +30,9 @@ pub struct Device {
     pub description: Option<String>,
     /// Active OS function service, absent if no service property is registered.
     pub service: Option<String>,
-    /// Registered WinUSB application interface aliases of this exact function.
+    /// Registered raw USB application interface aliases of this exact function.
     /// USB hub presence interfaces are not candidates for application I/O.
-    pub winusb_paths: Vec<String>,
+    pub usb_paths: Vec<String>,
 }
 
 struct DeviceSet(HDEVINFO);
@@ -108,79 +92,6 @@ fn property(set: HDEVINFO, dev: &SP_DEVINFO_DATA, key: &DEVPROPKEY) -> io::Resul
         Ok(metadata::Query::ValueBytes(required))
     })?;
     value.as_deref().map(metadata::string).transpose()
-}
-
-struct RegistryKey(HKEY);
-impl Drop for RegistryKey {
-    fn drop(&mut self) {
-        // SAFETY: this object uniquely owns the open registry key.
-        // Closing releases local resources and has no device or registry write effect.
-        unsafe {
-            RegCloseKey(self.0);
-        }
-    }
-}
-
-fn registry_value(
-    key: &RegistryKey,
-    name: &str,
-    flags: REG_ROUTINE_FLAGS,
-) -> io::Result<Option<Vec<u16>>> {
-    let name = wide(name);
-    metadata::read_utf16(|buffer| {
-        let mut size = metadata::capacity_bytes(buffer)?;
-        let output = if buffer.is_empty() {
-            null_mut()
-        } else {
-            buffer.as_mut_ptr().cast()
-        };
-        // SAFETY: key is live, the value name is terminated, and
-        // output is null for sizing or points to size initialized writable bytes.
-        // DIREG_DEV already opens Device Parameters, so the value is on key itself.
-        let status = unsafe {
-            RegGetValueW(
-                key.0,
-                null(),
-                name.as_ptr(),
-                flags,
-                null_mut(),
-                output,
-                &mut size,
-            )
-        };
-        match status {
-            0 if buffer.is_empty() && size > 0 => Ok(metadata::Query::NeededBytes(size)),
-            0 => Ok(metadata::Query::ValueBytes(size)),
-            ERROR_MORE_DATA => Ok(metadata::Query::NeededBytes(size)),
-            ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => Ok(metadata::Query::Missing),
-            code => Err(native_error(code)),
-        }
-    })
-}
-
-/// Interpret both Windows registration forms on an already opened hardware key.
-/// Missing values are absence; access, type, and malformed-data failures propagate.
-fn registered_interface_guids(key: &RegistryKey) -> io::Result<Vec<GUID>> {
-    let multi = registry_value(key, "DeviceInterfaceGUIDs", RRF_RT_REG_MULTI_SZ)?;
-    let single = registry_value(key, "DeviceInterfaceGUID", RRF_RT_REG_SZ)?;
-    metadata::interface_guids(multi.as_deref(), single.as_deref())
-}
-
-fn interface_guids(set: HDEVINFO, dev: &SP_DEVINFO_DATA) -> io::Result<Vec<GUID>> {
-    // SAFETY: the device set and element are live; only value-read access is requested.
-    let raw =
-        unsafe { SetupDiOpenDevRegKey(set, dev, DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_QUERY_VALUE) };
-    if raw == INVALID_HANDLE_VALUE {
-        // SAFETY: called immediately after the failed key-open operation.
-        return match unsafe { GetLastError() } {
-            ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND | ERROR_KEY_DOES_NOT_EXIST => {
-                Ok(Vec::new())
-            }
-            code => Err(native_error(code)),
-        };
-    }
-    let key = RegistryKey(raw);
-    registered_interface_guids(&key)
 }
 
 fn interface_paths(guid: &GUID, instance: &str) -> io::Result<Vec<String>> {
@@ -328,245 +239,16 @@ pub fn devices() -> io::Result<Vec<Device>> {
         }
         let description = property(set.0, &dev, &DEVPKEY_Device_DeviceDesc)?;
         let service = property(set.0, &dev, &DEVPKEY_Device_Service)?;
-        let mut paths = Vec::new();
-        if service
-            .as_deref()
-            .is_some_and(|s| s.eq_ignore_ascii_case("winusb"))
-        {
-            for guid in interface_guids(set.0, &dev)? {
-                paths.extend(interface_paths(&guid, &instance)?);
-            }
-        }
-        paths.sort();
-        paths.dedup();
+        let paths = Vec::new();
         out.push(Device {
             instance,
             description,
             service,
-            winusb_paths: paths,
+            usb_paths: paths,
         });
     }
     Err(io::Error::new(
         io::ErrorKind::InvalidData,
         "device enumeration exceeds limit",
     ))
-}
-
-/// An exclusively opened WinUSB function with one 64-byte bulk pair.
-pub struct WinUsb {
-    usb: WINUSB_INTERFACE_HANDLE,
-    file: OwnedHandle,
-    input: u8,
-    output: u8,
-    clock_origin: Instant,
-}
-impl fmt::Debug for WinUsb {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("WinUsb")
-            .field("input", &self.input)
-            .field("output", &self.output)
-            .finish_non_exhaustive()
-    }
-}
-impl WinUsb {
-    /// Open an existing WinUSB interface. Verifies VID/PID and descriptors before
-    /// exposing the transport. Never rebinds an installed driver.
-    pub fn open(path: &str) -> io::Result<Self> {
-        if path.contains('\0') {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"));
-        }
-        let path = wide(path);
-        // SAFETY: path is terminated; access is exclusive and the returned handle
-        // is either INVALID_HANDLE_VALUE or newly owned by this scope.
-        let raw = unsafe {
-            CreateFileW(
-                path.as_ptr(),
-                0xc0000000,
-                0,
-                null(),
-                OPEN_EXISTING,
-                FILE_FLAG_OVERLAPPED,
-                null_mut(),
-            )
-        };
-        if raw == INVALID_HANDLE_VALUE {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: raw is a newly created valid kernel handle, transferred once.
-        let file = unsafe { OwnedHandle::from_raw_handle(raw) };
-        let mut usb = null_mut();
-        // SAFETY: file stays alive until after WinUsb_Free; usb is writable output.
-        win_ok(unsafe { WinUsb_Initialize(file.as_raw_handle(), &mut usb) })?;
-        let mut owner = Self {
-            usb,
-            file,
-            input: 0,
-            output: 0,
-            clock_origin: Instant::now(),
-        };
-        owner.configure()?;
-        Ok(owner)
-    }
-    fn configure(&mut self) -> io::Result<()> {
-        let mut descriptor = [0u8; 18];
-        let mut n = 0;
-        // SAFETY: the interface is live; descriptor and n are exclusively writable.
-        win_ok(unsafe {
-            WinUsb_GetDescriptor(self.usb, 1, 0, 0, descriptor.as_mut_ptr(), 18, &mut n)
-        })?;
-        if n != 18 || descriptor[8..12] != [0x4c, 0x05, 0xe1, 0x02] {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "not an RC-S956 054C:02E1 device",
-            ));
-        }
-        let mut interface = USB_INTERFACE_DESCRIPTOR::default();
-        // SAFETY: the initialized output structure is writable and interface is live.
-        win_ok(unsafe { WinUsb_QueryInterfaceSettings(self.usb, 0, &mut interface) })?;
-        for i in 0..interface.bNumEndpoints {
-            let mut pipe = WINUSB_PIPE_INFORMATION::default();
-            // SAFETY: queried index is within the endpoint count; pipe is writable.
-            win_ok(unsafe { WinUsb_QueryPipe(self.usb, 0, i, &mut pipe) })?;
-            if pipe.PipeType != UsbdPipeTypeBulk {
-                continue;
-            }
-            if pipe.MaximumPacketSize != 64 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "RC-S956 bulk MPS must be 64",
-                ));
-            }
-            let slot = if pipe.PipeId & 0x80 != 0 {
-                &mut self.input
-            } else {
-                &mut self.output
-            };
-            if *slot != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "ambiguous bulk endpoints",
-                ));
-            }
-            *slot = pipe.PipeId;
-        }
-        if self.input == 0 || self.output == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "missing bulk pair",
-            ));
-        }
-        // WinUSB emits the terminating ZLP on nonzero 64-byte multiples.
-        let enabled = 1u8;
-        // SAFETY: policy uses a one-byte BOOL value; interface and OUT pipe are live.
-        win_ok(unsafe {
-            WinUsb_SetPipePolicy(
-                self.usb,
-                self.output,
-                SHORT_PACKET_TERMINATE,
-                1,
-                (&enabled as *const u8).cast(),
-            )
-        })?;
-        let disabled = 0u8;
-        // SAFETY: policy uses a one-byte BOOL, and input pipe belongs to this owner.
-        win_ok(unsafe {
-            WinUsb_SetPipePolicy(
-                self.usb,
-                self.input,
-                IGNORE_SHORT_PACKETS,
-                1,
-                (&disabled as *const u8).cast(),
-            )
-        })?;
-        Ok(())
-    }
-    fn timeout(&self, pipe: u8, duration: Duration) -> io::Result<()> {
-        let ms = u32::try_from(duration.as_millis().max(1)).map_err(io::Error::other)?;
-        // SAFETY: PIPE_TRANSFER_TIMEOUT consumes one u32 synchronously; its
-        // borrowed pointer remains valid throughout the call.
-        win_ok(unsafe {
-            WinUsb_SetPipePolicy(
-                self.usb,
-                pipe,
-                PIPE_TRANSFER_TIMEOUT,
-                4,
-                (&ms as *const u32).cast(),
-            )
-        })
-    }
-}
-impl Transport for WinUsb {
-    type Error = io::Error;
-
-    fn monotonic_time(&self) -> Duration {
-        self.clock_origin.elapsed()
-    }
-
-    fn wait(&mut self, duration: Duration) {
-        thread::sleep(duration);
-    }
-
-    fn write(&mut self, frame: &[u8], timeout: Duration) -> io::Result<usize> {
-        self.timeout(self.output, timeout)?;
-        let mut n = 0;
-        let length = u32::try_from(frame.len()).map_err(io::Error::other)?;
-        // SAFETY: the input is borrowed until the synchronous call completes;
-        // WinUSB documents this buffer as input despite its ABI's mutable pointer.
-        // Null OVERLAPPED requests synchronous completion, with n always provided.
-        win_ok(unsafe {
-            WinUsb_WritePipe(
-                self.usb,
-                self.output,
-                frame.as_ptr().cast_mut(),
-                length,
-                &mut n,
-                null(),
-            )
-        })?;
-        usize::try_from(n).map_err(io::Error::other)
-    }
-    fn read(&mut self, buffer: &mut [u8], timeout: Duration) -> io::Result<usize> {
-        self.timeout(self.input, timeout)?;
-        let mut n = 0;
-        let length = u32::try_from(buffer.len()).map_err(io::Error::other)?;
-        // SAFETY: buffer has length writable initialized bytes; synchronous
-        // completion keeps it alive and exclusively borrowed until return.
-        win_ok(unsafe {
-            WinUsb_ReadPipe(
-                self.usb,
-                self.input,
-                buffer.as_mut_ptr(),
-                length,
-                &mut n,
-                null(),
-            )
-        })?;
-        let n = usize::try_from(n).map_err(io::Error::other)?;
-        if n > buffer.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "WinUSB receive length",
-            ));
-        }
-        Ok(n)
-    }
-    fn recover(&mut self) -> io::Result<()> {
-        for pipe in [self.input, self.output] {
-            // SAFETY: operations are synchronous and no transfer remains in flight.
-            win_ok(unsafe { WinUsb_ResetPipe(self.usb, pipe) })?;
-        }
-        // SAFETY: the exclusively owned input pipe has no operation in flight.
-        win_ok(unsafe { WinUsb_FlushPipe(self.usb, self.input) })
-    }
-}
-impl Drop for WinUsb {
-    fn drop(&mut self) {
-        // SAFETY: all operations completed synchronously. usb is uniquely owned;
-        // file is still live and is dropped after the WinUSB interface is freed.
-        // Free is local resource cleanup, not a fallible RF-off completion.
-        unsafe {
-            WinUsb_Free(self.usb);
-        }
-        let _file_lifetime = &self.file;
-    }
 }
