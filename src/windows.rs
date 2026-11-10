@@ -1,11 +1,18 @@
-//! Windows device discovery.
+//! Discovery and exclusive access to the RC-S956 UMDF USB driver.
 
 mod metadata;
 
+use rcs956_core::transport::Transport;
+use rcs956_usb_abi as abi;
+
 use std::{
+    fs::{File, OpenOptions},
     io,
     mem::{offset_of, size_of},
+    os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
     ptr::{null, null_mut},
+    thread,
+    time::{Duration, Instant},
 };
 use windows_sys::{
     Win32::{
@@ -17,6 +24,7 @@ use windows_sys::{
             DEVPROPKEY, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_ITEMS, ERROR_NOT_FOUND,
             GetLastError,
         },
+        System::IO::DeviceIoControl,
     },
     core::GUID,
 };
@@ -34,6 +42,13 @@ pub struct Device {
     /// USB hub presence interfaces are not candidates for application I/O.
     pub usb_paths: Vec<String>,
 }
+
+const INTERFACE: GUID = GUID {
+    data1: abi::INTERFACE.0,
+    data2: abi::INTERFACE.1,
+    data3: abi::INTERFACE.2,
+    data4: abi::INTERFACE.3,
+};
 
 struct DeviceSet(HDEVINFO);
 impl Drop for DeviceSet {
@@ -239,7 +254,9 @@ pub fn devices() -> io::Result<Vec<Device>> {
         }
         let description = property(set.0, &dev, &DEVPKEY_Device_DeviceDesc)?;
         let service = property(set.0, &dev, &DEVPKEY_Device_Service)?;
-        let paths = Vec::new();
+        let mut paths = interface_paths(&INTERFACE, &instance)?;
+        paths.sort();
+        paths.dedup();
         out.push(Device {
             instance,
             description,
@@ -251,4 +268,124 @@ pub fn devices() -> io::Result<Vec<Device>> {
         io::ErrorKind::InvalidData,
         "device enumeration exceeds limit",
     ))
+}
+
+/// Exclusive client of a bound RC-S956 USB driver.
+#[derive(Debug)]
+pub struct Usb {
+    file: File,
+    epoch: Instant,
+}
+
+impl Usb {
+    /// Open an enumerated RC-S956 USB interface. The driver validates the
+    /// device and bulk endpoints before publishing that interface.
+    pub fn open(path: &str) -> io::Result<Self> {
+        let available = devices()?.iter().any(|device| {
+            device
+                .usb_paths
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(path))
+        });
+        if !available {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "RC-S956 USB driver interface not present",
+            ));
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(path)?;
+        Ok(Self {
+            file,
+            epoch: Instant::now(),
+        })
+    }
+
+    fn control(&self, code: u32, input: &[u8], output: &mut [u8]) -> io::Result<usize> {
+        let mut count = 0;
+        let input_bytes = u32::try_from(input.len()).map_err(io::Error::other)?;
+        let output_bytes = u32::try_from(output.len()).map_err(io::Error::other)?;
+        // SAFETY: The file is synchronous and live. Both buffers stay valid
+        // until completion and are disjoint. A zero length requires no buffer access.
+        win_ok(unsafe {
+            DeviceIoControl(
+                self.file.as_raw_handle(),
+                code,
+                input.as_ptr().cast(),
+                input_bytes,
+                output.as_mut_ptr().cast(),
+                output_bytes,
+                &mut count,
+                null_mut(),
+            )
+        })?;
+        let count = count as usize;
+        if count > output.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid driver completion length",
+            ));
+        }
+        Ok(count)
+    }
+}
+
+fn timeout_bytes(wait: Duration) -> io::Result<[u8; abi::WORD]> {
+    abi::encode_timeout(wait).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "USB transfer timeout outside driver limits",
+        )
+    })
+}
+
+impl Transport for Usb {
+    type Error = io::Error;
+
+    fn monotonic_time(&self) -> Duration {
+        self.epoch.elapsed()
+    }
+
+    fn wait(&mut self, duration: Duration) {
+        thread::sleep(duration);
+    }
+
+    fn write(&mut self, data: &[u8], timeout: Duration) -> io::Result<usize> {
+        if data.len() > abi::MAX_TRANSFER {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "USB write exceeds driver limit",
+            ));
+        }
+        let mut request = Vec::with_capacity(abi::WORD + data.len());
+        request.extend_from_slice(&timeout_bytes(timeout)?);
+        request.extend_from_slice(data);
+        let mut count = [0; abi::WORD];
+        let received = self.control(abi::WRITE, &request, &mut count)?;
+        let written = u32::from_le_bytes(count) as usize;
+        if received != abi::WORD || written > data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid USB write count",
+            ));
+        }
+        Ok(written)
+    }
+
+    fn read(&mut self, buffer: &mut [u8], timeout: Duration) -> io::Result<usize> {
+        if buffer.is_empty() || buffer.len() > abi::MAX_TRANSFER {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "USB read outside driver limits",
+            ));
+        }
+        self.control(abi::READ, &timeout_bytes(timeout)?, buffer)
+    }
+
+    fn recover(&mut self) -> io::Result<()> {
+        self.control(abi::RECOVER, &[], &mut []).map(|_| ())
+    }
 }

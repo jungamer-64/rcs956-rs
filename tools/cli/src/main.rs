@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 
 #[cfg(windows)]
-use rcs956::windows::WinUsb;
+use rcs956::windows::Usb;
 #[cfg(windows)]
 use rcs956_core::reader::{Reader, TypeBSelection};
 use rcs956_core::{
@@ -26,7 +26,7 @@ fn main() -> std::process::ExitCode {
 }
 fn help() {
     println!(
-        "rcs956 devices\nrcs956 probe [--path DEVICE_INTERFACE]\nrcs956 poll [--type felica|a|b] [--timeout-ms 500] [--path PATH]\nFeliCa poll options: [--rate 212|424] [--system FFFF] [--request 1] [--slots 0]\nrcs956 read --service HEX --blocks DECIMAL[,DECIMAL...] [FeliCa poll options]\nrcs956 write --service HEX --block-data DECIMAL:HEX [--block-data DECIMAL:HEX ...] [FeliCa poll options]\nrcs956 systems [FeliCa poll options]\nrcs956 service-at --index DECIMAL [FeliCa poll options]\nrcs956 raw-felica --data LENGTH_PREFIXED_HEX [--data LENGTH_PREFIXED_HEX ...] [FeliCa poll options]\nNFC-B options: [--b-profile standard|alternate] [--afi HEX] [--nad HEX]\nrcs956 exchange --type a|a-apdu|b|b-frame --data HEX [--timeout-ms 500] [--path PATH]\nrcs956 sequence --type a|a-apdu|b|b-frame --data HEX --data HEX [...] [--timeout-ms 500] [--path PATH]\nrcs956 ndef-read --type type1|a|felica|b [--rate 212|424] [--timeout-ms 500] [--path PATH]\nrcs956 ndef-write --type type1|a|felica|b --data NDEF_HEX [--rate 212|424] [--timeout-ms 500] [--path PATH]\nrcs956 ndef-decode NDEF_HEX\nrcs956 dep-echo --data SIX_BYTE_IDENTITY_SUFFIX_HEX [--timeout-ms 500] [--path PATH]\nrcs956 decode READER_FRAME_HEX\n\nHardware commands require an existing WinUSB binding. exchange sends one caller-supplied card command (A) or ISO-DEP APDU (a-apdu or b) or a non-ISO-DEP card command (b-frame); sequence sends each supplied command in order within one card selection. Their effects belong to the caller. No automatic application-command replay."
+        "rcs956 devices\nrcs956 probe [--path DEVICE_INTERFACE]\nrcs956 poll [--type felica|a|b] [--timeout-ms 500] [--path PATH]\nFeliCa poll options: [--rate 212|424] [--system FFFF] [--request 1] [--slots 0]\nrcs956 read --service HEX --blocks DECIMAL[,DECIMAL...] [FeliCa poll options]\nrcs956 write --service HEX --block-data DECIMAL:HEX [--block-data DECIMAL:HEX ...] [FeliCa poll options]\nrcs956 systems [FeliCa poll options]\nrcs956 service-at --index DECIMAL [FeliCa poll options]\nrcs956 raw-felica --data LENGTH_PREFIXED_HEX [--data LENGTH_PREFIXED_HEX ...] [FeliCa poll options]\nNFC-B options: [--b-profile standard|alternate] [--afi HEX] [--nad HEX]\nrcs956 exchange --type a|a-apdu|b|b-frame --data HEX [--timeout-ms 500] [--path PATH]\nrcs956 sequence --type a|a-apdu|b|b-frame --data HEX --data HEX [...] [--timeout-ms 500] [--path PATH]\nrcs956 ndef-read --type type1|a|felica|b [--rate 212|424] [--timeout-ms 500] [--path PATH]\nrcs956 ndef-write --type type1|a|felica|b --data NDEF_HEX [--rate 212|424] [--timeout-ms 500] [--path PATH]\nrcs956 ndef-decode NDEF_HEX\nrcs956 dep-echo --data SIX_BYTE_IDENTITY_SUFFIX_HEX [--timeout-ms 500] [--path PATH]\nrcs956 decode READER_FRAME_HEX\n\nHardware commands require an existing UMDF USB binding. exchange sends one caller-supplied card command (A) or ISO-DEP APDU (a-apdu or b) or a non-ISO-DEP card command (b-frame); sequence sends each supplied command in order within one card selection. Their effects belong to the caller. No automatic application-command replay."
     );
 }
 fn run() -> Result<(), Box<dyn Error>> {
@@ -224,7 +224,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     #[cfg(windows)]
     {
         let path = select_path(path)?;
-        let usb = WinUsb::open(&path)?;
+        let usb = Usb::open(&path)?;
         println!("Interface: {path}");
         let mut reader = Reader::new(usb);
         if command == "dep-echo" {
@@ -300,7 +300,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     #[cfg(not(windows))]
     {
         let _ = (path, request, timeout, service, blocks, technology, data);
-        Err("hardware binding is currently Windows WinUSB; portable library and codec are available".into())
+        Err("hardware binding is currently Windows UMDF USB; portable library and codec are available".into())
     }
 }
 
@@ -391,7 +391,7 @@ fn validate_exchange(technology: Technology, data: &[u8]) -> Result<(), Box<dyn 
 
 #[cfg(windows)]
 fn type_a_operation(
-    reader: &mut Reader<WinUsb>,
+    reader: &mut Reader<Usb>,
     timeout: RfTimeout,
     data: &[Vec<u8>],
     command: &str,
@@ -431,7 +431,7 @@ fn type_a_operation(
 
 #[cfg(windows)]
 fn type_b_operation(
-    reader: &mut Reader<WinUsb>,
+    reader: &mut Reader<Usb>,
     options: TypeBPollOptions,
     timeout: RfTimeout,
     data: &[Vec<u8>],
@@ -460,7 +460,7 @@ fn type_b_operation(
 }
 
 #[cfg(windows)]
-fn print_type_a(card: &rcs956_core::reader::TypeACard<'_, WinUsb>) {
+fn print_type_a(card: &rcs956_core::reader::TypeACard<'_, Usb>) {
     let observation = card.observation();
     println!(
         "Target: {}\nSENS_RES: {}\nSEL_RES: {:02X}\nUID: {}",
@@ -475,7 +475,7 @@ fn print_type_a(card: &rcs956_core::reader::TypeACard<'_, WinUsb>) {
 }
 
 #[cfg(windows)]
-fn print_type_b(card: &TypeBSelection<'_, WinUsb>) {
+fn print_type_b(card: &TypeBSelection<'_, Usb>) {
     let observation = card.observation();
     println!(
         "Target: {}\nPUPI: {}\nATQB: {}\nATTRIB: {}",
@@ -507,7 +507,7 @@ impl NdefOperation<'_> {
 
 #[cfg(windows)]
 fn ndef_operation(
-    reader: &mut Reader<WinUsb>,
+    reader: &mut Reader<Usb>,
     technology: Technology,
     rate: BitRate,
     options: TypeBPollOptions,
@@ -598,7 +598,7 @@ fn decode_ndef(bytes: &[u8]) -> Result<(), Box<dyn Error>> {
 
 #[cfg(windows)]
 fn dep_echo(
-    reader: &mut Reader<WinUsb>,
+    reader: &mut Reader<Usb>,
     identity: [u8; 6],
     timeout: RfTimeout,
 ) -> Result<(), Box<dyn Error>> {
@@ -653,7 +653,7 @@ enum FelicaOperation<'a> {
 
 #[cfg(windows)]
 fn card_operation(
-    reader: &mut Reader<WinUsb>,
+    reader: &mut Reader<Usb>,
     rate: BitRate,
     request: PollRequest,
     timeout: RfTimeout,
@@ -726,7 +726,7 @@ fn list_devices() -> Result<(), Box<dyn Error>> {
                 .unwrap_or("description not registered"),
             device.service.as_deref().unwrap_or("not bound")
         );
-        for path in device.winusb_paths {
+        for path in device.usb_paths {
             println!("  Interface: {path}");
         }
     }
@@ -748,11 +748,11 @@ fn select_path(explicit: Option<String>) -> Result<String, Box<dyn Error>> {
         Err(SelectionError::NoDevice) => Err(
             "RC-S956 USB (054C:02E1) is not present; connect it to this PC, then run devices".into(),
         ),
-        Err(SelectionError::NoWinUsbInterface) => Err(format!(
-            "reader is present, but no registered WinUSB application interface is available (services: {}). OS driver rebinding is not performed by this tool",
+        Err(SelectionError::NoUsbInterface) => Err(format!(
+            "reader is present, but no RC-S956 USB driver interface is available (services: {}). OS driver rebinding is not performed by this tool",
             devices.iter().map(|d| d.service.as_deref().unwrap_or("not bound")).collect::<Vec<_>>().join(", ")
         ).into()),
-        Err(SelectionError::MultipleReaders) => Err("multiple WinUSB readers found; select one with --path".into()),
+        Err(SelectionError::MultipleReaders) => Err("multiple RC-S956 USB readers found; select one with --path".into()),
     }
 }
 
@@ -760,7 +760,7 @@ fn select_path(explicit: Option<String>) -> Result<String, Box<dyn Error>> {
 #[derive(Debug, PartialEq, Eq)]
 enum SelectionError {
     NoDevice,
-    NoWinUsbInterface,
+    NoUsbInterface,
     MultipleReaders,
 }
 
@@ -771,14 +771,8 @@ fn select_discovered_path(devices: &[rcs956::windows::Device]) -> Result<&str, S
     }
     // Each Device is one PnP function. Multiple registered aliases do not make
     // that function multiple readers; enumeration sorts aliases deterministically.
-    let mut functions = devices.iter().filter_map(|device| {
-        device
-            .service
-            .as_deref()
-            .filter(|service| service.eq_ignore_ascii_case("winusb"))
-            .and_then(|_| device.winusb_paths.first())
-    });
-    let path = functions.next().ok_or(SelectionError::NoWinUsbInterface)?;
+    let mut functions = devices.iter().filter_map(|device| device.usb_paths.first());
+    let path = functions.next().ok_or(SelectionError::NoUsbInterface)?;
     if functions.next().is_some() {
         return Err(SelectionError::MultipleReaders);
     }
@@ -823,24 +817,24 @@ mod tests {
             instance: instance.to_owned(),
             description: None,
             service: service.map(str::to_owned),
-            winusb_paths: paths.iter().map(|path| (*path).to_owned()).collect(),
+            usb_paths: paths.iter().map(|path| (*path).to_owned()).collect(),
         }
     }
 
     #[test]
-    fn aliases_belong_to_one_function_and_other_services_are_not_candidates() {
+    fn aliases_belong_to_one_function_and_unbound_functions_are_not_candidates() {
         let devices = [
-            device("reader-one", Some("WinUSB"), &["alias-a", "alias-b"]),
-            device("reader-two", Some("sonyrcs956c"), &["native-path"]),
+            device("reader-one", Some("WUDFRd"), &["alias-a", "alias-b"]),
+            device("reader-two", Some("sonyrcs956c"), &[]),
         ];
         assert_eq!(select_discovered_path(&devices), Ok("alias-a"));
     }
 
     #[test]
-    fn separate_winusb_functions_require_selection() {
+    fn separate_usb_functions_require_selection() {
         let devices = [
-            device("reader-one", Some("WinUSB"), &["alias-a", "alias-b"]),
-            device("reader-two", Some("WinUSB"), &["alias-c"]),
+            device("reader-one", Some("WUDFRd"), &["alias-a", "alias-b"]),
+            device("reader-two", Some("WUDFRd"), &["alias-c"]),
         ];
         assert_eq!(
             select_discovered_path(&devices),
@@ -853,12 +847,12 @@ mod tests {
         assert_eq!(select_discovered_path(&[]), Err(SelectionError::NoDevice));
         for present in [
             device("reader", None, &[]),
-            device("reader", Some("WinUSB"), &[]),
-            device("reader", Some("sonyrcs956c"), &["native-path"]),
+            device("reader", Some("WUDFRd"), &[]),
+            device("reader", Some("sonyrcs956c"), &[]),
         ] {
             assert_eq!(
                 select_discovered_path(&[present]),
-                Err(SelectionError::NoWinUsbInterface)
+                Err(SelectionError::NoUsbInterface)
             );
         }
     }

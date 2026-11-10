@@ -1,4 +1,4 @@
-//! Host binding for RC-S956 device discovery and synchronous USB transfers.
+//! Windows client for RC-S956 device discovery and synchronous USB transfers.
 #![deny(unsafe_code)]
 
 #[cfg(windows)]

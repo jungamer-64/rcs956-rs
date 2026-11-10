@@ -1,24 +1,39 @@
 # Build and device validation
 
-`rcs956-core`はフレーム、取引状態、RF設定、カードプロトコルを所有する。`no_std`と`alloc`で動作し、crate全体で`unsafe_code`を禁止する。Rustからは`rcs956_core::reader::Reader`などを使用する。coreが定義する`Transport`へ同期転送、pipe回復、単調時計、待機を委譲し、期限・待機時間とエラー時の状態遷移はcoreで決める。`rcs956`はWindowsのWinUSBドライバに接続する`rcs956::windows::WinUsb`を提供する。
+`rcs956-core`はフレーム、取引状態、RF設定、カードプロトコルを所有する。`no_std`と`alloc`で動作し、crate全体で`unsafe_code`を禁止する。Rustからは`rcs956_core::reader::Reader`などを使用する。coreが定義する`Transport`へ同期転送、pipe回復、単調時計、待機を委譲し、期限・待機時間とエラー時の状態遷移はcoreで決める。`rcs956::windows::Usb`はUMDF 2のUSBモードを使うWindowsクライアント。
 
-## Windowsでのビルドと検証
+## ビルドと検証
 
-リポジトリのルートで実行する。coreの`no_std`検証にはベアメタル向けRust targetが必要。 rustdocの検証は、環境変数やターゲット別設定で`rustdocflags`を上書きしていない状態で行う。
+リポジトリのルートで実行する。既定のビルド対象は `rcs956-core`。core の `no_std` 検証にはベアメタル向け Rust target が必要。
 
 ```powershell
-rustup target add x86_64-unknown-none
 cargo build --locked
 cargo fmt --all --check
 cargo check --locked -p rcs956-core --lib --target x86_64-unknown-none
-cargo test --locked --workspace
-cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo doc --locked --workspace --no-deps --config "build.rustdocflags=['-Dwarnings']"
+```
+
+ドライバのビルドには Windows SDK、UMDF の WDF ヘッダとライブラリを含む WDK、MSVC、LLVM の libclang が必要。[windows-drivers-rs の開発環境](https://github.com/microsoft/windows-drivers-rs#setup)を参照する。ドライバの feature は `usb` と `pcsc` のいずれか一つを選ぶ。`cargo build-usb` は USB ドライバと CLI をビルドする。
+
+```powershell
+cargo build-usb
+cargo build-pcsc
+cargo test --locked --workspace --features rcs956-driver/usb
+cargo test --locked -p rcs956-driver --features pcsc
+cargo clippy --locked --workspace --all-targets --features rcs956-driver/usb -- -D warnings
+cargo clippy --locked -p rcs956-driver --all-targets --features pcsc -- -D warnings
+cargo doc --locked --workspace --no-deps --features rcs956-driver/usb --config "build.rustdocflags=['-Dwarnings']"
+```
+
+Windows 11 向けの未署名パッケージは `driver/package.ps1` で生成する。`-Mode` でインストールするインターフェイスを指定する。WDK のコマンドプロンプトを使うか、`-WdkBin` に使用するバージョンの WDK の bin ディレクトリを渡す。スクリプトが出力したディレクトリに DLL、INF、カタログが揃う。インストール環境の署名要件を満たしたパッケージを使用する。
+
+```powershell
+./driver/package.ps1 -Mode usb
+./driver/package.ps1 -Mode pcsc
 ```
 
 ## 実機検証ツール
 
-[`tools/cli`](tools/cli)の`rcs956-cli`は両ライブラリを使う実機検証ツールで、実行ファイル名は`rcs956`。ルートからの既定のビルドはライブラリを対象とし、CLIはpackageを明示して実行する。
+[`tools/cli`](tools/cli)の`rcs956-cli`は両ライブラリを使う実機検証ツールで、実行ファイル名は`rcs956`。CLIの実行時はpackageを指定する。
 
 ```powershell
 cargo run --locked -p rcs956-cli -- devices
@@ -31,13 +46,20 @@ cargo run --locked -p rcs956-cli -- read --system 88B4 --service 000B --blocks 0
 
 read例のservice／systemは対象カードに存在するものを指定する。未確認のカードへ例の値をそのまま適用しない。`--path`は複数リーダーの中から対象のapplication interfaceを指定する。同じUSB functionの複数aliasは1台として扱い、使用可能なfunctionが1台なら登録pathのソート順で先頭を選ぶ。`--timeout-ms`はRF交換の有限待機値で、host応答待機には余裕時間を加える。`exchange --type a --data HEX`はカードcommand、`exchange --type b --data HEX`はISO-DEP APDUを送る。送信内容とカードへの効果はcallerが決める。FeliCaのreadは非暗号化読取だけを行う。application commandの自動再実行はしない。
 
-## Windows binding
+## Windows のデバイスインターフェイス
 
-ハードウェア操作には、対象USB functionがWinUSBで利用可能であることが必要。`WinUsb::open`はdescriptorと`054C:02E1`、Bulk IN／OUT、64-byte MPSを検査する。OSドライバーの自動インストール・置換、registryへの書込みは行わない。Sonyの既存private SDK interfaceはWinUSB interfaceとは別である。
+両モードは USB ID `054C:02E1` と 64-byte Bulk IN／OUT を検査する。同じ USB function にインストールするドライバパッケージは一つ。CLI の `devices` は接続中のデバイスと、USB モードで開けるパスを表示する。
 
-WinUSBのapplication interface登録は、hardware key上の`DeviceInterfaceGUIDs`（REG_MULTI_SZ）と`DeviceInterfaceGUID`（REG_SZ）を読む。hardware keyは`SetupDiOpenDevRegKey(DIREG_DEV)`で開き、追加の`Device Parameters` subkeyは開かない。USB hubの存在通知interfaceをI/O候補に含めない。property／registry値の不在と、アクセス失敗・型不一致・不正な文字列を区別する。可変長metadataは64 KiBを上限に取得し、4回のqueryで確定しなければWouldBlockを返す。登録形式と取得APIの外部契約は[WinUSB installation](https://learn.microsoft.com/en-us/windows-hardware/drivers/usbcon/winusb-installation)と[hardware key](https://learn.microsoft.com/en-us/windows-hardware/drivers/install/opening-a-device-s-hardware-key)を参照する。
+USB モードは単一のクライアントに USB 転送を許可する。reader の初期化、取引の回復、NDEF と各カードプロトコルはクライアントで動作する。ドライバは転送長とタイムアウトを検査して USB I/O を直列化する。アプリケーションコマンドをドライバ内で再実行しない。
 
-WinUSBでないserviceが列挙された場合、`devices`の結果で実際のbindingを確認する。OSドライバーを変更する必要がある場合は、対象と復元方法を決めて別途実施する。`probe`成功はRF／カード読取成功を意味しない。
+PC/SC モードでは Smart Card Resource Manager が USB デバイスを NFC-A／NFC-B の ISO-DEP リーダーとして利用する。T=1 の ATR を生成し、WinSCard から最大262 bytesの APDU を選択中のカードに送る。カードの待機中は挿入と離脱をポーリングする。接続中のカードの離脱は APDU 交換の失敗、または電源解除後の再ポーリングで検出する。FeliCa とストレージカードの疑似 APDU は PC/SC モードの対象外。
+
+```powershell
+cargo run --locked -p rcs956-driver --features pcsc --example pcsc_probe -- list
+cargo run --locked -p rcs956-driver --features pcsc --example pcsc_probe -- connect
+```
+
+`connect` は ATR を表示する。追加引数に16進 APDU を指定すると、選択したカードにそのコマンドを送る。
 
 ## 設定とカードsession
 
@@ -81,14 +103,12 @@ MIFARE Classicはcallerが指定したkeyでreaderが認証し、成功したsec
 
 ## 検証境界
 
-固定packet vectorは実機captureではない。registry取得のtestは隔離したvolatile HKCU keyを作成し、取得・型・アクセスエラーを実際のWindows APIで確認して終了時に削除する。deviceの登録やbindingには書き込まない。
+固定packet vectorはデバイスに送るフレームと応答の解釈を検証する。実機captureはUSBとRFの観測範囲を別途記録する。
 
 実機検証では、`devices`による対象／service／path、`probe`のfirmware／model／設定checksum、`poll`のidentity／PMm、対象serviceを指定した`read`を別々に記録する。CLI出力はAPIの観測結果であり、USB bus上のZLPやRF timingのcaptureとは区別する。全firmware、PC/SC完全互換、全カードcommand／APDUの意味と副作用の成立は、この検証の対象に含めない。NFC-A／Bの固定vectorはカード実機の成功証拠ではない。
 
 ## 外部実装へ委譲する責務
 
-Windows ABIの宣言とlinkはMicrosoftの`windows-sys`へ委譲し、`rcs956`がhandle lifetimeとFFI buffer境界を所有する。hostのruntimeの外部依存はそのABI projectionと`windows-link`。native codeの独自buildやFFI宣言の複製は行わない。
+UMDF と USB の ABI、WDF ライブラリのリンクは Microsoft の `windows-drivers-rs` に委譲する。ドライバは USB ターゲットの寿命、要求の所有権と転送期限を管理する。Windows クライアントと PC/SC 検証ツールの Windows ABI は `windows-sys` を使用する。
 
 `serde_json`は固定fixtureの読取にだけ使うdev dependencyで、通常のlibrary／CLIへ入れない。JSON parserとそのformatter／string処理の依存、およびCargo targetに基づくbuild scriptはtest buildのtrust surfaceとして扱う。driverやPDFのsample codeを同梱・portする依存ではない。
-
-WinUSBの同期I/OとZLP policyの外部契約は[MicrosoftのReadPipe定義](https://learn.microsoft.com/en-us/windows/win32/api/winusb/nf-winusb-winusb_readpipe)と[pipe policy](https://learn.microsoft.com/en-us/windows-hardware/drivers/usbcon/winusb-functions-for-pipe-policy-modification)を参照する。

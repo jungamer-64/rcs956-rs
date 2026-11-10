@@ -1,0 +1,40 @@
+[package]
+name = "rcs956-driver"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "UMDF 2 USB or PC/SC driver for RC-S956"
+publish = false
+
+[features]
+usb = ["dep:rcs956-usb-abi"]
+pcsc = ["windows-sys/Win32_Security_Credentials"]
+
+[lib]
+crate-type = ["cdylib"]
+
+[[example]]
+name = "pcsc_probe"
+required-features = ["pcsc"]
+
+[dependencies]
+rcs956-core = { path = "../core", version = "0.1" }
+rcs956-usb-abi = { path = "usb-abi", optional = true }
+wdk-sys = { git = "https://github.com/microsoft/windows-drivers-rs.git", tag = "wdk-sys-v0.5.2", features = ["usb"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
+
+[build-dependencies]
+wdk-build = { git = "https://github.com/microsoft/windows-drivers-rs.git", tag = "wdk-sys-v0.5.2" }
+
+[dev-dependencies]
+wdk-sys = { git = "https://github.com/microsoft/windows-drivers-rs.git", tag = "wdk-sys-v0.5.2", features = ["test-stubs"] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "forbid"
+unused = { level = "deny", priority = -1 }
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "deny"
+expect_used = "deny"

@@ -1,0 +1,57 @@
+[Version]
+Signature = "$Windows NT$"
+Class = @DeviceClass@
+ClassGuid = @ClassGuid@
+Provider = %Provider%
+CatalogFile = rcs956_driver.cat
+PnpLockdown = 1
+
+[Manufacturer]
+%Provider% = Models,NT$ARCH$.10.0...22000
+
+[Models.NT$ARCH$.10.0...22000]
+%Reader% = ReaderInstall,USB\VID_054C&PID_02E1
+
+[DestinationDirs]
+DriverFiles = 13
+
+[SourceDisksNames]
+1 = %Media%
+
+[SourceDisksFiles]
+rcs956_driver.dll = 1
+
+[DriverFiles]
+rcs956_driver.dll
+
+[ReaderInstall.NT]
+Include = WUDFRD.inf
+Needs = WUDFRD.NT
+CopyFiles = DriverFiles
+
+[ReaderInstall.NT.HW]
+Include = WUDFRD.inf
+Needs = WUDFRD.NT.HW
+AddReg = ReaderProperties
+
+[ReaderProperties]
+@HardwareProperties@
+
+[ReaderInstall.NT.Services]
+Include = WUDFRD.inf
+Needs = WUDFRD.NT.Services
+
+[ReaderInstall.NT.Wdf]
+UmdfDispatcher = NativeUSB
+@KernelClientPolicy@
+UmdfService = @UmdfService@,DriverService
+UmdfServiceOrder = @UmdfService@
+
+[DriverService]
+UmdfLibraryVersion = $UMDFVERSION$
+ServiceBinary = %13%\rcs956_driver.dll
+
+[Strings]
+Provider = "rcs956-rs"
+Reader = "@ReaderName@"
+Media = "RC-S956 Driver Package"
