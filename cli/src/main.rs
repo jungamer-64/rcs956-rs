@@ -25,7 +25,7 @@ fn main() -> std::process::ExitCode {
 }
 fn help() {
     println!(
-        "rcs956 devices\nrcs956 probe [--path DEVICE_INTERFACE]\nrcs956 poll [--type felica|a|b] [--timeout-ms 500] [--path PATH]\nFeliCa poll options: [--rate 212|424] [--system FFFF] [--request 1] [--slots 0]\nrcs956 read --service HEX --blocks DECIMAL[,DECIMAL...] [FeliCa poll options]\nrcs956 write --service HEX --block-data DECIMAL:HEX [--block-data DECIMAL:HEX ...] [FeliCa poll options]\nrcs956 systems [FeliCa poll options]\nrcs956 service-at --index DECIMAL [FeliCa poll options]\nrcs956 raw-felica --data LENGTH_PREFIXED_HEX [--data LENGTH_PREFIXED_HEX ...] [--rate 212|424]\nNFC-B options: [--b-profile standard|alternate] [--afi HEX] [--nad HEX]\nrcs956 exchange --type a|b|b-frame --data HEX [--timeout-ms 500] [--path PATH]\nrcs956 sequence --type a|b|b-frame --data HEX --data HEX [...] [--timeout-ms 500] [--path PATH]\nrcs956 decode READER_FRAME_HEX\n\nHardware commands require an existing WinUSB binding. exchange sends one caller-supplied card command (A) or ISO-DEP APDU (B) or a non-ISO-DEP card command (b-frame); sequence sends each supplied command in order within one card selection. Their effects belong to the caller. No automatic application-command replay."
+        "rcs956 devices\nrcs956 probe [--path DEVICE_INTERFACE]\nrcs956 poll [--type felica|a|b] [--timeout-ms 500] [--path PATH]\nFeliCa poll options: [--rate 212|424] [--system FFFF] [--request 1] [--slots 0]\nrcs956 read --service HEX --blocks DECIMAL[,DECIMAL...] [FeliCa poll options]\nrcs956 write --service HEX --block-data DECIMAL:HEX [--block-data DECIMAL:HEX ...] [FeliCa poll options]\nrcs956 systems [FeliCa poll options]\nrcs956 service-at --index DECIMAL [FeliCa poll options]\nrcs956 raw-felica --data LENGTH_PREFIXED_HEX [--data LENGTH_PREFIXED_HEX ...] [--rate 212|424]\nNFC-B options: [--b-profile standard|alternate] [--afi HEX] [--nad HEX]\nrcs956 exchange --type a|a-apdu|b|b-frame --data HEX [--timeout-ms 500] [--path PATH]\nrcs956 sequence --type a|a-apdu|b|b-frame --data HEX --data HEX [...] [--timeout-ms 500] [--path PATH]\nrcs956 ndef-read --type a|b [--timeout-ms 500] [--path PATH]\nrcs956 decode READER_FRAME_HEX\n\nHardware commands require an existing WinUSB binding. exchange sends one caller-supplied card command (A) or ISO-DEP APDU (a-apdu or b) or a non-ISO-DEP card command (b-frame); sequence sends each supplied command in order within one card selection. Their effects belong to the caller. No automatic application-command replay."
     );
 }
 fn run() -> Result<(), Box<dyn Error>> {
@@ -59,6 +59,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             | "systems"
             | "service-at"
             | "raw-felica"
+            | "ndef-read"
             | "exchange"
             | "sequence"
     ) {
@@ -194,6 +195,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     if b_options.node_address.is_some() && technology != Technology::TypeB {
         return Err("--nad requires --type b".into());
     }
+    if command == "ndef-read" && !matches!(technology, Technology::TypeA | Technology::TypeB) {
+        return Err("ndef-read requires --type a or b".into());
+    }
     validate_data_options(&command, technology, &data)?;
     let request = PollRequest::new(system, request, slots)?;
     let timeout = RfTimeout::new(Duration::from_millis(timeout))?;
@@ -245,17 +249,12 @@ fn run() -> Result<(), Box<dyn Error>> {
                         operation,
                     )
                 }
-                Technology::TypeA => {
-                    type_a_operation(&mut reader, timeout, &data, command == "sequence")
+                Technology::TypeA | Technology::TypeAApdu => {
+                    type_a_operation(&mut reader, timeout, &data, &command, technology)
                 }
-                Technology::TypeB | Technology::TypeBFrame => type_b_operation(
-                    &mut reader,
-                    b_options,
-                    timeout,
-                    &data,
-                    command == "sequence",
-                    technology,
-                ),
+                Technology::TypeB | Technology::TypeBFrame => {
+                    type_b_operation(&mut reader, b_options, timeout, &data, &command, technology)
+                }
             }
         };
         let shutdown = reader.rf_off();
@@ -278,6 +277,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 enum Technology {
     Felica,
     TypeA,
+    TypeAApdu,
     TypeB,
     TypeBFrame,
 }
@@ -286,9 +286,10 @@ impl Technology {
         match input {
             "felica" => Ok(Self::Felica),
             "a" => Ok(Self::TypeA),
+            "a-apdu" => Ok(Self::TypeAApdu),
             "b" => Ok(Self::TypeB),
             "b-frame" => Ok(Self::TypeBFrame),
-            _ => Err("--type must be felica, a, b or b-frame".into()),
+            _ => Err("--type must be felica, a, a-apdu, b or b-frame".into()),
         }
     }
 }
@@ -329,11 +330,11 @@ fn validate_data_options(
 
 fn validate_exchange(technology: Technology, data: &[u8]) -> Result<(), Box<dyn Error>> {
     let maximum = match technology {
-        Technology::TypeA => MAX_TYPE_A_COMMAND_BYTES,
+        Technology::TypeA | Technology::TypeAApdu => MAX_TYPE_A_COMMAND_BYTES,
         Technology::TypeB => MAX_APDU_BYTES,
         Technology::TypeBFrame => 63,
         Technology::Felica => {
-            return Err("exchange and sequence require --type a, b or b-frame".into());
+            return Err("exchange and sequence require --type a, a-apdu, b or b-frame".into());
         }
     };
     if data.is_empty() || data.len() > maximum {
@@ -347,7 +348,8 @@ fn type_a_operation(
     reader: &mut Reader<WinUsb>,
     timeout: RfTimeout,
     data: &[Vec<u8>],
-    sequence: bool,
+    command: &str,
+    technology: Technology,
 ) -> Result<(), Box<dyn Error>> {
     let Some(mut card) = reader.poll_type_a(timeout)? else {
         println!("No NFC-A card");
@@ -364,16 +366,30 @@ fn type_a_operation(
     if let Some(ats) = observation.ats() {
         println!("ATS: {}", hex(ats.bytes()));
     }
+    if command == "ndef-read" {
+        if observation.supports_iso_dep() {
+            println!("NDEF: {}", hex(&card.read_type4_ndef()?));
+        } else if let Some(message) = card.read_type2_ndef()? {
+            println!("NDEF: {}", hex(&message));
+        } else {
+            println!("No NDEF message");
+        }
+        return Ok(());
+    }
     for (index, apdu) in data.iter().enumerate() {
-        if sequence {
+        if command == "sequence" {
             println!("APDU {}: {}", index + 1, hex(apdu));
         }
-        let reply = card.exchange(apdu)?;
-        println!(
-            "Reader status: {:02X}\nResponse: {}",
-            reply.status,
-            hex(&reply.data)
-        );
+        if technology == Technology::TypeAApdu {
+            println!("Response: {}", hex(&card.exchange_apdu(apdu)?));
+        } else {
+            let reply = card.exchange(apdu)?;
+            println!(
+                "Reader status: {:02X}\nResponse: {}",
+                reply.status,
+                hex(&reply.data)
+            );
+        }
     }
     Ok(())
 }
@@ -384,7 +400,7 @@ fn type_b_operation(
     options: TypeBPollOptions,
     timeout: RfTimeout,
     data: &[Vec<u8>],
-    sequence: bool,
+    command: &str,
     technology: Technology,
 ) -> Result<(), Box<dyn Error>> {
     let Some(mut card) = reader.poll_type_b(options, timeout)? else {
@@ -399,8 +415,15 @@ fn type_b_operation(
         hex(observation.atqb()),
         hex(observation.attrib_response())
     );
+    if command == "ndef-read" {
+        let TypeBSelection::IsoDep(card) = &mut card else {
+            return Err("Type 4B NDEF requires ISO-DEP activation".into());
+        };
+        println!("NDEF: {}", hex(&card.read_type4_ndef()?));
+        return Ok(());
+    }
     for (index, apdu) in data.iter().enumerate() {
-        if sequence {
+        if command == "sequence" {
             println!("APDU {}: {}", index + 1, hex(apdu));
         }
         let response = match (&mut card, technology) {

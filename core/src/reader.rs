@@ -864,6 +864,83 @@ impl<T: Transport> TypeACard<'_, T> {
             .exchange_target(self.target, data, timeout)
             .map_err(TypeAExchangeError::Exchange)
     }
+
+    /// Exchange one ISO-DEP APDU and collect reader-reported continuation
+    /// fragments. Requires completed activation with ATS. The APDU is sent
+    /// once. Failure after submission returns any accumulated response and
+    /// invalidates the selection before another command can be sent.
+    pub fn exchange_apdu(
+        &mut self,
+        apdu: &[u8],
+    ) -> Result<Vec<u8>, isodep::Error<Error<T::Error>>> {
+        const MAX_FRAGMENTS: usize = 256;
+        const MAX_RESPONSE_BYTES: usize = 65_536;
+        let mut progress = isodep::Progress::default();
+        let mut output = Vec::new();
+        let result = (|| {
+            if !self.observation.supports_iso_dep() || self.observation.ats().is_none() {
+                return Err(isodep::Cause::ActivationRequired);
+            }
+            let timeout = ResponseTimeout::for_request(self.timeout);
+            let mut response = match self.exchange(apdu) {
+                Ok(response) => {
+                    progress.attempted_application_bytes = apdu.len();
+                    progress.acknowledged_application_bytes = apdu.len();
+                    progress.frames = 1;
+                    response
+                }
+                Err(TypeAExchangeError::InputLength(actual)) => {
+                    return Err(isodep::Cause::InputLength {
+                        actual,
+                        maximum: MAX_TYPE_A_COMMAND_BYTES,
+                    });
+                }
+                Err(TypeAExchangeError::SessionInvalid) => {
+                    return Err(isodep::Cause::SessionInvalid);
+                }
+                Err(TypeAExchangeError::Preparation(error)) => {
+                    return Err(isodep::Cause::Preparation(error));
+                }
+                Err(TypeAExchangeError::Exchange(error)) => {
+                    progress.attempted_application_bytes = apdu.len();
+                    progress.frames = 1;
+                    return Err(isodep::Cause::Transport(error));
+                }
+            };
+            loop {
+                if response.status & 0x80 != 0 {
+                    return Err(isodep::Cause::InvalidBlock("unexpected NFC-A NAD"));
+                }
+                if output.len() + response.data.len() > MAX_RESPONSE_BYTES {
+                    return Err(isodep::Cause::Budget(isodep::Budget::ResponseBytes));
+                }
+                output.extend_from_slice(&response.data);
+                progress.received_application_bytes = output.len();
+                if response.status & 0x40 == 0 {
+                    return Ok(());
+                }
+                if progress.frames == MAX_FRAGMENTS {
+                    return Err(isodep::Cause::Budget(isodep::Budget::Frames));
+                }
+                progress.frames += 1;
+                response = self
+                    .reader
+                    .exchange_target(self.target, &[], timeout)
+                    .map_err(isodep::Cause::Transport)?;
+            }
+        })();
+        if let Err(cause) = result {
+            if progress.frames != 0 {
+                self.reader.state = State::NeedsInitialization;
+            }
+            return Err(isodep::Error {
+                cause,
+                progress,
+                partial_response: output,
+            });
+        }
+        Ok(output)
+    }
 }
 
 /// NFC-B ISO-DEP selection, with a block-number state that cannot outlive the

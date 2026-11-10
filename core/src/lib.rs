@@ -11,6 +11,8 @@ extern crate std;
 
 pub mod felica;
 pub mod isodep;
+pub mod mifare;
+pub mod ndef;
 pub mod nfca;
 pub mod nfcb;
 pub mod reader;

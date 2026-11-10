@@ -32,7 +32,7 @@ WinUSBでないserviceが列挙された場合、`devices`の結果で実際のb
 
 初期化はreset／host ACK、設定bank読取、checksum／model検査、register設定、RF offを順に行う。失敗した初期化を成功状態として公開しない。RF modeはprotocolと適用済みtimerを保持し、protocol変更時には対応する設定imageのtableを適用する。`4A`はFeliCaを212または424 kbps、NFC-A／Bを106 kbpsで1 target検出する。
 
-NFC-AはUID（4／7／10 bytes）、SAK、optional ATSのTLとinterface byte境界を検査する。カード交換は`40 target`で最大262 bytesを送り、成功したreader statusの上位bitsも保持する。別controllerのMI処理を仮定した自動継続は行わない。ATSがないカードの検出は、ISO-DEPのactivation成立と同一ではない。
+NFC-AはUID（4／7／10 bytes）、SAK、optional ATSのTLとinterface byte境界を検査する。`exchange --type a`は`40 target`で最大262 bytesを送り、成功したreader statusの上位bitsも保持する。`--type a-apdu`はSAKとATSでISO-DEP activationを確認し、readerが継続bitを立てた応答を空の`40 target`で回収する。継続に失敗した場合は部分応答を返し、再初期化を要求する。
 
 NFC-Aの`40`交換では、要求待機を整数msへ切り上げ、`32 02 0B 0B code`の段階値へ変換する。RF応答待機は最大3280 msへ制限され、`1C`にはその実効待機を使う。host待機は実効待機に1秒を加える。成功したselectorとreader timerだけを保持し、同値の設定送信を省略する。RF offやtargetの再選択でselectorは失効しないが、reset／不確定な設定失敗では失効する。`TypeAExchangeError::Preparation`はカードcommand送信前の設定失敗を示し、再初期化を要求する。`Exchange`はカード交換段階の失敗を示し、原因に応じてカードへの効果が不明になり得る。
 
@@ -45,6 +45,8 @@ NFC-BのISO-DEP sessionはblock番号、送受信chaining、R-block、WTXを処�
 APDUの入力と最低frame数を検査してからreader設定を始める。入力拒否はsessionを保持する。設定失敗は`Cause::Preparation`として返し、applicationの送信progressとRF frame数を0に保ってsessionを失効させる。RF交換を開始した後の失敗もsessionを失効させ、attemptした入力prefix、確認済みprefix、受信済み応答、frame数をerrorに残す。送信chaining中に番号の異なるR-ACKを受けたときは直前のI-blockを再送できる。応答chaining中の重複I-blockには同じR-ACKを返す。readerがRF timeoutを報告した場合、送信中はR-NAKを送り、応答chainの受信中はR-ACKを再送する。USB取引の失敗はそのまま返す。カードからのR-NAKと、単一I-blockのcommandに対するR-ACKはprotocol errorとして扱う。
 
 カードhandleはreaderの排他的borrowを保持する。transport失敗後にはRF readinessが失効する。RF statusのmask後の値が0Dの場合も再初期化を要求する。0Bの場合はraw値を保持してエラーを返す前に10 msの待機を入れる。readerへの`initialize`は明示的な再同期であり、失敗したカード操作の再実行や結果照合ではない。`rf_off`の失敗はcallerが観測する。DropはOS resourceの解放だけを担当する。
+
+MIFARE Classicはcallerが指定したkeyでreaderが認証し、成功したsector内のブロックに限り読取・書込みを許す。ブロック交換失敗でsector handleは失効する。`ndef-read`はNFC-AのType 2 tagまたはNFC-A／BのType 4 tagから公開読取可能なNDEF messageのbytesを取得する。Type 2の物理アドレスは先頭sectorに限り、Type 4はmapping 2.xのshort APDUで参照できるfileを扱う。
 
 選択済みFeliCaのRF待機には`A0`のhalf-ms fieldと`1C`のreader timerを設定する。reader timerはRF待機を秒単位へ切り上げてから`(ms-10)/10`をLE16で送り、成功した設定だけをRF modeに保持する。raw FeliCaはtable4を適用し、`1C`のtimerを無効にして`A0`の待機を使う。raw packetは送受信ともFeliCaの長さbyteを含み、カードの選択・アドレス解釈は呼出側が行う。
 

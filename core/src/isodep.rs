@@ -86,6 +86,8 @@ pub enum Budget {
 pub enum Cause<E> {
     /// Reader setup or an RF exchange invalidated this selected session.
     SessionInvalid,
+    /// The selected target did not complete ISO-DEP activation.
+    ActivationRequired,
     /// Application input exceeds the local or advertised card buffer limit.
     /// No RF was attempted; the session remains reusable.
     InputLength {

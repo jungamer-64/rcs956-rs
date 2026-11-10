@@ -4,7 +4,7 @@
 
 use rcs956_core::{
     felica::{BitRate, BlockWrite, CardError, Idm, PollRequest, ServiceEntry},
-    isodep,
+    isodep, mifare, ndef,
     nfcb::{PollOptions, RfProfile},
     reader::{
         ConfigurationError, Error as ReaderError, Reader, RfTimeout, TimeoutRange,
@@ -1324,6 +1324,161 @@ fn alternate_type_b_profile_exchanges_a_proprietary_target_command() -> Result<(
 
 fn type_a_response(target: u8) -> Vec<u8> {
     vec![1, target, 4, 0, 0x20, 4, 1, 2, 3, 4, 3, 0x20, 0x40]
+}
+
+#[test]
+fn type_a_apdu_continuation_sends_no_second_application_command() -> Result<(), Box<dyn Error>> {
+    let mut steps = initialization(&ab_config_image());
+    steps.extend(ab_mode(false));
+    steps.extend([
+        command(0x4a, &[1, 0], &type_a_response(7)),
+        command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
+        command(0x40, &[7, 0xa4], &[0x40, 0x11]),
+        command(0x40, &[7], &[0, 0x22, 0x90, 0]),
+        command(0x40, &[7, 0xb0], &[0x40, 0x33]),
+        command(0x40, &[7], &[1]),
+    ]);
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut card = reader
+        .poll_type_a(timeout()?)?
+        .ok_or("expected NFC-A card")?;
+    assert_eq!(card.exchange_apdu(&[0xa4])?, [0x11, 0x22, 0x90, 0]);
+    let error = card
+        .exchange_apdu(&[0xb0])
+        .err()
+        .ok_or("expected continuation failure")?;
+    assert!(matches!(
+        error.cause,
+        isodep::Cause::Transport(ReaderError::RfStatus(1))
+    ));
+    assert_eq!(error.partial_response, [0x33]);
+    assert_eq!(error.progress.attempted_application_bytes, 1);
+    assert_eq!(error.progress.frames, 2);
+    assert!(matches!(
+        card.exchange(&[0xb0]),
+        Err(TypeAExchangeError::SessionInvalid)
+    ));
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn mifare_classic_authority_is_limited_to_the_authenticated_sector() -> Result<(), Box<dyn Error>> {
+    let mut steps = initialization(&ab_config_image());
+    steps.extend(ab_mode(false));
+    let mut write = vec![7, 0xa0, 130];
+    write.extend([0x5a; 16]);
+    let mut read_response = vec![0];
+    read_response.extend([0x44; 16]);
+    steps.extend([
+        command(0x4a, &[1, 0], &[1, 7, 4, 0, 0x18, 7, 1, 2, 3, 4, 5, 6, 7]),
+        command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
+        command(0x40, &[7, 0x61, 129, 1, 2, 3, 4, 5, 6, 4, 5, 6, 7], &[0]),
+        command(0x40, &[7, 0x30, 143], &read_response),
+        command(0x40, &write, &[0x0b]),
+    ]);
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut card = reader
+        .poll_type_a(timeout()?)?
+        .ok_or("expected NFC-A card")?;
+    let mut sector =
+        card.authenticate_mifare_classic(129, mifare::KeyKind::B, &[1, 2, 3, 4, 5, 6])?;
+    assert!(matches!(
+        sector.read_block(144),
+        Err(mifare::Error::Block(144))
+    ));
+    assert_eq!(sector.read_block(143)?, [0x44; 16]);
+    assert!(matches!(
+        sector.write_block(130, &[0x5a; 16]),
+        Err(mifare::Error::Exchange(TypeAExchangeError::Exchange(
+            ReaderError::RfStatus(0x0b)
+        )))
+    ));
+    assert!(matches!(
+        sector.read_block(143),
+        Err(mifare::Error::AuthenticationLost)
+    ));
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn type_two_ndef_read_skips_reserved_bytes_in_the_message() -> Result<(), Box<dyn Error>> {
+    let mut steps = initialization(&ab_config_image());
+    steps.extend(ab_mode(false));
+    steps.extend([
+        command(0x4a, &[1, 0], &[1, 7, 4, 0, 0, 7, 1, 2, 3, 4, 5, 6, 7]),
+        command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
+        command(
+            0x40,
+            &[7, 0x30, 0],
+            &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xe1, 0x10, 6, 0],
+        ),
+        // Memory Control TLV excludes byte 26, inside the NDEF value.
+        command(
+            0x40,
+            &[7, 0x30, 4],
+            &[
+                0, 2, 3, 0x62, 1, 2, 3, 4, 0x11, 0x22, 0x33, 0xff, 0x44, 0xfe, 0, 0, 0,
+            ],
+        ),
+    ]);
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut card = reader
+        .poll_type_a(timeout()?)?
+        .ok_or("expected NFC-A card")?;
+    assert_eq!(
+        card.read_type2_ndef()?.as_deref(),
+        Some([0x11, 0x22, 0x33, 0x44].as_slice())
+    );
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn type_four_ndef_read_selects_files_and_checks_apdu_status() -> Result<(), Box<dyn Error>> {
+    let mut steps = initialization(&ab_config_image());
+    steps.extend(ab_mode(false));
+    let select = [7, 0, 0xa4, 4, 0, 7, 0xd2, 0x76, 0, 0, 0x85, 1, 1, 0];
+    steps.extend([
+        command(0x4a, &[1, 0], &type_a_response(7)),
+        command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
+        command(0x40, &select, &[0, 0x90, 0]),
+        command(0x40, &[7, 0, 0xa4, 0, 0x0c, 2, 0xe1, 3], &[0, 0x90, 0]),
+        command(
+            0x40,
+            &[7, 0, 0xb0, 0, 0, 7],
+            &[0, 0, 15, 0x20, 0, 15, 0, 15, 0x90, 0],
+        ),
+        command(
+            0x40,
+            &[7, 0, 0xb0, 0, 7, 8],
+            &[0, 4, 6, 0xe1, 4, 0, 0x80, 0, 0xff, 0x90, 0],
+        ),
+        command(0x40, &[7, 0, 0xa4, 0, 0x0c, 2, 0xe1, 4], &[0, 0x90, 0]),
+        command(0x40, &[7, 0, 0xb0, 0, 0, 2], &[0, 0, 3, 0x90, 0]),
+        command(0x40, &[7, 0, 0xb0, 0, 2, 3], &[0, 0xd0, 0, 0, 0x90, 0]),
+        command(0x40, &select, &[0, 0x6a, 0x82]),
+    ]);
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut card = reader
+        .poll_type_a(timeout()?)?
+        .ok_or("expected NFC-A card")?;
+    assert_eq!(card.read_type4_ndef()?, [0xd0, 0, 0]);
+    assert!(matches!(
+        card.read_type4_ndef(),
+        Err(ndef::Error::Status(0x6a82))
+    ));
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
 }
 
 #[test]
