@@ -41,7 +41,7 @@ WinUSBでないserviceが列挙された場合、`devices`の結果で実際のb
 
 初期化はreset／host ACK、設定bank読取、checksum／model検査、register設定、RF offを順に行う。失敗した初期化を成功状態として公開しない。RF modeはprotocolと適用済みtimerを保持し、protocol変更時には対応する設定imageのtableを適用する。`4A`はFeliCaを212または424 kbps、NFC-A／Bを106 kbpsで1 target検出する。
 
-NFC-AはUID（4／7／10 bytes）、SAK、optional ATSのTLとinterface byte境界を検査する。`exchange --type a`は`40 target`で最大262 bytesを送り、成功したreader statusの上位bitsも保持する。`--type a-apdu`はSAKとATSでISO-DEP activationを確認し、readerが継続bitを立てた応答を空の`40 target`で回収する。継続に失敗した場合は部分応答を返し、再初期化を要求する。
+NFC-AはUID（4／7／10 bytes）、SAK、optional ATSのTLとinterface byte境界を検査する。`TypeACard::into_raw`は型付き操作の権限を消費して、最大262 bytesの任意commandを許可する。raw交換はfragmentごとにreader statusを保持し、継続中は空の`40 target`による回収だけを許可する。`exchange --type a`は各fragmentを表示する。継続中にhandleを手放した場合や回収が失敗した場合は再初期化が必要。完了したraw交換の後は、新たな選択前にRFを切り、Type 2のセクター選択などのカード状態を解消する。`--type a-apdu`はSAKとATSでISO-DEP activationを確認して継続応答をまとめ、交換に失敗した場合は部分応答を返す。
 
 NFC-Aの`40`交換では、要求待機を整数msへ切り上げ、`32 02 0B 0B code`の段階値へ変換する。RF応答待機は最大3280 msへ制限され、`1C`にはその実効待機を使う。host待機は実効待機に1秒を加える。成功したselectorとreader timerだけを保持し、同値の設定送信を省略する。RF offやtargetの再選択でselectorは失効しないが、reset／不確定な設定失敗では失効する。`TypeAExchangeError::Preparation`はカードcommand送信前の設定失敗を示し、再初期化を要求する。`Exchange`はカード交換段階の失敗を示し、原因に応じてカードへの効果が不明になり得る。
 

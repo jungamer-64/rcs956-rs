@@ -12,6 +12,8 @@ use core::{error, fmt, time::Duration};
 
 /// Maximum card-command bytes accepted by the reader's NFC-A exchange.
 pub const MAX_TYPE_A_COMMAND_BYTES: usize = 262;
+const MAX_TYPE_A_RESPONSE_FRAGMENTS: usize = 256;
+const TYPE_A_MORE_INFORMATION: u8 = 0x40;
 
 /// Failures of reader initialization, RF configuration, or card exchange.
 #[derive(Debug)]
@@ -20,7 +22,7 @@ pub enum Error<E> {
     Transaction(TransactionError<E>),
     /// Recovery failed, preserving the phase of its out-of-band ACK transfer.
     Recovery(TransactionError<E>),
-    /// Reader initialization has not completed for this connection.
+    /// Reader initialization is required before the requested operation.
     NotInitialized,
     /// A command response did not have the required layout.
     Response(&'static str),
@@ -300,6 +302,13 @@ enum RfMode {
         protocol: RfProtocol,
         timer: ReaderTimer,
     },
+    RawTypeA(RawTypeAResponse),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RawTypeAResponse {
+    Idle,
+    Pending { frames: usize },
 }
 
 #[derive(Debug)]
@@ -379,8 +388,7 @@ impl<T: Transport> Reader<T> {
             .copied()
             .ok_or(Error::Response("reader flags length"))?;
         self.write_register(0x630a, 0x40)?;
-        self.command(0x32, &[1, 0], wait)?;
-        self.link.wait(Duration::from_millis(5));
+        self.disable_rf()?;
         let info = ReaderInfo {
             firmware,
             flags,
@@ -409,6 +417,15 @@ impl<T: Transport> Reader<T> {
         protocol: RfProtocol,
         timeout: RfTimeout,
     ) -> Result<(), Error<T::Error>> {
+        if matches!(
+            self.state,
+            State::Ready {
+                rf: RfMode::RawTypeA(_),
+                ..
+            }
+        ) {
+            self.rf_off()?;
+        }
         let timer = ReaderTimer::for_rf_timeout(timeout);
         let (info, apply_mode, response_timeout) = match &self.state {
             State::Ready {
@@ -538,6 +555,7 @@ impl<T: Transport> Reader<T> {
 
     /// Activate one NFC-A target at 106 kbps. UID, SAK and optional ATS are
     /// validated before granting the returned card access to this reader.
+    /// A preceding raw NFC-A exchange requires a field cycle before selection.
     pub fn poll_type_a(
         &mut self,
         timeout: RfTimeout,
@@ -700,20 +718,54 @@ impl<T: Transport> Reader<T> {
         Ok(TargetResponse { status, data })
     }
 
+    fn prepare_type_a_exchange(
+        &mut self,
+        timeout: ResponseTimeout,
+    ) -> Result<(), TypeAExchangeError<T::Error>> {
+        if !matches!(
+            self.state,
+            State::Ready {
+                rf: RfMode::Configured {
+                    protocol: RfProtocol::TypeA,
+                    ..
+                },
+                ..
+            }
+        ) {
+            return Err(TypeAExchangeError::SessionInvalid);
+        }
+        self.prepare_exchange_timing(RfProtocol::TypeA, timeout)
+            .map_err(TypeAExchangeError::Preparation)
+    }
+
+    fn disable_rf(&mut self) -> Result<(), Error<T::Error>> {
+        let response = self.command(0x32, &[1, 0], Duration::from_secs(1))?;
+        if !response.is_empty() {
+            return Err(Error::Response("RF off response length"));
+        }
+        self.link.wait(Duration::from_millis(5));
+        Ok(())
+    }
+
     /// Disable RF and invalidate the configured mode. Call explicitly to observe
     /// failure; dropping a reader only releases the backend's OS resources.
+    /// If a raw NFC-A response was left pending, use [`Self::initialize`] to
+    /// recover the reader stream before issuing further commands.
     pub fn rf_off(&mut self) -> Result<(), Error<T::Error>> {
         let (info, response_timeout) = match &self.state {
+            State::Ready {
+                rf: RfMode::RawTypeA(RawTypeAResponse::Pending { .. }),
+                ..
+            }
+            | State::NeedsInitialization => return Err(Error::NotInitialized),
             State::Ready {
                 info,
                 response_timeout,
                 ..
             } => (info.clone(), *response_timeout),
-            State::NeedsInitialization => return Err(Error::NotInitialized),
         };
         self.state = State::NeedsInitialization;
-        self.command(0x32, &[1, 0], Duration::from_secs(1))?;
-        self.link.wait(Duration::from_millis(5));
+        self.disable_rf()?;
         self.state = State::Ready {
             info,
             rf: RfMode::Off,
@@ -740,6 +792,10 @@ pub enum TypeAExchangeError<E> {
     InputLength(usize),
     /// The selection has already lost its operation authority.
     SessionInvalid,
+    /// A raw exchange has a response fragment waiting to be collected.
+    ResponsePending,
+    /// The raw response exceeded the fragment budget. Reinitialize the reader.
+    FragmentLimit,
     /// Reader timing setup failed before any card command was sent.
     Preparation(Error<E>),
     /// The card command transaction or its response failed. Consult the cause
@@ -757,7 +813,10 @@ impl<E: error::Error + 'static> error::Error for TypeAExchangeError<E> {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
             Self::Preparation(error) | Self::Exchange(error) => Some(error),
-            Self::InputLength(_) | Self::SessionInvalid => None,
+            Self::InputLength(_)
+            | Self::SessionInvalid
+            | Self::ResponsePending
+            | Self::FragmentLimit => None,
         }
     }
 }
@@ -770,7 +829,7 @@ pub struct TypeACard<'a, T: Transport> {
     target: u8,
     timeout: RfTimeout,
 }
-impl<T: Transport> TypeACard<'_, T> {
+impl<'a, T: Transport> TypeACard<'a, T> {
     /// Validated activation data for this selection.
     pub fn observation(&self) -> &nfca::Observation {
         &self.observation
@@ -779,18 +838,18 @@ impl<T: Transport> TypeACard<'_, T> {
     pub fn target(&self) -> u8 {
         self.target
     }
-    /// Exchange up to 262 card-command bytes through reader command 40. Card
-    /// command semantics belong to the caller; no application request is replayed.
-    /// The complete status is preserved rather than assuming another controller's
-    /// upper status bits imply an automatic continuation.
-    /// The requested RF wait is rounded upward to a 32/02 timing step, capped
-    /// at 3280 ms. The reader timer uses that effective wait; host waiting adds 1 s.
-    ///
-    /// # Errors
-    ///
-    /// Invalid input leaves the selection unchanged. Timing setup failure
-    /// revokes the selection before any card command is sent. A transport
-    /// failure or RF status 0D during exchange also revokes the selection.
+    /// Consume the typed selection and allow caller-defined card commands.
+    /// Such commands can change card state that typed operations depend on.
+    pub fn into_raw(self) -> RawTypeACard<'a, T> {
+        RawTypeACard {
+            reader: self.reader,
+            target: self.target,
+            timeout: ResponseTimeout::for_request(self.timeout),
+        }
+    }
+
+    // Only for crate-owned commands whose response is a single frame and
+    // whose effects preserve the typed selection's activation assumptions.
     pub(crate) fn exchange(
         &mut self,
         data: &[u8],
@@ -798,25 +857,18 @@ impl<T: Transport> TypeACard<'_, T> {
         if data.is_empty() || data.len() > MAX_TYPE_A_COMMAND_BYTES {
             return Err(TypeAExchangeError::InputLength(data.len()));
         }
-        if !matches!(
-            self.reader.state,
-            State::Ready {
-                rf: RfMode::Configured {
-                    protocol: RfProtocol::TypeA,
-                    ..
-                },
-                ..
-            }
-        ) {
-            return Err(TypeAExchangeError::SessionInvalid);
-        }
         let timeout = ResponseTimeout::for_request(self.timeout);
-        self.reader
-            .prepare_exchange_timing(RfProtocol::TypeA, timeout)
-            .map_err(TypeAExchangeError::Preparation)?;
-        self.reader
-            .exchange_target(self.target, data, timeout)
-            .map_err(TypeAExchangeError::Exchange)
+        self.reader.prepare_type_a_exchange(timeout)?;
+        let response = self.reader.exchange_target(self.target, data, timeout);
+        if match &response {
+            Ok(reply) => reply.status & TYPE_A_MORE_INFORMATION != 0,
+            Err(Error::RfStatus(status)) => status & TYPE_A_MORE_INFORMATION != 0,
+            Err(Error::Response(_)) => true,
+            Err(_) => false,
+        } {
+            self.reader.state = State::NeedsInitialization;
+        }
+        response.map_err(TypeAExchangeError::Exchange)
     }
 
     /// Exchange one ISO-DEP APDU and collect reader-reported continuation
@@ -827,7 +879,6 @@ impl<T: Transport> TypeACard<'_, T> {
         &mut self,
         apdu: &[u8],
     ) -> Result<Vec<u8>, isodep::Error<Error<T::Error>>> {
-        const MAX_FRAGMENTS: usize = 256;
         const MAX_RESPONSE_BYTES: usize = 65_536;
         let mut progress = isodep::Progress::default();
         let mut output = Vec::new();
@@ -835,31 +886,28 @@ impl<T: Transport> TypeACard<'_, T> {
             if !self.observation.supports_iso_dep() || self.observation.ats().is_none() {
                 return Err(isodep::Cause::ActivationRequired);
             }
+            if apdu.is_empty() || apdu.len() > MAX_TYPE_A_COMMAND_BYTES {
+                return Err(isodep::Cause::InputLength {
+                    actual: apdu.len(),
+                    maximum: MAX_TYPE_A_COMMAND_BYTES,
+                });
+            }
             let timeout = ResponseTimeout::for_request(self.timeout);
-            let mut response = match self.exchange(apdu) {
-                Ok(response) => {
-                    progress.attempted_application_bytes = apdu.len();
-                    progress.acknowledged_application_bytes = apdu.len();
-                    progress.frames = 1;
-                    response
-                }
-                Err(TypeAExchangeError::InputLength(actual)) => {
-                    return Err(isodep::Cause::InputLength {
-                        actual,
-                        maximum: MAX_TYPE_A_COMMAND_BYTES,
-                    });
-                }
-                Err(TypeAExchangeError::SessionInvalid) => {
-                    return Err(isodep::Cause::SessionInvalid);
-                }
+            match self.reader.prepare_type_a_exchange(timeout) {
+                Ok(()) => {}
                 Err(TypeAExchangeError::Preparation(error)) => {
                     return Err(isodep::Cause::Preparation(error));
                 }
-                Err(TypeAExchangeError::Exchange(error)) => {
-                    progress.attempted_application_bytes = apdu.len();
-                    progress.frames = 1;
-                    return Err(isodep::Cause::Transport(error));
+                Err(_) => return Err(isodep::Cause::SessionInvalid),
+            }
+            progress.attempted_application_bytes = apdu.len();
+            progress.frames = 1;
+            let mut response = match self.reader.exchange_target(self.target, apdu, timeout) {
+                Ok(response) => {
+                    progress.acknowledged_application_bytes = apdu.len();
+                    response
                 }
+                Err(error) => return Err(isodep::Cause::Transport(error)),
             };
             loop {
                 if response.status & 0x80 != 0 {
@@ -870,10 +918,10 @@ impl<T: Transport> TypeACard<'_, T> {
                 }
                 output.extend_from_slice(&response.data);
                 progress.received_application_bytes = output.len();
-                if response.status & 0x40 == 0 {
+                if response.status & TYPE_A_MORE_INFORMATION == 0 {
                     return Ok(());
                 }
-                if progress.frames == MAX_FRAGMENTS {
+                if progress.frames == MAX_TYPE_A_RESPONSE_FRAGMENTS {
                     return Err(isodep::Cause::Budget(isodep::Budget::Frames));
                 }
                 progress.frames += 1;
@@ -894,6 +942,100 @@ impl<T: Transport> TypeACard<'_, T> {
             });
         }
         Ok(output)
+    }
+}
+
+/// Exclusive raw command access to a selected NFC-A target.
+///
+/// A pending response can only be continued through this handle. Abandoning
+/// it requires reader initialization. A completed raw exchange requires RF
+/// off before the next selection to clear card state such as the Type 2 sector.
+#[derive(Debug)]
+pub struct RawTypeACard<'a, T: Transport> {
+    reader: &'a mut Reader<T>,
+    target: u8,
+    timeout: ResponseTimeout,
+}
+
+impl<T: Transport> RawTypeACard<'_, T> {
+    /// Submit one caller-defined card command and return its first fragment,
+    /// including the unmodified reader status.
+    ///
+    /// Input must contain 1 to 262 bytes. Input rejection preserves the
+    /// selection. When a response is pending, call [`Self::receive_continuation`].
+    pub fn exchange(
+        &mut self,
+        data: &[u8],
+    ) -> Result<TargetResponse, TypeAExchangeError<T::Error>> {
+        if data.is_empty() || data.len() > MAX_TYPE_A_COMMAND_BYTES {
+            return Err(TypeAExchangeError::InputLength(data.len()));
+        }
+        match self.reader.state {
+            State::Ready {
+                rf: RfMode::RawTypeA(RawTypeAResponse::Pending { .. }),
+                ..
+            } => {
+                return Err(TypeAExchangeError::ResponsePending);
+            }
+            State::Ready {
+                rf: RfMode::RawTypeA(RawTypeAResponse::Idle),
+                ..
+            } => {}
+            _ => self.reader.prepare_type_a_exchange(self.timeout)?,
+        }
+        // Record loss of typed selection before the first raw transfer. This
+        // survives release of the handle and errors that leave the link usable.
+        self.set_response(RawTypeAResponse::Idle);
+        self.transfer(data, 1)
+    }
+
+    /// Receive the next fragment without sending card command data. Returns
+    /// `None` when the selection has no pending response. An exchange can
+    /// return up to 256 fragments. Continuation failure requires reinitialization.
+    pub fn receive_continuation(
+        &mut self,
+    ) -> Result<Option<TargetResponse>, TypeAExchangeError<T::Error>> {
+        let frames = match self.reader.state {
+            State::Ready {
+                rf: RfMode::RawTypeA(RawTypeAResponse::Pending { frames }),
+                ..
+            } => frames,
+            State::Ready { .. } => return Ok(None),
+            State::NeedsInitialization => return Err(TypeAExchangeError::SessionInvalid),
+        };
+        if frames == MAX_TYPE_A_RESPONSE_FRAGMENTS {
+            self.reader.state = State::NeedsInitialization;
+            return Err(TypeAExchangeError::FragmentLimit);
+        }
+        self.transfer(&[], frames + 1).map(Some)
+    }
+
+    fn set_response(&mut self, response: RawTypeAResponse) {
+        if let State::Ready { rf, .. } = &mut self.reader.state {
+            *rf = RfMode::RawTypeA(response);
+        }
+    }
+
+    fn transfer(
+        &mut self,
+        data: &[u8],
+        frames: usize,
+    ) -> Result<TargetResponse, TypeAExchangeError<T::Error>> {
+        let result = self.reader.exchange_target(self.target, data, self.timeout);
+        match &result {
+            Ok(response) => {
+                let next = if response.status & TYPE_A_MORE_INFORMATION != 0 {
+                    RawTypeAResponse::Pending { frames }
+                } else {
+                    RawTypeAResponse::Idle
+                };
+                self.set_response(next);
+            }
+            Err(Error::RfStatus(status))
+                if frames == 1 && status & TYPE_A_MORE_INFORMATION == 0 => {}
+            Err(_) => self.reader.state = State::NeedsInitialization,
+        }
+        result.map_err(TypeAExchangeError::Exchange)
     }
 }
 

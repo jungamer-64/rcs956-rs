@@ -954,7 +954,8 @@ fn type_b_rf_timeout_budget_preserves_uncertain_progress() -> Result<(), Box<dyn
 }
 
 #[test]
-fn type_a_exchange_uses_selected_target_and_preserves_status() -> Result<(), Box<dyn Error>> {
+fn raw_type_a_recovers_pending_fragments_before_sending_another_command()
+-> Result<(), Box<dyn Error>> {
     let mut steps = initialization(&ab_config_image());
     steps.extend(ab_mode(false));
     steps.push(command(
@@ -964,24 +965,49 @@ fn type_a_exchange_uses_selected_target_and_preserves_status() -> Result<(), Box
     ));
     steps.push(command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]));
     steps.push(command(0x40, &[7, 0, 0xa4, 4, 0], &[0x40, 0x90, 0]));
+    steps.push(command(0x40, &[7], &[0xc0, 0x11]));
+    steps.push(command(0x40, &[7], &[0, 0x22]));
     steps.push(command(0x40, &[7, 0x30, 0], &[0x0d]));
     let (script, journal) = Script::new(steps);
     let mut reader = Reader::new(script);
     reader.initialize()?;
-    let mut card = reader
+    let card = reader
         .poll_type_a(timeout()?)?
         .ok_or("expected NFC-A card")?;
     assert_eq!(card.observation().uid(), &[1, 2, 3, 4]);
     assert_eq!(card.target(), 7);
+    let mut card = card.into_raw();
     let before = journal.borrow().requests.len();
     assert!(matches!(
         card.exchange(&vec![0; 263]),
         Err(TypeAExchangeError::InputLength(263))
     ));
+    assert!(card.receive_continuation()?.is_none());
     assert_eq!(journal.borrow().requests.len(), before);
     let reply = card.exchange(&[0, 0xa4, 4, 0])?;
     assert_eq!(reply.status, 0x40);
     assert_eq!(reply.data, [0x90, 0]);
+    let before = journal.borrow().requests.len();
+    assert!(matches!(
+        card.exchange(&[0x30, 0]),
+        Err(TypeAExchangeError::ResponsePending)
+    ));
+    assert_eq!(journal.borrow().requests.len(), before);
+    let reply = card
+        .receive_continuation()?
+        .ok_or("expected second fragment")?;
+    assert_eq!(reply.status, 0xc0);
+    assert_eq!(reply.data, [0x11]);
+    assert!(matches!(
+        card.exchange(&[0x30, 0]),
+        Err(TypeAExchangeError::ResponsePending)
+    ));
+    let reply = card
+        .receive_continuation()?
+        .ok_or("expected final fragment")?;
+    assert_eq!(reply.status, 0);
+    assert_eq!(reply.data, [0x22]);
+    assert!(card.receive_continuation()?.is_none());
     assert!(matches!(
         card.exchange(&[0x30, 0]),
         Err(TypeAExchangeError::Exchange(ReaderError::RfStatus(0x0d)))
@@ -993,6 +1019,56 @@ fn type_a_exchange_uses_selected_target_and_preserves_status() -> Result<(), Box
     ));
     assert_eq!(journal.borrow().requests.len(), before);
     assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn incomplete_raw_type_a_response_requires_reader_recovery() -> Result<(), Box<dyn Error>> {
+    for read_continuation in [false, true] {
+        let mut steps = initialization(&ab_config_image());
+        steps.extend(ab_mode(false));
+        steps.extend([
+            command(0x4a, &[1, 0], &type_a_response(7)),
+            command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
+            command(0x40, &[7, 0xa4], &[0x40, 0x11]),
+        ]);
+        if read_continuation {
+            steps.push(command(0x40, &[7], &[1]));
+        }
+        steps.extend(initialization(&ab_config_image()));
+        steps.extend(ab_mode(false));
+        steps.push(command(0x4a, &[1, 0], &[0]));
+        let (script, journal) = Script::new(steps);
+        let mut reader = Reader::new(script);
+        reader.initialize()?;
+        {
+            let mut card = reader
+                .poll_type_a(timeout()?)?
+                .ok_or("expected NFC-A card")?
+                .into_raw();
+            assert_eq!(card.exchange(&[0xa4])?.status, 0x40);
+            if read_continuation {
+                assert!(matches!(
+                    card.receive_continuation(),
+                    Err(TypeAExchangeError::Exchange(ReaderError::RfStatus(1)))
+                ));
+                assert!(matches!(
+                    card.exchange(&[0xa4]),
+                    Err(TypeAExchangeError::SessionInvalid)
+                ));
+            }
+        }
+        let before = journal.borrow().requests.len();
+        assert!(matches!(reader.rf_off(), Err(ReaderError::NotInitialized)));
+        assert!(matches!(
+            reader.poll_type_a(timeout()?),
+            Err(ReaderError::NotInitialized)
+        ));
+        assert_eq!(journal.borrow().requests.len(), before);
+        reader.initialize()?;
+        assert!(reader.poll_type_a(timeout()?)?.is_none());
+        assert_eq!(journal.borrow().remaining, 0);
+    }
     Ok(())
 }
 
@@ -1332,8 +1408,7 @@ fn type_b_timing_cache_survives_reselection_and_tracks_cross_protocol_changes()
         reader
             .poll_type_a(RfTimeout::new(Duration::from_millis(500))?)?
             .ok_or("expected NFC-A card")?
-            .exchange(&[0xa4])?
-            .data,
+            .exchange_apdu(&[0xa4])?,
         [0x90, 0]
     );
     assert_eq!(
@@ -1457,8 +1532,11 @@ fn type_a_apdu_continuation_sends_no_second_application_command() -> Result<(), 
     assert_eq!(error.progress.attempted_application_bytes, 1);
     assert_eq!(error.progress.frames, 2);
     assert!(matches!(
-        card.exchange(&[0xb0]),
-        Err(TypeAExchangeError::SessionInvalid)
+        card.exchange_apdu(&[0xb0]),
+        Err(isodep::Error {
+            cause: isodep::Cause::SessionInvalid,
+            ..
+        })
     ));
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
@@ -1537,6 +1615,55 @@ fn type_two_ndef_read_skips_reserved_bytes_in_the_message() -> Result<(), Box<dy
         card.read_type2_ndef()?.as_deref(),
         Some([0x11, 0x22, 0x33, 0x44].as_slice())
     );
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn typed_type_two_read_reselects_after_raw_sector_change() -> Result<(), Box<dyn Error>> {
+    let mut steps = initialization(&ab_config_image());
+    let activation = [1, 7, 4, 0, 0, 7, 1, 2, 3, 4, 5, 6, 7];
+    steps.extend(ab_mode(false));
+    steps.extend([
+        command(0x4a, &[1, 0], &activation),
+        command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
+        command(0x40, &[7, 0xc2, 0xff], &[0]),
+        // The second SECTOR SELECT packet can take effect without a reply.
+        command(0x40, &[7, 1, 0, 0, 0], &[1]),
+        command(0x32, &[1, 0], &[]),
+    ]);
+    steps.extend(ab_mode(false));
+    steps.extend([
+        command(0x4a, &[1, 0], &activation),
+        command(
+            0x40,
+            &[7, 0x30, 0],
+            &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xe1, 0x10, 6, 0],
+        ),
+        command(
+            0x40,
+            &[7, 0x30, 4],
+            &[0, 3, 3, 0xd0, 0, 0, 0xfe, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        ),
+    ]);
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    {
+        let mut raw = reader
+            .poll_type_a(timeout()?)?
+            .ok_or("expected NFC-A card")?
+            .into_raw();
+        raw.exchange(&[0xc2, 0xff])?;
+        assert!(matches!(
+            raw.exchange(&[1, 0, 0, 0]),
+            Err(TypeAExchangeError::Exchange(ReaderError::RfStatus(1)))
+        ));
+    }
+    let mut card = reader
+        .poll_type_a(timeout()?)?
+        .ok_or("expected NFC-A card")?;
+    assert_eq!(card.read_type2_ndef()?, Some(vec![0xd0, 0, 0]));
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
 }
@@ -1656,7 +1783,7 @@ fn type_a_timeout_applies_the_official_500ms_selector_before_exchange() -> Resul
     reader.initialize()?;
     let wait = RfTimeout::new(Duration::from_millis(500))?;
     let mut card = reader.poll_type_a(wait)?.ok_or("expected NFC-A card")?;
-    assert_eq!(card.exchange(&[0, 0xa4, 4, 0])?.data, [0x90, 0]);
+    assert_eq!(card.exchange_apdu(&[0, 0xa4, 4, 0])?, [0x90, 0]);
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
 }
@@ -1701,28 +1828,28 @@ fn type_a_quantized_timer_and_selector_cache_have_independent_lifetimes()
     let wait = RfTimeout::new(Duration::from_secs(2))?;
     {
         let mut card = reader.poll_type_a(wait)?.ok_or("expected NFC-A card")?;
-        card.exchange(&[0xa4])?;
-        card.exchange(&[0xb0])?;
+        card.exchange_apdu(&[0xa4])?;
+        card.exchange_apdu(&[0xb0])?;
     }
     reader
         .poll_type_a(wait)?
         .ok_or("expected NFC-A card")?
-        .exchange(&[0xa4])?;
+        .exchange_apdu(&[0xa4])?;
     let short_wait = RfTimeout::new(Duration::from_millis(500))?;
     reader
         .poll_type_a(short_wait)?
         .ok_or("expected NFC-A card")?
-        .exchange(&[0xa4])?;
+        .exchange_apdu(&[0xa4])?;
     reader.rf_off()?;
     reader
         .poll_type_a(short_wait)?
         .ok_or("expected NFC-A card")?
-        .exchange(&[0xa4])?;
+        .exchange_apdu(&[0xa4])?;
     reader.initialize()?;
     reader
         .poll_type_a(RfTimeout::new(Duration::from_millis(500))?)?
         .ok_or("expected NFC-A card")?
-        .exchange(&[0xa4])?;
+        .exchange_apdu(&[0xa4])?;
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
 }
@@ -1759,7 +1886,8 @@ fn type_a_failures_distinguish_timing_setup_from_card_exchange() -> Result<(), B
         reader.initialize()?;
         let mut card = reader
             .poll_type_a(RfTimeout::new(Duration::from_secs(2))?)?
-            .ok_or("expected NFC-A card")?;
+            .ok_or("expected NFC-A card")?
+            .into_raw();
         let result = card.exchange(&[0xa4]);
         let error = match result {
             Err(TypeAExchangeError::Exchange(error)) if lost_command == 0x40 => error,

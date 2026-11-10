@@ -364,19 +364,28 @@ fn type_a_operation(
         }
         return Ok(());
     }
-    for (index, apdu) in data.iter().enumerate() {
-        if command == "sequence" {
-            println!("APDU {}: {}", index + 1, hex(apdu));
-        }
-        if technology == Technology::TypeAApdu {
+    if technology == Technology::TypeAApdu {
+        for (index, apdu) in data.iter().enumerate() {
+            if command == "sequence" {
+                println!("APDU {}: {}", index + 1, hex(apdu));
+            }
             println!("Response: {}", hex(&card.exchange_apdu(apdu)?));
-        } else {
-            let reply = card.exchange(apdu)?;
+        }
+        return Ok(());
+    }
+    let mut card = card.into_raw();
+    for (index, data) in data.iter().enumerate() {
+        if command == "sequence" {
+            println!("APDU {}: {}", index + 1, hex(data));
+        }
+        let mut reply = Some(card.exchange(data)?);
+        while let Some(fragment) = reply {
             println!(
                 "Reader status: {:02X}\nResponse: {}",
-                reply.status,
-                hex(&reply.data)
+                fragment.status,
+                hex(&fragment.data)
             );
+            reply = card.receive_continuation()?;
         }
     }
     Ok(())
