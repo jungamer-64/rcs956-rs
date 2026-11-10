@@ -4,10 +4,11 @@
 #[cfg(windows)]
 use rcs956::windows::WinUsb;
 #[cfg(windows)]
-use rcs956_core::reader::Reader;
+use rcs956_core::reader::{Reader, TypeBSelection};
 use rcs956_core::{
     felica::{BitRate, BlockWrite, MAX_READ_BLOCKS, MAX_WRITE_BLOCKS, PollRequest},
     isodep::MAX_APDU_BYTES,
+    nfcb::{PollOptions as TypeBPollOptions, RfProfile},
     reader::{MAX_TYPE_A_COMMAND_BYTES, RfTimeout},
     wire,
 };
@@ -24,7 +25,7 @@ fn main() -> std::process::ExitCode {
 }
 fn help() {
     println!(
-        "rcs956 devices\nrcs956 probe [--path DEVICE_INTERFACE]\nrcs956 poll [--type felica|a|b] [--timeout-ms 500] [--path PATH]\nFeliCa poll options: [--rate 212|424] [--system FFFF] [--request 1] [--slots 0]\nrcs956 read --service HEX --blocks DECIMAL[,DECIMAL...] [FeliCa poll options]\nrcs956 write --service HEX --block-data DECIMAL:HEX [--block-data DECIMAL:HEX ...] [FeliCa poll options]\nrcs956 systems [FeliCa poll options]\nrcs956 service-at --index DECIMAL [FeliCa poll options]\nrcs956 raw-felica --data LENGTH_PREFIXED_HEX [--data LENGTH_PREFIXED_HEX ...] [--rate 212|424]\nrcs956 exchange --type a|b --data HEX [--timeout-ms 500] [--path PATH]\nrcs956 sequence --type a|b --data HEX --data HEX [...] [--timeout-ms 500] [--path PATH]\nrcs956 decode READER_FRAME_HEX\n\nHardware commands require an existing WinUSB binding. exchange sends one caller-supplied card command (A) or ISO-DEP APDU (B); sequence sends each supplied command in order within one card selection. Their effects belong to the caller. No automatic application-command replay."
+        "rcs956 devices\nrcs956 probe [--path DEVICE_INTERFACE]\nrcs956 poll [--type felica|a|b] [--timeout-ms 500] [--path PATH]\nFeliCa poll options: [--rate 212|424] [--system FFFF] [--request 1] [--slots 0]\nrcs956 read --service HEX --blocks DECIMAL[,DECIMAL...] [FeliCa poll options]\nrcs956 write --service HEX --block-data DECIMAL:HEX [--block-data DECIMAL:HEX ...] [FeliCa poll options]\nrcs956 systems [FeliCa poll options]\nrcs956 service-at --index DECIMAL [FeliCa poll options]\nrcs956 raw-felica --data LENGTH_PREFIXED_HEX [--data LENGTH_PREFIXED_HEX ...] [--rate 212|424]\nNFC-B options: [--b-profile standard|alternate] [--afi HEX]\nrcs956 exchange --type a|b|b-frame --data HEX [--timeout-ms 500] [--path PATH]\nrcs956 sequence --type a|b|b-frame --data HEX --data HEX [...] [--timeout-ms 500] [--path PATH]\nrcs956 decode READER_FRAME_HEX\n\nHardware commands require an existing WinUSB binding. exchange sends one caller-supplied card command (A) or ISO-DEP APDU (B) or a non-ISO-DEP card command (b-frame); sequence sends each supplied command in order within one card selection. Their effects belong to the caller. No automatic application-command replay."
     );
 }
 fn run() -> Result<(), Box<dyn Error>> {
@@ -73,6 +74,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut writes = Vec::new();
     let mut index = None;
     let mut rate = None;
+    let mut b_options = TypeBPollOptions::default();
+    let mut b_options_specified = false;
     let mut technology = Technology::Felica;
     let mut data: Vec<Vec<u8>> = Vec::new();
     let mut felica_options = false;
@@ -101,6 +104,18 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "424" => BitRate::Kbps424,
                     _ => return Err("--rate must be 212 or 424".into()),
                 })
+            }
+            "--afi" => {
+                b_options_specified = true;
+                b_options.afi = u8::try_from(hex_u16(&value)?)?;
+            }
+            "--b-profile" => {
+                b_options_specified = true;
+                b_options.profile = match value.as_str() {
+                    "standard" => RfProfile::Standard,
+                    "alternate" => RfProfile::Alternate,
+                    _ => return Err("--b-profile must be standard or alternate".into()),
+                };
             }
             "--index" => index = Some(value.parse::<u16>()?),
             "--block-data" => {
@@ -167,6 +182,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     if felica_options && command == "raw-felica" {
         return Err("raw-felica takes the full packet in --data".into());
     }
+    if b_options_specified && !matches!(technology, Technology::TypeB | Technology::TypeBFrame) {
+        return Err("--afi and --b-profile require --type b or b-frame".into());
+    }
     validate_data_options(&command, technology, &data)?;
     let request = PollRequest::new(system, request, slots)?;
     let timeout = RfTimeout::new(Duration::from_millis(timeout))?;
@@ -221,9 +239,14 @@ fn run() -> Result<(), Box<dyn Error>> {
                 Technology::TypeA => {
                     type_a_operation(&mut reader, timeout, &data, command == "sequence")
                 }
-                Technology::TypeB => {
-                    type_b_operation(&mut reader, timeout, &data, command == "sequence")
-                }
+                Technology::TypeB | Technology::TypeBFrame => type_b_operation(
+                    &mut reader,
+                    b_options,
+                    timeout,
+                    &data,
+                    command == "sequence",
+                    technology,
+                ),
             }
         };
         let shutdown = reader.rf_off();
@@ -247,6 +270,7 @@ enum Technology {
     Felica,
     TypeA,
     TypeB,
+    TypeBFrame,
 }
 impl Technology {
     fn parse(input: &str) -> Result<Self, Box<dyn Error>> {
@@ -254,7 +278,8 @@ impl Technology {
             "felica" => Ok(Self::Felica),
             "a" => Ok(Self::TypeA),
             "b" => Ok(Self::TypeB),
-            _ => Err("--type must be felica, a or b".into()),
+            "b-frame" => Ok(Self::TypeBFrame),
+            _ => Err("--type must be felica, a, b or b-frame".into()),
         }
     }
 }
@@ -297,7 +322,10 @@ fn validate_exchange(technology: Technology, data: &[u8]) -> Result<(), Box<dyn 
     let maximum = match technology {
         Technology::TypeA => MAX_TYPE_A_COMMAND_BYTES,
         Technology::TypeB => MAX_APDU_BYTES,
-        Technology::Felica => return Err("exchange and sequence require --type a or b".into()),
+        Technology::TypeBFrame => 63,
+        Technology::Felica => {
+            return Err("exchange and sequence require --type a, b or b-frame".into());
+        }
     };
     if data.is_empty() || data.len() > maximum {
         return Err(format!("exchange requires 1..={maximum} bytes").into());
@@ -344,18 +372,20 @@ fn type_a_operation(
 #[cfg(windows)]
 fn type_b_operation(
     reader: &mut Reader<WinUsb>,
+    options: TypeBPollOptions,
     timeout: RfTimeout,
     data: &[Vec<u8>],
     sequence: bool,
+    technology: Technology,
 ) -> Result<(), Box<dyn Error>> {
-    let Some(mut card) = reader.poll_type_b(timeout)? else {
+    let Some(mut card) = reader.poll_type_b(options, timeout)? else {
         println!("No NFC-B card");
         return Ok(());
     };
     let observation = card.observation();
     println!(
         "Target: {}\nPUPI: {}\nATQB: {}\nATTRIB: {}",
-        card.target(),
+        card.target_number(),
         hex(&observation.pupi()),
         hex(observation.atqb()),
         hex(observation.attrib_response())
@@ -364,7 +394,14 @@ fn type_b_operation(
         if sequence {
             println!("APDU {}: {}", index + 1, hex(apdu));
         }
-        println!("Response: {}", hex(&card.exchange_apdu(apdu)?));
+        let response = match (&mut card, technology) {
+            (TypeBSelection::IsoDep(card), Technology::TypeB) => card.exchange_apdu(apdu)?,
+            (TypeBSelection::Frame(card), Technology::TypeBFrame) => card.exchange(apdu)?.data,
+            _ => {
+                return Err("selected NFC-B protocol does not match the requested exchange".into());
+            }
+        };
+        println!("Response: {}", hex(&response));
     }
     Ok(())
 }
