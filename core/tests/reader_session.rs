@@ -1581,6 +1581,68 @@ fn type_four_ndef_read_selects_files_and_checks_apdu_status() -> Result<(), Box<
     Ok(())
 }
 
+fn type_four_file_selection(write_access: u8) -> [Step; 5] {
+    [
+        command(
+            0x40,
+            &[7, 0, 0xa4, 4, 0, 7, 0xd2, 0x76, 0, 0, 0x85, 1, 1, 0],
+            &[0, 0x90, 0],
+        ),
+        command(0x40, &[7, 0, 0xa4, 0, 0x0c, 2, 0xe1, 3], &[0, 0x90, 0]),
+        command(
+            0x40,
+            &[7, 0, 0xb0, 0, 0, 7],
+            &[0, 0, 15, 0x20, 0, 15, 0, 3, 0x90, 0],
+        ),
+        command(
+            0x40,
+            &[7, 0, 0xb0, 0, 7, 8],
+            &[0, 4, 6, 0xe1, 4, 0, 6, 0, write_access, 0x90, 0],
+        ),
+        command(0x40, &[7, 0, 0xa4, 0, 0x0c, 2, 0xe1, 4], &[0, 0x90, 0]),
+    ]
+}
+
+#[test]
+fn type_four_ndef_write_checks_access_and_capacity_then_publishes_nlen()
+-> Result<(), Box<dyn Error>> {
+    let mut steps = initialization(&ab_config_image());
+    steps.extend(ab_mode(false));
+    steps.extend([
+        command(0x4a, &[1, 0], &type_a_response(7)),
+        command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
+    ]);
+    steps.extend(type_four_file_selection(0xff));
+    steps.extend(type_four_file_selection(0));
+    steps.extend(type_four_file_selection(0));
+    steps.extend([
+        command(0x40, &[7, 0, 0xd6, 0, 0, 2, 0, 0], &[0, 0x90, 0]),
+        command(0x40, &[7, 0, 0xd6, 0, 2, 3, 0xd5, 0, 1], &[0, 0x90, 0]),
+        command(0x40, &[7, 0, 0xd6, 0, 5, 1, 0x42], &[0, 0x90, 0]),
+        command(0x40, &[7, 0, 0xd6, 0, 0, 2, 0, 4], &[0, 0x90, 0]),
+    ]);
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut card = reader
+        .poll_type_a(timeout()?)?
+        .ok_or("Type 4A card absent")?;
+    assert!(matches!(
+        card.write_type4_ndef(&[0xd0, 0, 0]),
+        Err(ndef::WriteError::Preparation(ndef::Error::WriteAccess))
+    ));
+    assert!(matches!(
+        card.write_type4_ndef(&[0; 5]),
+        Err(ndef::WriteError::Preparation(ndef::Error::Capacity {
+            requested: 5,
+            available: 4
+        }))
+    ));
+    card.write_type4_ndef(&[0xd5, 0, 1, 0x42])?;
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
 #[test]
 fn type_a_timeout_applies_the_official_500ms_selector_before_exchange() -> Result<(), Box<dyn Error>>
 {

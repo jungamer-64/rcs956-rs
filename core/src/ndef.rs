@@ -112,6 +112,9 @@ impl<E: core::error::Error + 'static> core::error::Error for WriteError<E> {
 /// Failure while retrieving a Type 4 message over NFC-A or NFC-B.
 pub type Type4Error<E> = Error<isodep::Error<reader::Error<E>>>;
 
+/// Failure while replacing a Type 4 message over NFC-A or NFC-B.
+pub type Type4WriteError<E> = WriteError<isodep::Error<reader::Error<E>>>;
+
 impl<T: Transport> TypeACard<'_, T> {
     /// Read the NDEF message from a Type 2 tag's first physical sector.
     /// Reserved bytes and dynamic lock bytes are skipped. An empty mapped
@@ -139,6 +142,12 @@ impl<T: Transport> TypeACard<'_, T> {
     pub fn read_type4_ndef(&mut self) -> Result<Vec<u8>, Type4Error<T::Error>> {
         read_type4(|command| self.exchange_apdu(command))
     }
+
+    /// Replace the NDEF message in the first publicly readable Type 4A file
+    /// if it is also publicly writable. An empty slice clears the file.
+    pub fn write_type4_ndef(&mut self, message: &[u8]) -> Result<(), Type4WriteError<T::Error>> {
+        write_type4(|command| self.exchange_apdu(command), message)
+    }
 }
 
 impl<T: Transport> TypeBCard<'_, T> {
@@ -146,6 +155,12 @@ impl<T: Transport> TypeBCard<'_, T> {
     /// This selects the NDEF application and files on the card.
     pub fn read_type4_ndef(&mut self) -> Result<Vec<u8>, Type4Error<T::Error>> {
         read_type4(|command| self.exchange_apdu(command))
+    }
+
+    /// Replace the NDEF message in the first publicly readable Type 4B file
+    /// if it is also publicly writable. An empty slice clears the file.
+    pub fn write_type4_ndef(&mut self, message: &[u8]) -> Result<(), Type4WriteError<T::Error>> {
+        write_type4(|command| self.exchange_apdu(command), message)
     }
 }
 
@@ -272,12 +287,75 @@ impl<F> Type2Data<F> {
 fn read_type4<E>(
     mut exchange: impl FnMut(&[u8]) -> Result<Vec<u8>, E>,
 ) -> Result<Vec<u8>, Error<E>> {
+    let file = select_ndef_file(&mut exchange)?;
+    let length = read_binary(&mut exchange, 0, 2)?;
+    let length = usize::from(u16::from_be_bytes([length[0], length[1]]));
+    if length + 2 > file.control.capacity {
+        return Err(Error::Layout("Type 4 NLEN exceeds file capacity"));
+    }
+    read_file(&mut exchange, 2..length + 2, file.max_read)
+}
+
+fn write_type4<E>(
+    mut exchange: impl FnMut(&[u8]) -> Result<Vec<u8>, E>,
+    message: &[u8],
+) -> Result<(), WriteError<E>> {
+    let file = select_ndef_file(&mut exchange).map_err(WriteError::Preparation)?;
+    if !file.control.writable {
+        return Err(WriteError::Preparation(Error::WriteAccess));
+    }
+    if file.max_write < 2 {
+        // Both bytes of NLEN must be published in the same UPDATE BINARY.
+        return Err(WriteError::Preparation(Error::Layout(
+            "Type 4 MLc cannot update NLEN",
+        )));
+    }
+    let available = file.control.capacity.min(0x8000) - 2;
+    if message.len() > available {
+        return Err(WriteError::Preparation(Error::Capacity {
+            requested: message.len(),
+            available,
+        }));
+    }
+    let length = (message.len() as u16).to_be_bytes();
+    if message.is_empty() {
+        return update_binary(&mut exchange, 0, &length)
+            .map_err(|cause| WriteError::update(UpdateStage::Publish, 0, cause));
+    }
+    update_binary(&mut exchange, 0, &[0, 0])
+        .map_err(|cause| WriteError::update(UpdateStage::Begin, 0, cause))?;
+    let mut written = 0;
+    for chunk in message.chunks(file.max_write) {
+        // Admission bounds all offsets to the short READ/UPDATE BINARY range.
+        update_binary(&mut exchange, (written + 2) as u16, chunk)
+            .map_err(|cause| WriteError::update(UpdateStage::Data, written, cause))?;
+        written += chunk.len();
+    }
+    update_binary(&mut exchange, 0, &length)
+        .map_err(|cause| WriteError::update(UpdateStage::Publish, written, cause))
+}
+
+struct FileControl {
+    id: [u8; 2],
+    capacity: usize,
+    writable: bool,
+}
+
+struct Type4File {
+    control: FileControl,
+    max_read: usize,
+    max_write: usize,
+}
+
+fn select_ndef_file<E>(
+    exchange: &mut impl FnMut(&[u8]) -> Result<Vec<u8>, E>,
+) -> Result<Type4File, Error<E>> {
     checked_apdu(
-        &mut exchange,
+        exchange,
         &[0, 0xa4, 4, 0, 7, 0xd2, 0x76, 0, 0, 0x85, 1, 1, 0],
     )?;
-    select_file(&mut exchange, [0xe1, 3])?;
-    let header = read_binary(&mut exchange, 0, 7)?;
+    select_file(exchange, [0xe1, 3])?;
+    let header = read_binary(exchange, 0, 7)?;
     let length = usize::from(u16::from_be_bytes([header[0], header[1]]));
     if header[2] >> 4 != 2 {
         return Err(Error::UnsupportedMapping);
@@ -289,36 +367,56 @@ fn read_type4<E>(
     if max_read < 15 {
         return Err(Error::Layout("Type 4 maximum read length"));
     }
-    let tlvs = read_file(&mut exchange, 7..length, max_read)?;
-    let (file, capacity) = ndef_file(&tlvs)?;
-    select_file(&mut exchange, file)?;
-    let length = read_binary(&mut exchange, 0, 2)?;
-    let length = usize::from(u16::from_be_bytes([length[0], length[1]]));
-    if length + 2 > capacity {
-        return Err(Error::Layout("Type 4 NLEN exceeds file capacity"));
-    }
-    read_file(&mut exchange, 2..length + 2, max_read)
+    let max_write = usize::from(u16::from_be_bytes([header[5], header[6]])).min(255);
+    let tlvs = read_file(exchange, 7..length, max_read)?;
+    let control = ndef_file(&tlvs)?;
+    select_file(exchange, control.id)?;
+    Ok(Type4File {
+        control,
+        max_read,
+        max_write,
+    })
 }
 
-fn ndef_file<E>(mut tlvs: &[u8]) -> Result<([u8; 2], usize), Error<E>> {
+fn ndef_file<E>(mut tlvs: &[u8]) -> Result<FileControl, Error<E>> {
     while let [tag, length, tail @ ..] = tlvs {
         let Some((value, rest)) = tail.split_at_checked(usize::from(*length)) else {
             return Err(Error::Layout("Type 4 file control TLV length"));
         };
         if *tag == 4 {
-            let [id_hi, id_lo, size_hi, size_lo, read, _] = value else {
+            let [id_hi, id_lo, size_hi, size_lo, read, write] = value else {
                 return Err(Error::Layout("Type 4 NDEF file control length"));
             };
             if *read == 0 {
-                return Ok((
-                    [*id_hi, *id_lo],
-                    usize::from(u16::from_be_bytes([*size_hi, *size_lo])),
-                ));
+                let capacity = usize::from(u16::from_be_bytes([*size_hi, *size_lo]));
+                if capacity < 2 {
+                    return Err(Error::Layout("Type 4 file cannot hold NLEN"));
+                }
+                return Ok(FileControl {
+                    id: [*id_hi, *id_lo],
+                    capacity,
+                    writable: *write == 0,
+                });
             }
         }
         tlvs = rest;
     }
     Err(Error::ReadAccess)
+}
+
+fn update_binary<E>(
+    exchange: &mut impl FnMut(&[u8]) -> Result<Vec<u8>, E>,
+    offset: u16,
+    data: &[u8],
+) -> Result<(), Error<E>> {
+    let [hi, lo] = offset.to_be_bytes();
+    let mut command = Vec::with_capacity(5 + data.len());
+    command.extend_from_slice(&[0, 0xd6, hi, lo, data.len() as u8]);
+    command.extend_from_slice(data);
+    if !checked_apdu(exchange, &command)?.is_empty() {
+        return Err(Error::Layout("UPDATE BINARY response length"));
+    }
+    Ok(())
 }
 
 fn checked_apdu<E>(
