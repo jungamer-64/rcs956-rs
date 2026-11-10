@@ -1,7 +1,7 @@
 use super::{Error, UpdateStage, WriteError};
 use crate::{
     isodep,
-    reader::{self, MAX_TYPE_A_COMMAND_BYTES, TypeACard, TypeBCard},
+    reader::{self, TypeACard, TypeBCard},
     transport::Transport,
 };
 use alloc::vec::Vec;
@@ -28,9 +28,10 @@ impl<T: Transport> TypeACard<'_, T> {
     /// Replace the NDEF message in the first publicly readable Type 4A file
     /// if it is also publicly writable. An empty slice clears the file.
     pub fn write_type4_ndef(&mut self, message: &[u8]) -> Result<(), Type4WriteError<T::Error>> {
+        let max_apdu_bytes = self.maximum_apdu_bytes();
         write_type4(
             |command| self.exchange_apdu(command),
-            MAX_TYPE_A_COMMAND_BYTES,
+            max_apdu_bytes,
             message,
         )
     }

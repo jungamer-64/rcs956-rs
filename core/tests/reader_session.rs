@@ -1687,6 +1687,44 @@ fn type_b_unchained_timeout_recovery_rejects_ack_with_matching_number() -> Resul
 }
 
 #[test]
+fn type_b_presence_probe_keeps_numbering_and_silence_revokes_the_session()
+-> Result<(), Box<dyn Error>> {
+    let mut steps = type_b_exchange_steps(&type_b_response());
+    steps.extend([
+        command(0xa0, &[11, 0, 0xb2], &[0, 0xa3]),
+        command(0xa0, &[11, 0, 2, 0xa4], &[0, 2, 0x90, 0]),
+        command(0xa0, &[11, 0, 0xb3], &[1]),
+        command(0xa0, &[11, 0, 0xb3], &[1]),
+        command(0xa0, &[11, 0, 0xb3], &[1]),
+    ]);
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut card = poll_iso_dep(&mut reader)?.ok_or("expected NFC-B card")?;
+    card.check_presence()?;
+    assert_eq!(card.exchange_apdu(&[0xa4])?, [0x90, 0]);
+    let error = card
+        .check_presence()
+        .err()
+        .ok_or("expected an unanswered probe")?;
+    assert!(matches!(
+        error,
+        isodep::PresenceError::NoResponse(ReaderError::RfStatus(1))
+    ));
+    let before = journal.borrow().requests.len();
+    assert!(matches!(
+        card.exchange_apdu(&[0xa4]),
+        Err(isodep::Error {
+            cause: isodep::Cause::SessionInvalid,
+            ..
+        })
+    ));
+    assert_eq!(journal.borrow().requests.len(), before);
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
 fn type_b_lost_exchange_keeps_transport_progress_without_apdu_replay() -> Result<(), Box<dyn Error>>
 {
     let mut steps = type_b_exchange_steps(&type_b_response());

@@ -933,6 +933,11 @@ impl<'a, T: Transport> TypeACard<'a, T> {
     pub fn target(&self) -> u8 {
         self.target
     }
+    /// Largest APDU [`Self::exchange_apdu`] admits. The reader performs ISO-DEP
+    /// chaining, so this is its `40` command limit.
+    pub fn maximum_apdu_bytes(&self) -> usize {
+        MAX_TYPE_A_COMMAND_BYTES
+    }
     /// Consume the typed selection and allow caller-defined card commands.
     /// Such commands can change card state that typed operations depend on.
     pub fn into_raw(self) -> RawTypeACard<'a, T> {
@@ -1133,7 +1138,9 @@ pub struct TypeBCard<'a, T: Transport> {
     session: isodep::Session,
 }
 impl<T: Transport> TypeBCard<'_, T> {
-    pub(crate) fn maximum_apdu_bytes(&self) -> usize {
+    /// Largest APDU this session admits: the local limit, the card buffer
+    /// advertised by MBLI, and the frame budget, whichever is smallest.
+    pub fn maximum_apdu_bytes(&self) -> usize {
         self.session.maximum_apdu_bytes()
     }
 
@@ -1162,6 +1169,25 @@ impl<T: Transport> TypeBCard<'_, T> {
         // blocks do not reprogram 1C.
         let setup = reader.prepare_exchange_timing(protocol, ResponseTimeout::Ms3280);
         exchange.exchange(
+            setup,
+            |error| matches!(error, Error::RfStatus(status) if status & 0x3f == 1),
+            |block, wait| {
+                let timeout = RfTimeout::new(wait)?;
+                reader.exchange_rf(block, timeout, protocol)
+            },
+        )
+    }
+
+    /// Confirm that the card still answers between APDUs, using the same
+    /// reader setup as [`Self::exchange_apdu`]. The probe carries no
+    /// application data and leaves block numbering unchanged. Any failure,
+    /// including an absent card, invalidates the session.
+    pub fn check_presence(&mut self) -> Result<(), isodep::PresenceError<Error<T::Error>>> {
+        let reader = &mut self.target.reader;
+        let protocol = RfProtocol::TypeB(self.target.profile);
+        let check = self.session.admit_presence_check()?;
+        let setup = reader.prepare_exchange_timing(protocol, ResponseTimeout::Ms3280);
+        check.run(
             setup,
             |error| matches!(error, Error::RfStatus(status) if status & 0x3f == 1),
             |block, wait| {

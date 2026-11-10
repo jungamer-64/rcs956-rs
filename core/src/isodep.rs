@@ -3,6 +3,7 @@
 //! CRC belongs to the reader. The block engine owns sequencing, CID, chaining
 //! and WTX; the caller owns each synchronous RF transfer and classifies RF
 //! timeouts. RF recovery requests a block within the same APDU exchange.
+//! Between APDUs, an R(NAK) probe confirms that the card is still in the field.
 use alloc::vec::Vec;
 use core::{error, fmt, time::Duration};
 
@@ -149,6 +150,38 @@ impl<E: error::Error + 'static> error::Error for Error<E> {
     }
 }
 
+/// Why a presence check did not confirm the selected card. Every variant
+/// leaves the session invalid; a new selection is required.
+#[derive(Debug)]
+pub enum PresenceError<E> {
+    /// An earlier failure invalidated this session.
+    SessionInvalid,
+    /// Reader setup failed before the presence probe was sent.
+    Preparation(E),
+    /// Neither the probe nor its bounded repetitions were answered. The last
+    /// RF timeout is preserved.
+    NoResponse(E),
+    /// A transfer failed for a reason other than an RF timeout.
+    Transport(E),
+    /// The answer was not the R(ACK) that the block protocol requires.
+    InvalidBlock(&'static str),
+}
+impl<E: fmt::Debug> fmt::Display for PresenceError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+impl<E: error::Error + 'static> error::Error for PresenceError<E> {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match self {
+            Self::Preparation(error) | Self::NoResponse(error) | Self::Transport(error) => {
+                Some(error)
+            }
+            Self::SessionInvalid | Self::InvalidBlock(_) => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 enum State {
     Active(u8),
@@ -223,6 +256,28 @@ impl Session {
         result
     }
 
+    /// Validate a received block's size and CID, returning its PCB and body.
+    fn split_block<'r>(&self, block: &'r [u8]) -> Result<(u8, &'r [u8]), &'static str> {
+        if block.is_empty() || block.len() > self.maximum_receive_bytes {
+            return Err("RF block size");
+        }
+        let pcb = block[0];
+        let with_cid = pcb & 8 != 0;
+        if with_cid != self.cid.is_some() {
+            return Err("CID presence");
+        }
+        let header = 1 + usize::from(with_cid);
+        if block.len() < header {
+            return Err("truncated CID");
+        }
+        if let Some(cid) = self.cid
+            && (block[1] & 0x3f != cid)
+        {
+            return Err("CID mismatch or reserved bits");
+        }
+        Ok((pcb, &block[header..]))
+    }
+
     fn first_capacity(&self) -> usize {
         self.capacity() - usize::from(self.nad.is_some())
     }
@@ -287,6 +342,71 @@ impl Session {
             apdu,
             number,
         })
+    }
+
+    pub(crate) fn admit_presence_check<E>(
+        &mut self,
+    ) -> Result<PresenceCheck<'_>, PresenceError<E>> {
+        let State::Active(number) = self.state else {
+            return Err(PresenceError::SessionInvalid);
+        };
+        self.state = State::Invalid;
+        Ok(PresenceCheck {
+            session: self,
+            number,
+        })
+    }
+}
+
+/// Exclusive session ownership for one presence probe. As with an APDU, only
+/// a confirmed answer restores reuse.
+#[derive(Debug)]
+pub(crate) struct PresenceCheck<'s> {
+    session: &'s mut Session,
+    number: u8,
+}
+
+impl PresenceCheck<'_> {
+    /// Send R(NAK) with the current block number. Between exchanges the card's
+    /// block number differs from ours, so ISO/IEC 14443-4 requires it to answer
+    /// R(ACK) carrying its own number without re-sending its last block. Neither
+    /// side toggles, so a confirmed probe leaves the next APDU unaffected.
+    pub(crate) fn run<E>(
+        self,
+        setup: Result<(), E>,
+        recoverable: impl Fn(&E) -> bool,
+        mut transmit: impl FnMut(&[u8], Duration) -> Result<Vec<u8>, E>,
+    ) -> Result<(), PresenceError<E>> {
+        let Self { session, number } = self;
+        setup.map_err(PresenceError::Preparation)?;
+        let probe = session.frame(0xb2 | number, &[]);
+        let mut repetitions = 0;
+        let response = loop {
+            match transmit(&probe, session.wait) {
+                Ok(response) => break response,
+                Err(error) if recoverable(&error) => {
+                    if repetitions == MAX_RETRANSMISSIONS {
+                        return Err(PresenceError::NoResponse(error));
+                    }
+                    repetitions += 1;
+                }
+                Err(error) => return Err(PresenceError::Transport(error)),
+            }
+        };
+        let (pcb, body) = session
+            .split_block(&response)
+            .map_err(PresenceError::InvalidBlock)?;
+        if pcb & 0xf6 != 0xa2 {
+            return Err(PresenceError::InvalidBlock("presence answer is not R(ACK)"));
+        }
+        if !body.is_empty() {
+            return Err(PresenceError::InvalidBlock("R-block data"));
+        }
+        if pcb & 1 == number {
+            return Err(PresenceError::InvalidBlock("R(ACK) block number"));
+        }
+        session.state = State::Active(number);
+        Ok(())
     }
 }
 
@@ -371,24 +491,9 @@ impl PreparedExchange<'_, '_> {
                     Err(error) => return Err(Cause::Transport(error)),
                 };
                 wait = session.wait;
-                if response.is_empty() || response.len() > session.maximum_receive_bytes {
-                    return Err(Cause::InvalidBlock("RF block size"));
-                }
-                let pcb = response[0];
-                let with_cid = pcb & 8 != 0;
-                if with_cid != session.cid.is_some() {
-                    return Err(Cause::InvalidBlock("CID presence"));
-                }
-                let header = 1 + usize::from(with_cid);
-                if response.len() < header {
-                    return Err(Cause::InvalidBlock("truncated CID"));
-                }
-                if let Some(cid) = session.cid
-                    && (response[1] & 0x3f != cid)
-                {
-                    return Err(Cause::InvalidBlock("CID mismatch or reserved bits"));
-                }
-                let body = &response[header..];
+                let (pcb, body) = session
+                    .split_block(&response)
+                    .map_err(Cause::InvalidBlock)?;
                 match pcb & 0xf7 {
                     0xf2 => {
                         if body.len() != 1 || !(1..=59).contains(&(body[0] & 0x3f)) {
@@ -834,6 +939,96 @@ mod tests {
             .err()
             .ok_or("expected receive limit")?;
         assert!(matches!(error.cause, Cause::InvalidBlock("RF block size")));
+        Ok(())
+    }
+
+    #[test]
+    fn presence_probe_expects_the_cards_opposite_block_number()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut link = session(64, Some(3))?;
+        let mut probes = 0;
+        link.admit_presence_check::<io::Error>()?.run(
+            Ok::<(), io::Error>(()),
+            |error| error.kind() == io::ErrorKind::TimedOut,
+            |frame, wait| {
+                probes += 1;
+                assert_eq!(frame, [0xba, 3]);
+                assert_eq!(wait, block_frame_wait(4));
+                if probes == 1 {
+                    Err(io::ErrorKind::TimedOut.into())
+                } else {
+                    Ok(vec![0xab, 3])
+                }
+            },
+        )?;
+        assert_eq!(probes, 2);
+        // The probe neither toggles the block number nor consumes the session.
+        assert_eq!(
+            link.prepare::<io::Error>(&[0xa4])?.exchange(
+                Ok(()),
+                |_| false,
+                |frame, _| {
+                    assert_eq!(frame, [0x0a, 3, 0xa4]);
+                    Ok::<_, io::Error>(vec![0x0a, 3, 0x90, 0])
+                }
+            )?,
+            [0x90, 0]
+        );
+        link.admit_presence_check::<io::Error>()?.run(
+            Ok(()),
+            |_| false,
+            |frame, _| {
+                assert_eq!(frame, [0xbb, 3]);
+                Ok::<_, io::Error>(vec![0xaa, 3])
+            },
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn unconfirmed_presence_invalidates_the_session() -> Result<(), Box<dyn std::error::Error>> {
+        for reply in [vec![0xa2], vec![0xa3, 0], vec![0xb3], vec![3, 0x90, 0]] {
+            let mut link = session(64, None)?;
+            let error = link
+                .admit_presence_check::<io::Error>()?
+                .run(Ok(()), |_| false, |_, _| Ok::<_, io::Error>(reply.clone()))
+                .err()
+                .ok_or("expected an unconfirmed probe")?;
+            assert!(matches!(error, PresenceError::InvalidBlock(_)));
+            assert!(matches!(
+                link.admit_presence_check::<io::Error>(),
+                Err(PresenceError::SessionInvalid)
+            ));
+        }
+        let mut link = session(64, None)?;
+        let mut probes = 0;
+        let error = link
+            .admit_presence_check::<io::Error>()?
+            .run(
+                Ok(()),
+                |_| true,
+                |_, _| {
+                    probes += 1;
+                    Err::<Vec<u8>, _>(io::Error::from(io::ErrorKind::TimedOut))
+                },
+            )
+            .err()
+            .ok_or("expected no response")?;
+        assert!(matches!(error, PresenceError::NoResponse(_)));
+        assert_eq!(probes, MAX_RETRANSMISSIONS + 1);
+        assert!(matches!(link.state, State::Invalid));
+        let mut link = session(64, None)?;
+        let error = link
+            .admit_presence_check::<io::Error>()?
+            .run(
+                Err(io::Error::other("setup")),
+                |_| false,
+                |_, _| Err::<Vec<u8>, _>(io::Error::other("unexpected transfer")),
+            )
+            .err()
+            .ok_or("expected setup failure")?;
+        assert!(matches!(error, PresenceError::Preparation(_)));
+        assert!(matches!(link.state, State::Invalid));
         Ok(())
     }
 }
