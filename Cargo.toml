@@ -12,26 +12,6 @@ target-umdf-version-minor = 33
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
-[package]
-name = "rcs956"
-version = "0.1.0"
-edition.workspace = true
-license.workspace = true
-description = "Windows client for the RC-S956 USB driver"
-
-[lib]
-path = "src/lib.rs"
-
-[target.'cfg(windows)'.dependencies]
-rcs956-usb-abi = { path = "driver/usb-abi" }
-windows-sys = { version = "0.61", features = ["Win32_Devices_DeviceAndDriverInstallation", "Win32_Devices_Properties", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
-
-[dependencies]
-rcs956-core = { path = "core", version = "0.1" }
-
-[lints]
-workspace = true
-
 [workspace.lints.rust]
 missing_docs = "deny"
 missing_debug_implementations = "deny"
