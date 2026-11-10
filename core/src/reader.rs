@@ -188,17 +188,6 @@ impl ConfigImage {
                 item.extend_from_slice(&self.bytes[0x1b..=0x22]);
                 vec![item]
             }
-            RfProtocol::RawFelica(_) => vec![vec![
-                0x0b,
-                self.bytes[0x1b],
-                self.bytes[0xcb],
-                self.bytes[0xcc],
-                self.bytes[0xcd],
-                self.bytes[0x1f],
-                self.bytes[0x20],
-                self.bytes[0x21],
-                self.bytes[0xce],
-            ]],
             RfProtocol::TypeB(profile) => {
                 let options = match profile {
                     nfcb::RfProfile::Standard => &self.bytes[0x23..=0x25],
@@ -234,25 +223,17 @@ pub struct ReaderInfo {
 /// Parameter of the reader's 1C timer, derived only from a validated RF wait.
 /// This timer and the A0 half-ms field are different protocol representations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReaderTimer {
-    Off,
-    Timed(u16),
-}
+struct ReaderTimer(u16);
 impl ReaderTimer {
     fn for_rf_timeout(timeout: RfTimeout) -> Self {
         // The accepted tick range is 1..=65535, so this conversion yields
         // 1..=33 whole seconds and a parameter in 99..=3299.
-        Self::Timed(timeout.ticks.div_ceil(2000) * 100 - 1)
+        Self(timeout.ticks.div_ceil(2000) * 100 - 1)
     }
 
     fn args(self) -> [u8; 3] {
-        match self {
-            Self::Off => [0, 0, 0],
-            Self::Timed(value) => {
-                let [lo, hi] = value.to_le_bytes();
-                [0x80, lo, hi]
-            }
-        }
+        let [lo, hi] = self.0.to_le_bytes();
+        [0x80, lo, hi]
     }
 }
 
@@ -309,7 +290,6 @@ impl ResponseTimeout {
 enum RfProtocol {
     TypeA,
     Felica,
-    RawFelica(BitRate),
     TypeB(nfcb::RfProfile),
 }
 
@@ -429,10 +409,7 @@ impl<T: Transport> Reader<T> {
         protocol: RfProtocol,
         timeout: RfTimeout,
     ) -> Result<(), Error<T::Error>> {
-        let timer = match protocol {
-            RfProtocol::RawFelica(_) => ReaderTimer::Off,
-            _ => ReaderTimer::for_rf_timeout(timeout),
-        };
+        let timer = ReaderTimer::for_rf_timeout(timeout);
         let (info, apply_mode, response_timeout) = match &self.state {
             State::Ready {
                 rf:
@@ -458,24 +435,17 @@ impl<T: Transport> Reader<T> {
         self.state = State::NeedsInitialization;
         self.command(0x1c, &timer.args(), Duration::from_secs(1))?;
         if apply_mode {
-            if !matches!(protocol, RfProtocol::RawFelica(_)) {
-                let (retry, timing) = if protocol == RfProtocol::Felica {
-                    (0, 0xb7)
-                } else {
-                    (4, 0x8f)
-                };
-                self.command(0x32, &[5, 0, 0, retry], Duration::from_secs(1))?;
-                self.command(0x32, &[0x81, timing], Duration::from_secs(1))?;
-            }
+            let (retry, timing) = if protocol == RfProtocol::Felica {
+                (0, 0xb7)
+            } else {
+                (4, 0x8f)
+            };
+            self.command(0x32, &[5, 0, 0, retry], Duration::from_secs(1))?;
+            self.command(0x32, &[0x81, timing], Duration::from_secs(1))?;
             for item in info.configuration.rf_configuration(protocol) {
                 self.command(0x32, &item, Duration::from_secs(1))?;
             }
-            if let RfProtocol::RawFelica(rate) = protocol {
-                self.write_register(0x630d, 8)?;
-                self.command(0x32, &[0x80, rate.selector()], Duration::from_secs(1))?;
-            } else {
-                self.write_register(0x630d, 0)?;
-            }
+            self.write_register(0x630d, 0)?;
         }
         self.state = State::Ready {
             info,
@@ -564,22 +534,6 @@ impl<T: Transport> Reader<T> {
             }
             _ => Err(Error::Response("poll target count/layout")),
         }
-    }
-
-    /// Exchange a length-prefixed FeliCa RF packet using raw mode. No reader
-    /// target is selected. The caller owns addressing and effects.
-    pub fn exchange_raw_felica(
-        &mut self,
-        rate: BitRate,
-        packet: &[u8],
-        timeout: RfTimeout,
-    ) -> Result<Vec<u8>, Error<T::Error>> {
-        felica::validate_length(packet, 2)?;
-        let protocol = RfProtocol::RawFelica(rate);
-        self.configure_rf(protocol, timeout)?;
-        let response = self.exchange_rf(packet, timeout, protocol)?;
-        felica::validate_length(&response, 2)?;
-        Ok(response)
     }
 
     /// Activate one NFC-A target at 106 kbps. UID, SAK and optional ATS are
@@ -1058,7 +1012,7 @@ pub struct FelicaCard<'a, T: Transport> {
     target: u8,
     timeout: RfTimeout,
 }
-impl<T: Transport> FelicaCard<'_, T> {
+impl<'a, T: Transport> FelicaCard<'a, T> {
     /// Polling information. IDm is a session address, not a universal persistent ID.
     pub fn observation(&self) -> &PollResponse {
         &self.observation
@@ -1137,6 +1091,37 @@ impl<T: Transport> FelicaCard<'_, T> {
         let request = felica::addressed_command(self.observation.idm, command, data)?;
         self.reader
             .exchange_rf(&request, self.timeout, RfProtocol::Felica)
+    }
+
+    /// Consume the selected card's typed command authority to send opaque
+    /// packets at its negotiated FeliCa rate. Packets can affect addressing
+    /// or card state, so the original identity is no longer an authority.
+    pub fn into_raw(self) -> RawFelicaCard<'a, T> {
+        RawFelicaCard {
+            reader: self.reader,
+            timeout: self.timeout,
+        }
+    }
+}
+
+/// Raw packet authority for an activated FeliCa RF field.
+#[derive(Debug)]
+pub struct RawFelicaCard<'a, T: Transport> {
+    reader: &'a mut Reader<T>,
+    timeout: RfTimeout,
+}
+
+impl<T: Transport> RawFelicaCard<'_, T> {
+    /// Send a caller-built FeliCa packet using `A0`. Both packets include
+    /// their FeliCa length byte. Address, command, status, and any ciphertext
+    /// belong to the caller; packet effects are never replayed automatically.
+    pub fn exchange_packet(&mut self, packet: &[u8]) -> Result<Vec<u8>, Error<T::Error>> {
+        felica::validate_length(packet, 2)?;
+        let response = self
+            .reader
+            .exchange_rf(packet, self.timeout, RfProtocol::Felica)?;
+        felica::validate_length(&response, 2)?;
+        Ok(response)
     }
 }
 
