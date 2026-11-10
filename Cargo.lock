@@ -409,20 +409,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "rcs956"
+name = "rcs956-cli"
 version = "0.1.0"
 dependencies = [
  "rcs956-core",
  "rcs956-usb-abi",
  "windows-sys",
-]
-
-[[package]]
-name = "rcs956-cli"
-version = "0.1.0"
-dependencies = [
- "rcs956",
- "rcs956-core",
 ]
 
 [[package]]

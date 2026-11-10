@@ -14,7 +14,8 @@ doc = false
 rcs956-core = { path = "../../core", version = "0.1" }
 
 [target.'cfg(windows)'.dependencies]
-rcs956 = { path = "../..", version = "0.1" }
+rcs956-usb-abi = { path = "../../driver/usb-abi" }
+windows-sys = { version = "0.61", features = ["Win32_Devices_DeviceAndDriverInstallation", "Win32_Devices_Properties", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
 
 [lints]
 workspace = true

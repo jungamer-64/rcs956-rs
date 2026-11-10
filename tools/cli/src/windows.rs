@@ -31,16 +31,16 @@ use windows_sys::{
 
 /// A currently enumerated RC-S956 USB device and its available interface paths.
 #[derive(Debug, Clone)]
-pub struct Device {
+pub(super) struct Device {
     /// PnP instance identity used only for selecting this attached device.
-    pub instance: String,
+    pub(super) instance: String,
     /// Device description, absent only if the property is not registered.
-    pub description: Option<String>,
+    pub(super) description: Option<String>,
     /// Active OS function service, absent if no service property is registered.
-    pub service: Option<String>,
+    pub(super) service: Option<String>,
     /// Registered raw USB application interface aliases of this exact function.
     /// USB hub presence interfaces are not candidates for application I/O.
-    pub usb_paths: Vec<String>,
+    pub(super) usb_paths: Vec<String>,
 }
 
 const INTERFACE: GUID = GUID {
@@ -216,7 +216,7 @@ fn device_instance(set: HDEVINFO, dev: &mut SP_DEVINFO_DATA) -> io::Result<Strin
 }
 
 /// Enumerate present RC-S956 devices without sending commands or changing drivers.
-pub fn devices() -> io::Result<Vec<Device>> {
+pub(super) fn devices() -> io::Result<Vec<Device>> {
     let usb = wide("USB");
     // SAFETY: the enumerator is terminated, flags request only present devices.
     let raw = unsafe {
@@ -272,7 +272,7 @@ pub fn devices() -> io::Result<Vec<Device>> {
 
 /// Exclusive client of a bound RC-S956 USB driver.
 #[derive(Debug)]
-pub struct Usb {
+pub(super) struct Usb {
     file: File,
     epoch: Instant,
 }
@@ -280,7 +280,7 @@ pub struct Usb {
 impl Usb {
     /// Open an enumerated RC-S956 USB interface. The driver validates the
     /// device and bulk endpoints before publishing that interface.
-    pub fn open(path: &str) -> io::Result<Self> {
+    pub(super) fn open(path: &str) -> io::Result<Self> {
         let available = devices()?.iter().any(|device| {
             device
                 .usb_paths

@@ -1,6 +1,6 @@
 # Build and device validation
 
-`rcs956-core`はフレーム、取引状態、RF設定、カードプロトコルを所有する。`no_std`と`alloc`で動作し、crate全体で`unsafe_code`を禁止する。Rustからは`rcs956_core::reader::Reader`などを使用する。coreが定義する`Transport`へ同期転送、pipe回復、単調時計、待機を委譲し、期限・待機時間とエラー時の状態遷移はcoreで決める。`rcs956::windows::Usb`はUMDF 2のUSBモードを使うWindowsクライアント。
+`rcs956-core`はフレーム、取引状態、RF設定、カードプロトコルを所有する。`no_std`と`alloc`で動作し、crate全体で`unsafe_code`を禁止する。Rustからは`rcs956_core::reader::Reader`などを使用する。coreが定義する`Transport`へ同期転送、pipe回復、単調時計、待機を委譲し、期限・待機時間とエラー時の状態遷移はcoreで決める。
 
 ## ビルドと検証
 
@@ -33,7 +33,7 @@ Windows 11 向けの未署名パッケージは `driver/package.ps1` で生成�
 
 ## 実機検証ツール
 
-[`tools/cli`](tools/cli)の`rcs956-cli`は両ライブラリを使う実機検証ツールで、実行ファイル名は`rcs956`。CLIの実行時はpackageを指定する。
+[`tools/cli`](tools/cli)の`rcs956-cli`はUMDF 2のUSBモードを使う実機検証ツールで、実行ファイル名は`rcs956`。CLIの実行時はpackageを指定する。
 
 ```powershell
 cargo run --locked -p rcs956-cli -- devices
