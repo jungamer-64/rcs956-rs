@@ -695,6 +695,35 @@ pub struct TargetResponse {
     pub data: Vec<u8>,
 }
 
+/// Failure of one NFC-A card command, classified by its application effect.
+#[derive(Debug)]
+pub enum TypeAExchangeError<E> {
+    /// The supplied byte count is outside `1..=MAX_TYPE_A_COMMAND_BYTES`.
+    InputLength(usize),
+    /// The selection has already lost its operation authority.
+    SessionInvalid,
+    /// Reader timing setup failed before any card command was sent.
+    Preparation(Error<E>),
+    /// The card command transaction or its response failed. Consult the cause
+    /// for transport progress; the command may have taken effect.
+    Exchange(Error<E>),
+}
+
+impl<E: fmt::Debug> fmt::Display for TypeAExchangeError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl<E: error::Error + 'static> error::Error for TypeAExchangeError<E> {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match self {
+            Self::Preparation(error) | Self::Exchange(error) => Some(error),
+            Self::InputLength(_) | Self::SessionInvalid => None,
+        }
+    }
+}
+
 /// NFC-A selection tied to one exclusive reader borrow.
 #[derive(Debug)]
 pub struct TypeACard<'a, T: Transport> {
@@ -718,12 +747,15 @@ impl<T: Transport> TypeACard<'_, T> {
     /// upper status bits imply an automatic continuation.
     /// The requested RF wait is rounded upward to a 32/02 timing step, capped
     /// at 3280 ms. The reader timer uses that effective wait; host waiting adds 1 s.
-    pub fn exchange(&mut self, data: &[u8]) -> Result<TargetResponse, Error<T::Error>> {
+    ///
+    /// # Errors
+    ///
+    /// Invalid input leaves the selection unchanged. Timing setup failure
+    /// revokes the selection before any card command is sent. A transport
+    /// failure or RF status 0D during exchange also revokes the selection.
+    pub fn exchange(&mut self, data: &[u8]) -> Result<TargetResponse, TypeAExchangeError<T::Error>> {
         if data.is_empty() || data.len() > MAX_TYPE_A_COMMAND_BYTES {
-            return Err(Error::InputLength {
-                maximum: MAX_TYPE_A_COMMAND_BYTES,
-                actual: data.len(),
-            });
+            return Err(TypeAExchangeError::InputLength(data.len()));
         }
         if !matches!(
             self.reader.state,
@@ -735,20 +767,29 @@ impl<T: Transport> TypeACard<'_, T> {
                 ..
             }
         ) {
-            return Err(Error::NotInitialized);
+            return Err(TypeAExchangeError::SessionInvalid);
         }
         let mut args = Vec::with_capacity(data.len() + 1);
         args.push(self.target);
         args.extend_from_slice(data);
         let timeout = ResponseTimeout::for_request(self.timeout);
         self.reader
-            .prepare_exchange_timing(RfProtocol::TypeA, timeout)?;
-        let response = self.reader.command(0x40, &args, timeout.host_wait())?;
+            .prepare_exchange_timing(RfProtocol::TypeA, timeout)
+            .map_err(TypeAExchangeError::Preparation)?;
+        let response = self
+            .reader
+            .command(0x40, &args, timeout.host_wait())
+            .map_err(TypeAExchangeError::Exchange)?;
         let status = response
             .first()
             .copied()
-            .ok_or(Error::Response("missing RF status"))?;
-        let data = self.reader.rf_response(response)?;
+            .ok_or(TypeAExchangeError::Exchange(Error::Response(
+                "missing RF status",
+            )))?;
+        let data = self
+            .reader
+            .rf_response(response)
+            .map_err(TypeAExchangeError::Exchange)?;
         Ok(TargetResponse { status, data })
     }
 }
