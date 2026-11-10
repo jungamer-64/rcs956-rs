@@ -18,7 +18,7 @@ name = "pcsc_probe"
 required-features = ["pcsc"]
 
 [dependencies]
-rcs956-core = { path = "../core", version = "0.1" }
+rcs956 = { path = "../core", version = "0.1" }
 rcs956-usb-abi = { path = "usb-abi", optional = true }
 wdk-sys = { git = "https://github.com/microsoft/windows-drivers-rs.git", tag = "wdk-sys-v0.5.2", features = ["usb"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation"] }

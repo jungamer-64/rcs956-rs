@@ -1,6 +1,6 @@
 use core::mem::size_of;
 
-use rcs956_core::{nfca, nfcb, reader::MAX_TYPE_A_COMMAND_BYTES};
+use rcs956::{nfca, nfcb, reader::MAX_TYPE_A_COMMAND_BYTES};
 use windows_sys::Win32::Security::Credentials::{
     SCARD_IO_REQUEST, SCARD_PROTOCOL_DEFAULT, SCARD_PROTOCOL_RAW, SCARD_PROTOCOL_T0,
     SCARD_PROTOCOL_T1,

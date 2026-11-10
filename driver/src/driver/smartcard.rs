@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rcs956_core::{
+use rcs956::{
     isodep,
     reader::{Error as ReaderError, Reader, RfTimeout, TypeACard, TypeBCard, TypeBSelection},
     transport::Failure,

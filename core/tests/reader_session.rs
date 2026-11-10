@@ -2,7 +2,7 @@
 //!
 //! These model command/response contracts, not physical device operation.
 
-use rcs956_core::{
+use rcs956::{
     felica::{BitRate, BlockWrite, CardError, Idm, PollRequest, ServiceEntry},
     isodep, mifare, ndef,
     nfcb::{PollOptions, RfProfile},
@@ -260,7 +260,7 @@ fn mode_configuration() -> Vec<Step> {
     ]
 }
 
-fn poll_request() -> Result<PollRequest, rcs956_core::felica::CardError> {
+fn poll_request() -> Result<PollRequest, rcs956::felica::CardError> {
     PollRequest::new(0x1234, 1, 0)
 }
 

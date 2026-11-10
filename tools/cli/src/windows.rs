@@ -2,7 +2,7 @@
 
 mod metadata;
 
-use rcs956_core::transport::Transport;
+use rcs956::transport::Transport;
 use rcs956_usb_abi as abi;
 
 use std::{

@@ -409,26 +409,26 @@ dependencies = [
 ]
 
 [[package]]
-name = "rcs956-cli"
-version = "0.1.0"
-dependencies = [
- "rcs956-core",
- "rcs956-usb-abi",
- "windows-sys",
-]
-
-[[package]]
-name = "rcs956-core"
+name = "rcs956"
 version = "0.1.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
+name = "rcs956-cli"
+version = "0.1.0"
+dependencies = [
+ "rcs956",
+ "rcs956-usb-abi",
+ "windows-sys",
+]
+
+[[package]]
 name = "rcs956-driver"
 version = "0.1.0"
 dependencies = [
- "rcs956-core",
+ "rcs956",
  "rcs956-usb-abi",
  "wdk-build",
  "wdk-sys",

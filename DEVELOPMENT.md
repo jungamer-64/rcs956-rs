@@ -1,15 +1,15 @@
 # Build and device validation
 
-`rcs956-core`はフレーム、取引状態、RF設定、カードプロトコルを所有する。`no_std`と`alloc`で動作し、crate全体で`unsafe_code`を禁止する。Rustからは`rcs956_core::reader::Reader`などを使用する。coreが定義する`Transport`へ同期転送、pipe回復、単調時計、待機を委譲し、期限・待機時間とエラー時の状態遷移はcoreで決める。
+`rcs956`はフレーム、取引状態、RF設定、カードプロトコルを所有する。`no_std`と`alloc`で動作し、crate全体で`unsafe_code`を禁止する。Rustからは`rcs956::reader::Reader`などを使用する。coreが定義する`Transport`へ同期転送、pipe回復、単調時計、待機を委譲し、期限・待機時間とエラー時の状態遷移はcoreで決める。
 
 ## ビルドと検証
 
-リポジトリのルートで実行する。既定のビルド対象は `rcs956-core`。core の `no_std` 検証にはベアメタル向け Rust target が必要。
+リポジトリのルートで実行する。既定のビルド対象は `rcs956`。core の `no_std` 検証にはベアメタル向け Rust target が必要。
 
 ```powershell
 cargo build --locked
 cargo fmt --all --check
-cargo check --locked -p rcs956-core --lib --target x86_64-unknown-none
+cargo check --locked -p rcs956 --lib --target x86_64-unknown-none
 ```
 
 ドライバのビルドには Windows SDK、UMDF の WDF ヘッダとライブラリを含む WDK、MSVC、LLVM の libclang が必要。[windows-drivers-rs の開発環境](https://github.com/microsoft/windows-drivers-rs#setup)を参照する。ドライバの feature は `usb` と `pcsc` のいずれか一つを選ぶ。`cargo build-usb` は USB ドライバと CLI をビルドする。

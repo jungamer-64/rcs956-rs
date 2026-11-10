@@ -4,8 +4,8 @@
 #[cfg(windows)]
 use crate::windows::{self, Device, Usb};
 #[cfg(windows)]
-use rcs956_core::reader::{Reader, TypeBSelection};
-use rcs956_core::{
+use rcs956::reader::{Reader, TypeBSelection};
+use rcs956::{
     felica::{BitRate, BlockWrite, MAX_READ_BLOCKS, MAX_WRITE_BLOCKS, PollRequest},
     isodep::MAX_APDU_BYTES,
     ndef::{Message, RecordType},
@@ -110,7 +110,7 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
             }
             "--nad" => {
                 b_options_specified = true;
-                b_options.node_address = Some(rcs956_core::isodep::NodeAddress::from_byte(
+                b_options.node_address = Some(rcs956::isodep::NodeAddress::from_byte(
                     u8::try_from(hex_u16(&value)?)?,
                 )?);
             }
@@ -451,7 +451,7 @@ fn type_b_operation(
 }
 
 #[cfg(windows)]
-fn print_type_a(card: &rcs956_core::reader::TypeACard<'_, Usb>) {
+fn print_type_a(card: &rcs956::reader::TypeACard<'_, Usb>) {
     let observation = card.observation();
     println!(
         "Target: {}\nSENS_RES: {}\nSEL_RES: {:02X}\nUID: {}",
@@ -682,10 +682,10 @@ fn card_operation(
             }
         }
         FelicaOperation::ServiceAt(index) => match card.search_service_code(index)? {
-            Some(rcs956_core::felica::ServiceEntry::Service(code)) => {
+            Some(rcs956::felica::ServiceEntry::Service(code)) => {
                 println!("Service: {code:04X}")
             }
-            Some(rcs956_core::felica::ServiceEntry::Area { code, end }) => {
+            Some(rcs956::felica::ServiceEntry::Area { code, end }) => {
                 println!("Area: {code:04X}..={end:04X}")
             }
             None => println!("End of service list"),

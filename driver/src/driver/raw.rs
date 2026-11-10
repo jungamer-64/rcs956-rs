@@ -1,6 +1,6 @@
 use std::{rc::Rc, thread, time::Duration};
 
-use rcs956_core::transport::Transport;
+use rcs956::transport::Transport;
 use rcs956_usb_abi as abi;
 
 use super::{

@@ -1,7 +1,7 @@
 use core::{ffi::c_void, fmt, mem::size_of, ptr::null_mut, time::Duration};
 use std::{rc::Rc, time::Instant};
 
-use rcs956_core::transport::Transport;
+use rcs956::transport::Transport;
 use wdk_sys::{
     _WDF_MEMORY_DESCRIPTOR__bindgen_ty_1, _WDF_MEMORY_DESCRIPTOR__bindgen_ty_1__bindgen_ty_1,
     _WDF_MEMORY_DESCRIPTOR_TYPE, _WDF_REQUEST_SEND_OPTIONS_FLAGS, _WDF_USB_PIPE_TYPE,

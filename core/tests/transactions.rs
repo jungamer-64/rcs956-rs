@@ -1,6 +1,6 @@
 //! Scripted transport behavior tests through the production transaction API.
 
-use rcs956_core::{
+use rcs956::{
     transport::{Failure, Link, Progress, TransactionError, Transport},
     wire,
 };
