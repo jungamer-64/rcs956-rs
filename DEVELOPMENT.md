@@ -51,7 +51,7 @@ NFC-BのAPDU交換前には`32 02 0B 0B 10`と`1C 80 8F 01`を設定する。`32
 
 NFC-BのISO-DEP sessionはblock番号、送受信chaining、R-block、WTXを処理する。空のINFを持つ継続I-blockも受理し、応答bytesを増やさずblock番号とframe数を進めてR-ACKを返す。application入力は1〜65535 bytes、応答は65536 bytes、RF callbackは2048回、WTXは32回、protocol再送は2回を上限とする。最低限の送信frame数だけでbudgetを超える入力は送信前に拒否する。初期block待機はATQBのFWIに基づく`330 us × 2^FWI`。WTXでは要求倍率を応答に返し、待機は倍率を掛けた値をFWI=14相当の上限に制限する。`--timeout-ms`は検出待機を指定し、NFC-Bの各block待機を上書きしない。
 
-APDUの入力と最低frame数を検査してからreader設定を始める。入力拒否はsessionを保持する。設定失敗は`Cause::Preparation`として返し、applicationの送信progressとRF frame数を0に保ってsessionを失効させる。RF交換を開始した後の失敗もsessionを失効させ、attemptした入力prefix、確認済みprefix、受信済み応答、frame数をerrorに残す。送信chaining中に番号の異なるR-ACKを受けたときは直前のI-blockを再送できる。応答chaining中の重複I-blockには同じR-ACKを返す。readerがRF timeoutを報告した場合、送信中はR-NAKを送り、応答chainの受信中はR-ACKを再送する。USB取引の失敗はそのまま返す。カードからのR-NAKと、単一I-blockのcommandに対するR-ACKはprotocol errorとして扱う。
+APDUの入力と最低frame数を検査してからreader設定を始める。入力拒否はsessionを保持する。設定失敗は`Cause::Preparation`として返し、applicationの送信progressとRF frame数を0に保ってsessionを失効させる。RF交換を開始した後の失敗もsessionを失効させ、attemptした入力prefix、確認済みprefix、受信済み応答、frame数をerrorに残す。送信chaining中に番号の異なるR-ACKを受けたときは直前のI-blockを再送できる。応答chaining中の重複I-blockには同じR-ACKを返す。readerがRF timeoutを報告した場合、送信中はR-NAKを送り、応答chainの受信中はR-ACKを再送する。USB取引の失敗はそのまま返す。単一I-blockのcommandは、RF timeout後に送ったR-NAKへの応答が異なる番号のR-ACKである場合に限り、同じI-blockを予算内で再送する。カードからのR-NAKはprotocol errorとして扱う。
 
 カードhandleはreaderの排他的borrowを保持する。transport失敗後にはRF readinessが失効する。RF statusのmask後の値が0Dの場合も再初期化を要求する。0Bの場合はraw値を保持してエラーを返す前に10 msの待機を入れる。readerへの`initialize`は明示的な再同期であり、失敗したカード操作の再実行や結果照合ではない。`rf_off`の失敗はcallerが観測する。DropはOS resourceの解放だけを担当する。
 

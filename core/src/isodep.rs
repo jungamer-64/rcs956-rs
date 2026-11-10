@@ -172,6 +172,14 @@ enum Phase {
     Receiving { previous_was_first: bool },
 }
 
+#[derive(Clone, Copy)]
+enum Outbound {
+    Information,
+    Acknowledge,
+    RequestRetransmission,
+    WaitExtension(u8),
+}
+
 impl Session {
     pub(crate) fn new(
         size: u16,
@@ -311,11 +319,11 @@ impl PreparedExchange<'_, '_> {
             end: first_end,
             more: first_end < apdu.len(),
         };
-        let mut pending = session.first_i_block(
+        let mut last_i = session.first_i_block(
             2 | number | if first_end < apdu.len() { 0x10 } else { 0 },
             &apdu[..first_end],
         );
-        let mut last_i = pending.clone();
+        let mut outbound = Outbound::Information;
         let mut wait = session.wait;
         let mut extensions = 0;
         let mut retransmissions = 0;
@@ -328,18 +336,27 @@ impl PreparedExchange<'_, '_> {
                 if let Phase::Sending { end, .. } = phase {
                     progress.attempted_application_bytes = end;
                 }
-                let response = match transmit(&pending, wait) {
+                let transfer = match outbound {
+                    Outbound::Information => transmit(&last_i, wait),
+                    Outbound::Acknowledge => transmit(&session.frame(0xa2 | number, &[]), wait),
+                    Outbound::RequestRetransmission => {
+                        transmit(&session.frame(0xb2 | number, &[]), wait)
+                    }
+                    Outbound::WaitExtension(multiplier) => {
+                        transmit(&session.frame(0xf2, &[multiplier]), wait)
+                    }
+                };
+                let response = match transfer {
                     Ok(response) => response,
                     Err(error) if recoverable(&error) => {
                         if retransmissions == MAX_RETRANSMISSIONS {
                             return Err(Cause::RecoveryExhausted(error));
                         }
                         retransmissions += 1;
-                        let pcb = match phase {
-                            Phase::Sending { .. } => 0xb2,
-                            Phase::Receiving { .. } => 0xa2,
+                        outbound = match phase {
+                            Phase::Sending { .. } => Outbound::RequestRetransmission,
+                            Phase::Receiving { .. } => Outbound::Acknowledge,
                         };
-                        pending = session.frame(pcb | number, &[]);
                         wait = session.wait;
                         continue;
                     }
@@ -376,7 +393,7 @@ impl PreparedExchange<'_, '_> {
                         let multiplier = body[0] & 0x3f;
                         // Apply FWT_MAX in the same guarded reader units as the base wait.
                         wait = (session.wait * u32::from(multiplier)).min(MAX_BLOCK_WAIT);
-                        pending = session.frame(0xf2, &[multiplier]);
+                        outbound = Outbound::WaitExtension(multiplier);
                     }
                     0xc2 => return Err(Cause::Deselected),
                     0xb2 | 0xb3 => return Err(Cause::InvalidBlock("R-NAK from card")),
@@ -387,9 +404,6 @@ impl PreparedExchange<'_, '_> {
                         let Phase::Sending { end, more } = phase else {
                             return Err(Cause::InvalidBlock("R-block during response"));
                         };
-                        if apdu.len() <= session.first_capacity() {
-                            return Err(Cause::InvalidBlock("R-ACK for unchained command"));
-                        }
                         if pcb & 1 == number {
                             if !more {
                                 return Err(Cause::InvalidBlock("R-ACK without command chaining"));
@@ -401,17 +415,24 @@ impl PreparedExchange<'_, '_> {
                                 end: next_end,
                                 more: next_end < apdu.len(),
                             };
-                            pending = session.frame(
+                            last_i = session.frame(
                                 2 | number | if next_end < apdu.len() { 0x10 } else { 0 },
                                 &apdu[end..next_end],
                             );
-                            last_i.clone_from(&pending);
+                            outbound = Outbound::Information;
                         } else {
+                            // An unchained I-block may be repeated only when the
+                            // card responds to our RF timeout recovery request.
+                            if first_end == apdu.len()
+                                && !matches!(outbound, Outbound::RequestRetransmission)
+                            {
+                                return Err(Cause::InvalidBlock("R-ACK for unchained command"));
+                            }
                             if retransmissions == MAX_RETRANSMISSIONS {
                                 return Err(Cause::Budget(Budget::Retransmissions));
                             }
                             retransmissions += 1;
-                            pending.clone_from(&last_i);
+                            outbound = Outbound::Information;
                         }
                     }
                     0x02 | 0x03 | 0x06 | 0x07 | 0x12 | 0x13 | 0x16 | 0x17 => {
@@ -442,7 +463,7 @@ impl PreparedExchange<'_, '_> {
                                 return Err(Cause::Budget(Budget::Retransmissions));
                             }
                             retransmissions += 1;
-                            pending = session.frame(0xa2 | number, &[]);
+                            outbound = Outbound::Acknowledge;
                             continue;
                         }
                         progress.acknowledged_application_bytes = apdu.len();
@@ -458,7 +479,7 @@ impl PreparedExchange<'_, '_> {
                         phase = Phase::Receiving {
                             previous_was_first: first,
                         };
-                        pending = session.frame(0xa2 | number, &[]);
+                        outbound = Outbound::Acknowledge;
                     }
                     _ => return Err(Cause::InvalidBlock("PCB")),
                 }

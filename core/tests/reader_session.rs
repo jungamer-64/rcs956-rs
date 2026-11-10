@@ -1255,6 +1255,49 @@ fn type_b_invalid_r_blocks_stop_without_retransmitting() -> Result<(), Box<dyn E
 }
 
 #[test]
+fn type_b_repeats_unchained_i_block_when_timeout_recovery_acknowledges_loss()
+-> Result<(), Box<dyn Error>> {
+    let mut steps = type_b_exchange_steps(&type_b_response());
+    steps.extend([
+        command(0xa0, &[11, 0, 2, 0xa4], &[1]),
+        command(0xa0, &[11, 0, 0xb2], &[0, 0xa3]),
+        command(0xa0, &[11, 0, 2, 0xa4], &[0, 2, 0x90, 0]),
+        command(0xa0, &[11, 0, 3, 0xb0], &[0, 3, 0x90, 0]),
+    ]);
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut card = poll_iso_dep(&mut reader)?.ok_or("expected NFC-B card")?;
+    assert_eq!(card.exchange_apdu(&[0xa4])?, [0x90, 0]);
+    assert_eq!(card.exchange_apdu(&[0xb0])?, [0x90, 0]);
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn type_b_unchained_timeout_recovery_rejects_ack_with_matching_number() -> Result<(), Box<dyn Error>>
+{
+    let mut steps = type_b_exchange_steps(&type_b_response());
+    steps.extend([
+        command(0xa0, &[11, 0, 2, 0xa4], &[1]),
+        command(0xa0, &[11, 0, 0xb2], &[0, 0xa2]),
+    ]);
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut card = poll_iso_dep(&mut reader)?.ok_or("expected NFC-B card")?;
+    let error = card
+        .exchange_apdu(&[0xa4])
+        .err()
+        .ok_or("expected invalid ACK")?;
+    assert!(matches!(error.cause, isodep::Cause::InvalidBlock(_)));
+    assert_eq!(error.progress.frames, 2);
+    assert_eq!(error.progress.acknowledged_application_bytes, 0);
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
 fn type_b_lost_exchange_keeps_transport_progress_without_apdu_replay() -> Result<(), Box<dyn Error>>
 {
     let mut steps = type_b_exchange_steps(&type_b_response());
