@@ -3,7 +3,10 @@
 mod dep;
 mod type1;
 
-pub use dep::{DepError, DepInitiator, DepRate, DepRequest, PassiveDepTarget};
+pub use dep::{
+    DepActivation, DepError, DepInitiator, DepLink, DepMessage, DepMode, DepPeer, DepRate,
+    DepRequest, DepTransferCause, MAX_DEP_MESSAGE_BYTES, PassiveDepTarget,
+};
 pub use type1::Type1Tag;
 
 use crate::{

@@ -101,11 +101,11 @@ MIFARE Classicはcallerが指定したkeyでreaderが認証し、成功したsec
 
 コアはLite-Sのプロトコル、MACの入力構成、session状態を所有する。2-key TDESは`des`、MACの比較は`subtle`、鍵用バッファの消去は`zeroize`に委譲する。TDES実装のメモリアクセスには鍵依存性があり、同一ホスト上のタイミング観測を排除する要件には別途対処が必要。
 
-## パッシブ NFC-DEP
+## NFC-DEP
 
-`Reader::listen_passive_dep`はNFC-A 106 kbpsまたはNFC-F 212／424 kbpsでパッシブターゲットとして待機する。発見用の識別子とGeneral Bytesはcallerが指定し、ATR_RESとDEP frame処理はreader firmwareが担う。callerは`receive`で取得した要求に1回応答できる。応答は60 bytes以下で、NAD付きの要求やfirmwareが継続を報告した要求は拒否する。LLCP等の上位protocolはcallerが処理する。
+`Reader::activate_dep`は指定された速度・通信モードでイニシエーターとして相手を選択する。`Reader::listen_passive_dep`は106／212／424 kbpsでパッシブターゲットとして待機する。ATRとDEPのRFフレーム処理はreader firmwareが担う。要求・応答は`MAX_DEP_MESSAGE_BYTES`以内で、継続フラグに基づいて分割・再結合する。NADは連結の先頭だけに付け、ターゲットは要求と同じアドレスで応答する。途中失敗ではコマンド投入済み・受理済みの長さと受信済みデータを返し、セッションを失効させる。ホストの待機時間は各フラグメントに適用する。LLCP等の上位protocolはcallerが処理する。
 
-`dep-echo --data HEX`は6-byteの識別子suffixを指定して1要求を反射する。ターゲットの終了は`finish`がresetと再初期化を行う。listenの失敗後は`initialize`で再同期する。
+`dep-echo --data HEX`は6-byteの識別子suffixを指定して1要求を反射する。終了時の`finish`はresetと再初期化を行う。起動に失敗した場合は`initialize`で再同期する。
 
 ## 検証境界
 

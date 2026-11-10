@@ -7,8 +7,9 @@ use rcs956::{
     isodep, mifare, ndef,
     nfcb::{PollOptions, RfProfile},
     reader::{
-        ConfigurationError, DepError, DepRate, Error as ReaderError, Reader, RfTimeout,
-        TimeoutRange, TypeAExchangeError, TypeBCard, TypeBSelection,
+        ConfigurationError, DepActivation, DepError, DepMode, DepRate, DepTransferCause,
+        Error as ReaderError, MAX_DEP_MESSAGE_BYTES, Reader, RfTimeout, TimeoutRange,
+        TypeAExchangeError, TypeBCard, TypeBSelection,
     },
     transport::{Progress, TransactionError, Transport},
     wire::{self, Direction, Frame},
@@ -2050,9 +2051,12 @@ fn passive_dep_owns_activation_and_one_response_at_a_time() -> Result<(), Box<dy
             ],
         ),
         command(0x92, &[0x46, 0x66, 0x6d], &[0]),
-        command(0x86, &[], &[0, 0x11, 0x22]),
-        command(0x8e, &[0x33], &[0]),
+        command(0x86, &[], &[0xc0, 0x12, 0x11]),
+        command(0x86, &[], &[0, 0x22]),
+        command(0x94, &[0x12; 60], &[0]),
+        command(0x8e, &[0x12; 2], &[0]),
         command(0x86, &[], &[0x40, 0x44]),
+        command(0x86, &[], &[0x01]),
     ]);
     steps.extend(initialization(&configuration));
     let (script, journal) = Script::new(steps);
@@ -2063,11 +2067,12 @@ fn passive_dep_owns_activation_and_one_response_at_a_time() -> Result<(), Box<dy
     {
         let mut request = target.receive(timeout()?)?;
         assert_eq!(request.payload(), [0x11, 0x22]);
+        assert_eq!(request.node_address(), Some(0x12));
         assert!(matches!(
-            request.respond(&[0; 61]),
-            Err(DepError::ResponseLength(61))
+            request.respond(&[0; MAX_DEP_MESSAGE_BYTES + 1]),
+            Err(DepError::MessageLength(_))
         ));
-        request.respond(&[0x33])?;
+        request.respond(&[0x12; 61])?;
         assert!(matches!(
             request.respond(&[0x33]),
             Err(DepError::SessionUnavailable)
@@ -2075,13 +2080,70 @@ fn passive_dep_owns_activation_and_one_response_at_a_time() -> Result<(), Box<dy
     }
     assert!(matches!(
         target.receive(timeout()?),
-        Err(DepError::UnsupportedRequest { status: 0x40, prefix }) if prefix == [0x44]
+        Err(DepError::Transfer {
+            attempted: 0, accepted: 0, received,
+            cause: DepTransferCause::Status(1),
+        }) if received.payload == [0x44]
     ));
     assert!(matches!(
         target.receive(timeout()?),
         Err(DepError::SessionUnavailable)
     ));
     target.finish()?;
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn dep_initiator_uses_meta_chaining_and_retains_partial_failure() -> Result<(), Box<dyn Error>> {
+    let configuration = ab_config_image();
+    let mut steps = initialization(&configuration);
+    let mut first = vec![0x41, 0x31];
+    first.extend([0xa5; 59]);
+    steps.extend([
+        command(0x12, &[1], &[]),
+        command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
+        command(0x32, &[5, 0, 0, 0], &[]),
+        command(
+            0x56,
+            &[1, 1, 4, 0x46, 0x66, 0x6d],
+            &[0, 1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 0, 0, 0, 8, 3, 0x46],
+        ),
+        command(0x40, &first, &[0]),
+        command(0x40, &[1, 0xa5, 0xa5], &[0xc0, 0x31, 0xab]),
+        command(0x40, &[1], &[0, 0xcd]),
+        command(0x40, &[1, 0x31, 0x22], &[0xc0, 0x31, 0xef]),
+        command(0x40, &[1], &[0x01]),
+    ]);
+    steps.extend(initialization(&configuration));
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    let mut link = reader.activate_dep(
+        DepActivation {
+            mode: DepMode::Active,
+            rate: DepRate::Kbps212,
+            nfcid3: None,
+            general_bytes: b"Ffm",
+            node_address: Some(0x31),
+        },
+        timeout()?,
+    )?;
+    assert_eq!(link.peer().general_bytes, b"F");
+    let reply = link.exchange(&[0xa5; 61])?;
+    assert_eq!(reply.node_address, Some(0x31));
+    assert_eq!(reply.payload, [0xab, 0xcd]);
+    assert!(matches!(
+        link.exchange(&[0x22]),
+        Err(DepError::Transfer {
+            attempted: 1, accepted: 1, received,
+            cause: DepTransferCause::Status(1),
+        }) if received.payload == [0xef] && received.node_address == Some(0x31)
+    ));
+    assert!(matches!(
+        link.exchange(&[]),
+        Err(DepError::SessionUnavailable)
+    ));
+    link.finish()?;
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
 }
