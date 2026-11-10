@@ -55,7 +55,13 @@ APDUの入力と最低frame数を検査してからreader設定を始める。�
 
 カードhandleはreaderの排他的borrowを保持する。transport失敗後にはRF readinessが失効する。RF statusのmask後の値が0Dの場合も再初期化を要求する。0Bの場合はraw値を保持してエラーを返す前に10 msの待機を入れる。readerへの`initialize`は明示的な再同期であり、失敗したカード操作の再実行や結果照合ではない。`rf_off`の失敗はcallerが観測する。DropはOS resourceの解放だけを担当する。
 
-MIFARE Classicはcallerが指定したkeyでreaderが認証し、成功したsector内のブロックに限り読取・書込みを許す。ブロック交換失敗でsector handleは失効する。`ndef-read`はNFC-AのType 2 tagまたはNFC-A／BのType 4 tagから公開読取可能なNDEF messageのbytesを取得する。Type 2の物理アドレスは先頭sectorに限り、Type 4はmapping 2.xのshort APDUで参照できるfileを扱う。
+MIFARE Classicはcallerが指定したkeyでreaderが認証し、成功したsector内のブロックに限り読取・書込みを許す。ブロック交換失敗でsector handleは失効する。
+
+`ndef-read`と`ndef-write`は、`--type type1`で120-byte静的メモリのType 1、`--type a`でType 2／4A、`--type felica`でsystem 12FCのType 3、`--type b`でType 4Bを扱う。Type 2は物理sector 0、Type 4はmapping 2.xのshort APDUで参照できる最初の公開読取可能なNDEF fileに限る。Type 1／2の書込みには初期化済みのNDEF TLVが必要で、置換後のTerminatorより後ろのTLVは参照されない。Type 3は属性ブロックのchecksumと更新中フラグを検査する。
+
+`ndef-write --data HEX`はタグを開く前にNDEFのレコード境界と長さを検査する。空の`--data`はメッセージを消去する。`ndef-read`は格納されたbytesを返す。`ndef-decode HEX`はオフラインでレコードを復元し、type、ID、payloadを表示する。アプリケーション固有のpayloadは各レコードの利用側が解釈する。
+
+書込みはメッセージを非公開にしてから本文を更新し、長さまたは属性ブロックを最後に確定する。失敗は永続書込み前の準備エラーと、更新開始・本文・公開の各段階を区別する。更新コマンド失敗時の確認済みbytes数は直前までの応答に基づく。再選択してタグの状態を確認してから、必要な回復操作を判断する。
 
 選択済みFeliCaのRF待機には`A0`のhalf-ms fieldと`1C`のreader timerを設定する。reader timerはRF待機を秒単位へ切り上げてから`(ms-10)/10`をLE16で送り、成功した設定だけをRF modeに保持する。`raw-felica`は`4A`で選択を成立させてから`A0`で任意のpacketを交換する。送受信ともFeliCaの長さbyteを含み、アドレス・コマンド・暗号化の解釈は呼出側が行う。任意packetを許可した時点でtyped card handleのIDm authorityは消費される。
 

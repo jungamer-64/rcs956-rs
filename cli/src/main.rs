@@ -8,6 +8,7 @@ use rcs956_core::reader::{Reader, TypeBSelection};
 use rcs956_core::{
     felica::{BitRate, BlockWrite, MAX_READ_BLOCKS, MAX_WRITE_BLOCKS, PollRequest},
     isodep::MAX_APDU_BYTES,
+    ndef::{Message, RecordType},
     nfcb::{PollOptions as TypeBPollOptions, RfProfile},
     reader::{MAX_TYPE_A_COMMAND_BYTES, RfTimeout},
     wire,
@@ -25,7 +26,7 @@ fn main() -> std::process::ExitCode {
 }
 fn help() {
     println!(
-        "rcs956 devices\nrcs956 probe [--path DEVICE_INTERFACE]\nrcs956 poll [--type felica|a|b] [--timeout-ms 500] [--path PATH]\nFeliCa poll options: [--rate 212|424] [--system FFFF] [--request 1] [--slots 0]\nrcs956 read --service HEX --blocks DECIMAL[,DECIMAL...] [FeliCa poll options]\nrcs956 write --service HEX --block-data DECIMAL:HEX [--block-data DECIMAL:HEX ...] [FeliCa poll options]\nrcs956 systems [FeliCa poll options]\nrcs956 service-at --index DECIMAL [FeliCa poll options]\nrcs956 raw-felica --data LENGTH_PREFIXED_HEX [--data LENGTH_PREFIXED_HEX ...] [FeliCa poll options]\nNFC-B options: [--b-profile standard|alternate] [--afi HEX] [--nad HEX]\nrcs956 exchange --type a|a-apdu|b|b-frame --data HEX [--timeout-ms 500] [--path PATH]\nrcs956 sequence --type a|a-apdu|b|b-frame --data HEX --data HEX [...] [--timeout-ms 500] [--path PATH]\nrcs956 ndef-read --type a|b [--timeout-ms 500] [--path PATH]\nrcs956 decode READER_FRAME_HEX\n\nHardware commands require an existing WinUSB binding. exchange sends one caller-supplied card command (A) or ISO-DEP APDU (a-apdu or b) or a non-ISO-DEP card command (b-frame); sequence sends each supplied command in order within one card selection. Their effects belong to the caller. No automatic application-command replay."
+        "rcs956 devices\nrcs956 probe [--path DEVICE_INTERFACE]\nrcs956 poll [--type felica|a|b] [--timeout-ms 500] [--path PATH]\nFeliCa poll options: [--rate 212|424] [--system FFFF] [--request 1] [--slots 0]\nrcs956 read --service HEX --blocks DECIMAL[,DECIMAL...] [FeliCa poll options]\nrcs956 write --service HEX --block-data DECIMAL:HEX [--block-data DECIMAL:HEX ...] [FeliCa poll options]\nrcs956 systems [FeliCa poll options]\nrcs956 service-at --index DECIMAL [FeliCa poll options]\nrcs956 raw-felica --data LENGTH_PREFIXED_HEX [--data LENGTH_PREFIXED_HEX ...] [FeliCa poll options]\nNFC-B options: [--b-profile standard|alternate] [--afi HEX] [--nad HEX]\nrcs956 exchange --type a|a-apdu|b|b-frame --data HEX [--timeout-ms 500] [--path PATH]\nrcs956 sequence --type a|a-apdu|b|b-frame --data HEX --data HEX [...] [--timeout-ms 500] [--path PATH]\nrcs956 ndef-read --type type1|a|felica|b [--rate 212|424] [--timeout-ms 500] [--path PATH]\nrcs956 ndef-write --type type1|a|felica|b --data NDEF_HEX [--rate 212|424] [--timeout-ms 500] [--path PATH]\nrcs956 ndef-decode NDEF_HEX\nrcs956 decode READER_FRAME_HEX\n\nHardware commands require an existing WinUSB binding. exchange sends one caller-supplied card command (A) or ISO-DEP APDU (a-apdu or b) or a non-ISO-DEP card command (b-frame); sequence sends each supplied command in order within one card selection. Their effects belong to the caller. No automatic application-command replay."
     );
 }
 fn run() -> Result<(), Box<dyn Error>> {
@@ -44,6 +45,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         println!("{:?}", wire::parse(&bytes, wire::Direction::Reader)?);
         return Ok(());
     }
+    if command == "ndef-decode" {
+        let bytes = hex_bytes(&args.collect::<Vec<_>>().join(" "))?;
+        return decode_ndef(&bytes);
+    }
     if command == "devices" {
         if args.next().is_some() {
             return Err("devices takes no options".into());
@@ -60,6 +65,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             | "service-at"
             | "raw-felica"
             | "ndef-read"
+            | "ndef-write"
             | "exchange"
             | "sequence"
     ) {
@@ -192,8 +198,19 @@ fn run() -> Result<(), Box<dyn Error>> {
     if b_options.node_address.is_some() && technology != Technology::TypeB {
         return Err("--nad requires --type b".into());
     }
-    if command == "ndef-read" && !matches!(technology, Technology::TypeA | Technology::TypeB) {
-        return Err("ndef-read requires --type a or b".into());
+    let is_ndef = matches!(command.as_str(), "ndef-read" | "ndef-write");
+    if is_ndef
+        && (!matches!(
+            technology,
+            Technology::Felica | Technology::Type1 | Technology::TypeA | Technology::TypeB
+        ) || felica_options)
+    {
+        return Err(
+            "NDEF requires --type type1, a, felica or b; the Type 3 system is fixed".into(),
+        );
+    }
+    if technology == Technology::Type1 && !is_ndef {
+        return Err("--type type1 requires an NDEF operation".into());
     }
     validate_data_options(&command, technology, &data)?;
     let request = PollRequest::new(system, request, slots)?;
@@ -213,6 +230,19 @@ fn run() -> Result<(), Box<dyn Error>> {
         );
         let result = if command == "probe" {
             Ok(())
+        } else if is_ndef {
+            let operation = match data.as_slice() {
+                [message] => NdefOperation::Write(message),
+                _ => NdefOperation::Read,
+            };
+            ndef_operation(
+                &mut reader,
+                technology,
+                rate.unwrap_or(BitRate::Kbps212),
+                b_options,
+                timeout,
+                operation,
+            )
         } else {
             match technology {
                 Technology::Felica => {
@@ -243,6 +273,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 Technology::TypeB | Technology::TypeBFrame => {
                     type_b_operation(&mut reader, b_options, timeout, &data, &command, technology)
                 }
+                Technology::Type1 => Err("Type 1 requires an NDEF operation".into()),
             }
         };
         let shutdown = reader.rf_off();
@@ -264,6 +295,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Technology {
     Felica,
+    Type1,
     TypeA,
     TypeAApdu,
     TypeB,
@@ -273,11 +305,12 @@ impl Technology {
     fn parse(input: &str) -> Result<Self, Box<dyn Error>> {
         match input {
             "felica" => Ok(Self::Felica),
+            "type1" => Ok(Self::Type1),
             "a" => Ok(Self::TypeA),
             "a-apdu" => Ok(Self::TypeAApdu),
             "b" => Ok(Self::TypeB),
             "b-frame" => Ok(Self::TypeBFrame),
-            _ => Err("--type must be felica, a, a-apdu, b or b-frame".into()),
+            _ => Err("--type must be felica, type1, a, a-apdu, b or b-frame".into()),
         }
     }
 }
@@ -305,12 +338,20 @@ fn validate_data_options(
                 );
             }
         }
+        "ndef-write" => {
+            let [message] = data else {
+                return Err("ndef-write requires exactly one --data".into());
+            };
+            if !message.is_empty() {
+                Message::parse(message)?;
+            }
+        }
         "exchange" | "sequence" => {
             for apdu in data {
                 validate_exchange(technology, apdu)?;
             }
         }
-        _ if !data.is_empty() => return Err("--data requires exchange or sequence".into()),
+        _ if !data.is_empty() => return Err("unexpected --data for this command".into()),
         _ => {}
     }
     Ok(())
@@ -321,7 +362,7 @@ fn validate_exchange(technology: Technology, data: &[u8]) -> Result<(), Box<dyn 
         Technology::TypeA | Technology::TypeAApdu => MAX_TYPE_A_COMMAND_BYTES,
         Technology::TypeB => MAX_APDU_BYTES,
         Technology::TypeBFrame => 63,
-        Technology::Felica => {
+        Technology::Felica | Technology::Type1 => {
             return Err("exchange and sequence require --type a, a-apdu, b or b-frame".into());
         }
     };
@@ -343,27 +384,7 @@ fn type_a_operation(
         println!("No NFC-A card");
         return Ok(());
     };
-    let observation = card.observation();
-    println!(
-        "Target: {}\nSENS_RES: {}\nSEL_RES: {:02X}\nUID: {}",
-        card.target(),
-        hex(&observation.sens_res()),
-        observation.sel_res(),
-        hex(observation.uid())
-    );
-    if let Some(ats) = observation.ats() {
-        println!("ATS: {}", hex(ats.bytes()));
-    }
-    if command == "ndef-read" {
-        if observation.supports_iso_dep() {
-            println!("NDEF: {}", hex(&card.read_type4_ndef()?));
-        } else if let Some(message) = card.read_type2_ndef()? {
-            println!("NDEF: {}", hex(&message));
-        } else {
-            println!("No NDEF message");
-        }
-        return Ok(());
-    }
+    print_type_a(&card);
     if technology == Technology::TypeAApdu {
         for (index, apdu) in data.iter().enumerate() {
             if command == "sequence" {
@@ -404,21 +425,7 @@ fn type_b_operation(
         println!("No NFC-B card");
         return Ok(());
     };
-    let observation = card.observation();
-    println!(
-        "Target: {}\nPUPI: {}\nATQB: {}\nATTRIB: {}",
-        card.target_number(),
-        hex(&observation.pupi()),
-        hex(observation.atqb()),
-        hex(observation.attrib_response())
-    );
-    if command == "ndef-read" {
-        let TypeBSelection::IsoDep(card) = &mut card else {
-            return Err("Type 4B NDEF requires ISO-DEP activation".into());
-        };
-        println!("NDEF: {}", hex(&card.read_type4_ndef()?));
-        return Ok(());
-    }
+    print_type_b(&card);
     for (index, apdu) in data.iter().enumerate() {
         if command == "sequence" {
             println!("APDU {}: {}", index + 1, hex(apdu));
@@ -431,6 +438,143 @@ fn type_b_operation(
             }
         };
         println!("Response: {}", hex(&response));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn print_type_a(card: &rcs956_core::reader::TypeACard<'_, WinUsb>) {
+    let observation = card.observation();
+    println!(
+        "Target: {}\nSENS_RES: {}\nSEL_RES: {:02X}\nUID: {}",
+        card.target(),
+        hex(&observation.sens_res()),
+        observation.sel_res(),
+        hex(observation.uid())
+    );
+    if let Some(ats) = observation.ats() {
+        println!("ATS: {}", hex(ats.bytes()));
+    }
+}
+
+#[cfg(windows)]
+fn print_type_b(card: &TypeBSelection<'_, WinUsb>) {
+    let observation = card.observation();
+    println!(
+        "Target: {}\nPUPI: {}\nATQB: {}\nATTRIB: {}",
+        card.target_number(),
+        hex(&observation.pupi()),
+        hex(observation.atqb()),
+        hex(observation.attrib_response())
+    );
+}
+
+#[cfg(windows)]
+enum NdefOperation<'a> {
+    Read,
+    Write(&'a [u8]),
+}
+
+#[cfg(windows)]
+impl NdefOperation<'_> {
+    fn no_tag(&self, message: &'static str) -> Result<(), Box<dyn Error>> {
+        match self {
+            Self::Read => {
+                println!("{message}");
+                Ok(())
+            }
+            Self::Write(_) => Err(message.into()),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn ndef_operation(
+    reader: &mut Reader<WinUsb>,
+    technology: Technology,
+    rate: BitRate,
+    options: TypeBPollOptions,
+    timeout: RfTimeout,
+    operation: NdefOperation<'_>,
+) -> Result<(), Box<dyn Error>> {
+    match technology {
+        Technology::Type1 => {
+            let Some(mut tag) = reader.poll_type1(timeout)? else {
+                return operation.no_tag("No Type 1 tag");
+            };
+            println!("UID: {}", hex(&tag.uid()));
+            match operation {
+                NdefOperation::Read => match tag.read_ndef()? {
+                    Some(message) => println!("NDEF: {}", hex(&message)),
+                    None => println!("No NDEF message"),
+                },
+                NdefOperation::Write(message) => tag.write_ndef(message)?,
+            }
+        }
+        Technology::Felica => {
+            let Some(mut tag) = reader.poll_type3(rate, timeout)? else {
+                return operation.no_tag("No NFC Forum Type 3 tag");
+            };
+            match operation {
+                NdefOperation::Read => println!("NDEF: {}", hex(&tag.read_ndef()?)),
+                NdefOperation::Write(message) => tag.write_ndef(message)?,
+            }
+        }
+        Technology::TypeA => {
+            let Some(mut card) = reader.poll_type_a(timeout)? else {
+                return operation.no_tag("No NFC-A card");
+            };
+            print_type_a(&card);
+            match (&operation, card.observation().supports_iso_dep()) {
+                (NdefOperation::Read, true) => println!("NDEF: {}", hex(&card.read_type4_ndef()?)),
+                (NdefOperation::Read, false) => match card.read_type2_ndef()? {
+                    Some(message) => println!("NDEF: {}", hex(&message)),
+                    None => println!("No NDEF message"),
+                },
+                (NdefOperation::Write(message), true) => card.write_type4_ndef(message)?,
+                (NdefOperation::Write(message), false) => card.write_type2_ndef(message)?,
+            }
+        }
+        Technology::TypeB => {
+            let Some(mut selection) = reader.poll_type_b(options, timeout)? else {
+                return operation.no_tag("No NFC-B card");
+            };
+            print_type_b(&selection);
+            let TypeBSelection::IsoDep(card) = &mut selection else {
+                return Err("Type 4B NDEF requires ISO-DEP activation".into());
+            };
+            match operation {
+                NdefOperation::Read => println!("NDEF: {}", hex(&card.read_type4_ndef()?)),
+                NdefOperation::Write(message) => card.write_type4_ndef(message)?,
+            }
+        }
+        _ => return Err("invalid NDEF technology".into()),
+    }
+    if let NdefOperation::Write(message) = operation {
+        println!("NDEF written ({} bytes)", message.len());
+    }
+    Ok(())
+}
+
+fn decode_ndef(bytes: &[u8]) -> Result<(), Box<dyn Error>> {
+    let message = Message::parse(bytes)?;
+    for (index, record) in message.records().iter().enumerate() {
+        let (format, name) = match record.record_type {
+            RecordType::Empty => ("Empty", &[][..]),
+            RecordType::WellKnown(name) => ("Well-known", name),
+            RecordType::Media(name) => ("Media", name),
+            RecordType::AbsoluteUri(name) => ("Absolute URI", name),
+            RecordType::External(name) => ("External", name),
+            RecordType::Unknown => ("Unknown", &[][..]),
+        };
+        println!(
+            "Record {}: {}\nType: {}\nID: {}\nPayload: {}",
+            index + 1,
+            format,
+            hex(name),
+            hex(record.id.unwrap_or_default()),
+            hex(&record.payload),
+        );
     }
     Ok(())
 }
@@ -598,7 +742,6 @@ fn hex_bytes(s: &str) -> Result<Vec<u8>, Box<dyn Error>> {
         .map(|n| u8::from_str_radix(&digits[n..n + 2], 16).map_err(Into::into))
         .collect()
 }
-#[cfg(windows)]
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02X}")).collect()
 }
@@ -668,6 +811,24 @@ mod tests {
 #[cfg(test)]
 mod sequence_tests {
     use super::*;
+
+    #[test]
+    fn ndef_write_validates_the_complete_message_before_device_access() {
+        assert!(
+            validate_data_options("ndef-write", Technology::Type1, &[vec![0xd0, 0, 0]]).is_ok()
+        );
+        assert!(validate_data_options("ndef-write", Technology::Felica, &[vec![]]).is_ok());
+        assert!(validate_data_options("ndef-write", Technology::TypeB, &[]).is_err());
+        assert!(validate_data_options("ndef-write", Technology::TypeA, &[vec![0xd1, 0]]).is_err());
+        assert!(
+            validate_data_options(
+                "ndef-write",
+                Technology::TypeA,
+                &[vec![0xd0, 0, 0], vec![0xd0, 0, 0]]
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn sequence_requires_apdus_and_type_a_or_b() {

@@ -1755,6 +1755,91 @@ fn mifare_classic_authority_is_limited_to_the_authenticated_sector() -> Result<(
 }
 
 #[test]
+fn type_one_ndef_uses_rid_rall_and_byte_writes() -> Result<(), Box<dyn Error>> {
+    let mut steps = initialization(&ab_config_image());
+    steps.extend(ab_mode(false));
+    let mut memory = [0; 120];
+    memory[..4].copy_from_slice(&[1, 2, 3, 4]);
+    memory[8..18].copy_from_slice(&[0xe1, 0x10, 0x0e, 0, 3, 3, 0xd0, 0, 0, 0xfe]);
+    memory[112..114].copy_from_slice(&[1, 0x60]);
+    let mut reply = vec![0, 0x11, 0x48];
+    reply.extend(memory);
+    let read = [7, 0, 0, 0, 1, 2, 3, 4];
+    steps.extend([
+        command(0x4a, &[1, 4], &[1, 7, 0, 0x0c, 1, 2, 3, 4]),
+        command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
+        command(
+            0x40,
+            &[7, 0x78, 0, 0, 0, 0, 0, 0],
+            &[0, 0x11, 0x48, 1, 2, 3, 4],
+        ),
+        command(0x40, &read, &reply),
+        command(0x40, &read, &reply),
+    ]);
+    for (address, data) in [
+        (13, 0),
+        (14, 0xd5),
+        (15, 0),
+        (16, 1),
+        (17, 0x42),
+        (18, 0xfe),
+        (13, 4),
+    ] {
+        steps.push(command(
+            0x40,
+            &[7, 0x53, address, data, 1, 2, 3, 4],
+            &[0, address, data],
+        ));
+    }
+    reply[3 + 112] |= 4; // Lock block 2, which includes the end of the replacement.
+    steps.push(command(0x40, &read, &reply));
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut tag = reader.poll_type1(timeout()?)?.ok_or("Type 1 tag absent")?;
+    assert_eq!(tag.uid(), [1, 2, 3, 4]);
+    assert_eq!(tag.read_ndef()?.as_deref(), Some([0xd0, 0, 0].as_slice()));
+    tag.write_ndef(&[0xd5, 0, 1, 0x42])?;
+    assert!(matches!(
+        tag.write_ndef(&[0xd5, 0, 1, 0x42]),
+        Err(ndef::WriteError::Preparation(ndef::Error::WriteAccess))
+    ));
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn type_one_dynamic_memory_is_rejected_before_read_or_write() -> Result<(), Box<dyn Error>> {
+    let mut steps = initialization(&ab_config_image());
+    steps.extend(ab_mode(false));
+    steps.extend([
+        command(0x4a, &[1, 4], &[1, 7, 0, 0x0c, 1, 2, 3, 4]),
+        command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
+        command(
+            0x40,
+            &[7, 0x78, 0, 0, 0, 0, 0, 0],
+            &[0, 0x12, 0x48, 1, 2, 3, 4],
+        ),
+    ]);
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut tag = reader.poll_type1(timeout()?)?.ok_or("Type 1 tag absent")?;
+    assert!(matches!(
+        tag.read_ndef(),
+        Err(ndef::Error::UnsupportedMapping)
+    ));
+    assert!(matches!(
+        tag.write_ndef(&[0xd0, 0, 0]),
+        Err(ndef::WriteError::Preparation(
+            ndef::Error::UnsupportedMapping
+        ))
+    ));
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
 fn type_two_ndef_read_skips_reserved_bytes_in_the_message() -> Result<(), Box<dyn Error>> {
     let mut steps = initialization(&ab_config_image());
     steps.extend(ab_mode(false));

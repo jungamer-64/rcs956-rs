@@ -1,4 +1,4 @@
-use super::{Error, UpdateStage, WriteError};
+use super::{Error, UpdateStage, WriteError, control_range};
 use crate::{
     reader::{TypeACard, TypeAExchangeError},
     transport::Transport,
@@ -136,26 +136,16 @@ impl<'card, 'reader, T: Transport> Type2Data<'card, 'reader, T> {
     }
 
     fn exclude(&mut self, tag: u8) -> Result<(), Type2Error<T::Error>> {
-        let position = self.byte()?;
-        let size = self.byte()?;
-        let control = self.byte()?;
-        let page_shift = control & 0x0f;
-        let offset = usize::from(position & 0x0f);
-        if page_shift == 0 || offset >= 1usize << page_shift {
-            return Err(Error::Layout("Type 2 control TLV address"));
-        }
-        let start = (usize::from(position >> 4) << page_shift) + offset;
-        let size = if size == 0 { 256 } else { usize::from(size) };
-        let bytes = if tag == 1 { size.div_ceil(8) } else { size };
-        if start < self.address
+        let reserved = control_range(tag, [self.byte()?, self.byte()?, self.byte()?])?;
+        if reserved.start < self.address
             || self
                 .excluded
                 .iter()
-                .any(|range| range.start < start + bytes && start < range.end)
+                .any(|range| range.start < reserved.end && reserved.start < range.end)
         {
             return Err(Error::Layout("Type 2 control TLV overlaps mapped bytes"));
         }
-        self.excluded.push(start..start + bytes);
+        self.excluded.push(reserved);
         Ok(())
     }
 

@@ -1,5 +1,9 @@
 //! Reader configuration and lifetime-bound NFC card access.
 
+mod type1;
+
+pub use type1::Type1Tag;
+
 use crate::{
     felica::{
         self, BitRate, BlockWrite, CardError, PollRequest, PollResponse, ReadResponse, ServiceEntry,

@@ -2,10 +2,14 @@
 //!
 //! Mapping and access checks are separate from RF exchange and record encoding.
 
+mod message;
+mod type1;
 mod type2;
 mod type3;
 mod type4;
 
+pub use message::{Message, MessageError, MessageErrorKind, Record, RecordType};
+pub use type1::{Type1Error, Type1WriteError};
 pub use type2::{Type2Error, Type2WriteError};
 pub use type3::Type3Tag;
 pub use type4::{Type4Error, Type4WriteError};
@@ -111,4 +115,19 @@ impl<E: core::error::Error + 'static> core::error::Error for WriteError<E> {
             Self::Preparation(error) | Self::Update { cause: error, .. } => Some(error),
         }
     }
+}
+
+fn control_range<E>(
+    tag: u8,
+    [position, size, control]: [u8; 3],
+) -> Result<core::ops::Range<usize>, Error<E>> {
+    let page_size = 1usize << (control & 0x0f);
+    let offset = usize::from(position & 0x0f);
+    if offset >= page_size {
+        return Err(Error::Layout("control TLV address"));
+    }
+    let start = usize::from(position >> 4) * page_size + offset;
+    let size = if size == 0 { 256 } else { usize::from(size) };
+    let bytes = if tag == 1 { size.div_ceil(8) } else { size };
+    Ok(start..start + bytes)
 }
