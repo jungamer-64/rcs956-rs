@@ -1273,6 +1273,32 @@ fn type_b_rf_timeout_budget_preserves_uncertain_progress() -> Result<(), Box<dyn
 }
 
 #[test]
+fn type_a_exchange_timeout_is_independent_of_the_polling_wait() -> Result<(), Box<dyn Error>> {
+    let mut steps = initialization(&ab_config_image());
+    steps.extend(ab_mode(false));
+    steps.push(command(
+        0x4a,
+        &[1, 0],
+        &[1, 7, 4, 0, 0x20, 4, 1, 2, 3, 4, 3, 0x20, 0x40],
+    ));
+    steps.push(command(0x32, &[2, 0x0b, 0x0b, 0x10], &[]));
+    steps.push(command(0x1c, &[0x80, 0x8f, 1], &[]));
+    steps.push(command(0x40, &[7, 0, 0xa4, 4, 0], &[0, 0x90, 0]));
+    steps.push(command(0x40, &[7, 0, 0xb0, 0, 0], &[0, 0x6a, 0x82]));
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut card = reader
+        .poll_type_a(timeout()?)?
+        .ok_or("expected NFC-A card")?;
+    card.set_exchange_timeout(RfTimeout::new(Duration::from_millis(3280))?);
+    assert_eq!(card.exchange_apdu(&[0, 0xa4, 4, 0])?, [0x90, 0]);
+    assert_eq!(card.exchange_apdu(&[0, 0xb0, 0, 0])?, [0x6a, 0x82]);
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
 fn raw_type_a_recovers_pending_fragments_before_sending_another_command()
 -> Result<(), Box<dyn Error>> {
     let mut steps = initialization(&ab_config_image());

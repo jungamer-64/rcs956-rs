@@ -20,7 +20,13 @@ use super::{
 
 const SCAN_PERIOD: Duration = Duration::from_millis(200);
 const SCAN_WAIT: Duration = Duration::from_millis(100);
-const PRESENCE_PERIOD: Duration = Duration::from_millis(200);
+/// NFC-A APDU response wait: the largest `32/02` step, so that card
+/// processing is bounded by the reader's ISO-DEP handling rather than by the
+/// short polling wait.
+const APDU_WAIT: Duration = Duration::from_millis(3280);
+/// Card silence after which a powered card is probed. Every completed
+/// exchange or probe restarts it.
+const PRESENCE_PERIOD: Duration = Duration::from_secs(2);
 const INIT_BUDGET: Duration = Duration::from_secs(6);
 
 pub(crate) struct Frontend {
@@ -40,6 +46,8 @@ impl Frontend {
             unit,
             control,
             scan: RfTimeout::new(SCAN_WAIT)
+                .map_err(|_| Status(status::DEVICE_CONFIGURATION_ERROR))?,
+            apdu: RfTimeout::new(APDU_WAIT)
                 .map_err(|_| Status(status::DEVICE_CONFIGURATION_ERROR))?,
         };
         let mut reader = Reader::new(transport);
@@ -65,6 +73,7 @@ struct Service {
     unit: u32,
     control: Rc<Control>,
     scan: RfTimeout,
+    apdu: RfTimeout,
 }
 
 #[derive(Clone, Copy)]
@@ -149,7 +158,7 @@ impl Service {
                 }
             }
             self.control.bound(INIT_BUDGET);
-            let next = match select(reader, technology, self.scan) {
+            let next = match select(reader, technology, self.scan, self.apdu) {
                 Ok(Some((card, icc))) => {
                     self.queues.signal(true);
                     self.selected(card, &icc, reset.take())
@@ -371,19 +380,22 @@ impl Service {
 }
 
 /// Select one ISO-DEP card. Cards without ISO-DEP activation are outside
-/// PC/SC mode and are reported like an empty field.
+/// PC/SC mode and are reported like an empty field. NFC-B APDUs use the
+/// session's own block waits; NFC-A APDUs use `apdu`.
 fn select(
     reader: &mut Reader<UsbTransport>,
     technology: Technology,
     timeout: RfTimeout,
+    apdu: RfTimeout,
 ) -> Result<Option<(Card<'_>, Icc)>, ReaderError<Status>> {
     Ok(match technology {
-        Technology::A => reader.poll_type_a(timeout)?.and_then(|card| {
+        Technology::A => reader.poll_type_a(timeout)?.and_then(|mut card| {
             let observation = card.observation();
             let ats = observation
                 .ats()
                 .filter(|_| observation.supports_iso_dep())?;
             let icc = Icc::type_a(ats, card.maximum_apdu_bytes());
+            card.set_exchange_timeout(apdu);
             Some((Card::A(card), icc))
         }),
         Technology::B => match reader.poll_type_b(Default::default(), timeout)? {

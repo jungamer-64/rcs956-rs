@@ -938,6 +938,14 @@ impl<'a, T: Transport> TypeACard<'a, T> {
     pub fn maximum_apdu_bytes(&self) -> usize {
         MAX_TYPE_A_COMMAND_BYTES
     }
+    /// Replace the card response wait of later exchanges through this
+    /// selection, including [`Self::into_raw`]. It starts as the polling
+    /// timeout, so a caller polling with a short wait can grant card commands
+    /// a longer one. The `32/02` step rounding and `1C` timer of `40` exchanges
+    /// apply unchanged.
+    pub fn set_exchange_timeout(&mut self, timeout: RfTimeout) {
+        self.timeout = timeout;
+    }
     /// Consume the typed selection and allow caller-defined card commands.
     /// Such commands can change card state that typed operations depend on.
     pub fn into_raw(self) -> RawTypeACard<'a, T> {
