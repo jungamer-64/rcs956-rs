@@ -793,6 +793,67 @@ fn type_b_exchange_steps(activation: &[u8]) -> Vec<Step> {
 }
 
 #[test]
+fn type_b_nad_and_timeout_recovery_use_only_the_current_rf_block() -> Result<(), Box<dyn Error>> {
+    let mut activation = type_b_response();
+    activation[13] |= 2;
+    let mut steps = type_b_exchange_steps(&activation);
+    steps.extend([
+        command(0xa0, &[11, 0, 0x06, 0x21, 0xa4], &[1]),
+        command(0xa0, &[11, 0, 0xb2], &[0, 0x16, 0x12, 0xab]),
+        command(0xa0, &[11, 0, 0xa3], &[1]),
+        command(0xa0, &[11, 0, 0xa3], &[0, 0x03, 0x90, 0]),
+    ]);
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    assert!(isodep::NodeAddress::from_byte(0x88).is_err());
+    let options = PollOptions {
+        node_address: Some(isodep::NodeAddress::from_byte(0x21)?),
+        ..PollOptions::default()
+    };
+    let Some(TypeBSelection::IsoDep(mut card)) = reader.poll_type_b(options, timeout()?)? else {
+        return Err("expected ISO-DEP activation".into());
+    };
+    assert_eq!(card.exchange_apdu(&[0xa4])?, [0xab, 0x90, 0]);
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn type_b_rf_timeout_budget_preserves_uncertain_progress() -> Result<(), Box<dyn Error>> {
+    let mut steps = type_b_exchange_steps(&type_b_response());
+    steps.extend([
+        command(0xa0, &[11, 0, 2, 0xa4], &[1]),
+        command(0xa0, &[11, 0, 0xb2], &[1]),
+        command(0xa0, &[11, 0, 0xb2], &[1]),
+    ]);
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut card = poll_iso_dep(&mut reader)?.ok_or("expected ISO-DEP activation")?;
+    let error = card
+        .exchange_apdu(&[0xa4])
+        .err()
+        .ok_or("expected RF timeout")?;
+    assert!(matches!(
+        error.cause,
+        isodep::Cause::RecoveryExhausted(ReaderError::RfStatus(1))
+    ));
+    assert_eq!(error.progress.attempted_application_bytes, 1);
+    assert_eq!(error.progress.acknowledged_application_bytes, 0);
+    assert_eq!(error.progress.frames, 3);
+    assert!(matches!(
+        card.exchange_apdu(&[0xa4]),
+        Err(isodep::Error {
+            cause: isodep::Cause::SessionInvalid,
+            ..
+        })
+    ));
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
 fn type_a_exchange_uses_selected_target_and_preserves_status() -> Result<(), Box<dyn Error>> {
     let mut steps = initialization(&ab_config_image());
     steps.extend(ab_mode(false));
@@ -1244,6 +1305,7 @@ fn alternate_type_b_profile_exchanges_a_proprietary_target_command() -> Result<(
     let options = PollOptions {
         profile: RfProfile::Alternate,
         afi: 0x12,
+        node_address: None,
     };
     let Some(TypeBSelection::Frame(mut card)) = reader.poll_type_b(options, timeout()?)? else {
         return Err("expected a frame selection".into());

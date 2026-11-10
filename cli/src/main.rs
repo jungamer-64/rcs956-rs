@@ -25,7 +25,7 @@ fn main() -> std::process::ExitCode {
 }
 fn help() {
     println!(
-        "rcs956 devices\nrcs956 probe [--path DEVICE_INTERFACE]\nrcs956 poll [--type felica|a|b] [--timeout-ms 500] [--path PATH]\nFeliCa poll options: [--rate 212|424] [--system FFFF] [--request 1] [--slots 0]\nrcs956 read --service HEX --blocks DECIMAL[,DECIMAL...] [FeliCa poll options]\nrcs956 write --service HEX --block-data DECIMAL:HEX [--block-data DECIMAL:HEX ...] [FeliCa poll options]\nrcs956 systems [FeliCa poll options]\nrcs956 service-at --index DECIMAL [FeliCa poll options]\nrcs956 raw-felica --data LENGTH_PREFIXED_HEX [--data LENGTH_PREFIXED_HEX ...] [--rate 212|424]\nNFC-B options: [--b-profile standard|alternate] [--afi HEX]\nrcs956 exchange --type a|b|b-frame --data HEX [--timeout-ms 500] [--path PATH]\nrcs956 sequence --type a|b|b-frame --data HEX --data HEX [...] [--timeout-ms 500] [--path PATH]\nrcs956 decode READER_FRAME_HEX\n\nHardware commands require an existing WinUSB binding. exchange sends one caller-supplied card command (A) or ISO-DEP APDU (B) or a non-ISO-DEP card command (b-frame); sequence sends each supplied command in order within one card selection. Their effects belong to the caller. No automatic application-command replay."
+        "rcs956 devices\nrcs956 probe [--path DEVICE_INTERFACE]\nrcs956 poll [--type felica|a|b] [--timeout-ms 500] [--path PATH]\nFeliCa poll options: [--rate 212|424] [--system FFFF] [--request 1] [--slots 0]\nrcs956 read --service HEX --blocks DECIMAL[,DECIMAL...] [FeliCa poll options]\nrcs956 write --service HEX --block-data DECIMAL:HEX [--block-data DECIMAL:HEX ...] [FeliCa poll options]\nrcs956 systems [FeliCa poll options]\nrcs956 service-at --index DECIMAL [FeliCa poll options]\nrcs956 raw-felica --data LENGTH_PREFIXED_HEX [--data LENGTH_PREFIXED_HEX ...] [--rate 212|424]\nNFC-B options: [--b-profile standard|alternate] [--afi HEX] [--nad HEX]\nrcs956 exchange --type a|b|b-frame --data HEX [--timeout-ms 500] [--path PATH]\nrcs956 sequence --type a|b|b-frame --data HEX --data HEX [...] [--timeout-ms 500] [--path PATH]\nrcs956 decode READER_FRAME_HEX\n\nHardware commands require an existing WinUSB binding. exchange sends one caller-supplied card command (A) or ISO-DEP APDU (B) or a non-ISO-DEP card command (b-frame); sequence sends each supplied command in order within one card selection. Their effects belong to the caller. No automatic application-command replay."
     );
 }
 fn run() -> Result<(), Box<dyn Error>> {
@@ -109,6 +109,12 @@ fn run() -> Result<(), Box<dyn Error>> {
                 b_options_specified = true;
                 b_options.afi = u8::try_from(hex_u16(&value)?)?;
             }
+            "--nad" => {
+                b_options_specified = true;
+                b_options.node_address = Some(rcs956_core::isodep::NodeAddress::from_byte(
+                    u8::try_from(hex_u16(&value)?)?,
+                )?);
+            }
             "--b-profile" => {
                 b_options_specified = true;
                 b_options.profile = match value.as_str() {
@@ -183,7 +189,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Err("raw-felica takes the full packet in --data".into());
     }
     if b_options_specified && !matches!(technology, Technology::TypeB | Technology::TypeBFrame) {
-        return Err("--afi and --b-profile require --type b or b-frame".into());
+        return Err("NFC-B options require --type b or b-frame".into());
+    }
+    if b_options.node_address.is_some() && technology != Technology::TypeB {
+        return Err("--nad requires --type b".into());
     }
     validate_data_options(&command, technology, &data)?;
     let request = PollRequest::new(system, request, slots)?;

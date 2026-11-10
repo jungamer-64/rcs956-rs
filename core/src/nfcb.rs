@@ -22,6 +22,8 @@ pub struct PollOptions {
     pub profile: RfProfile,
     /// Application Family Identifier. Zero requests all families.
     pub afi: u8,
+    /// Optional node address for ISO-DEP, valid only with card-advertised NAD support.
+    pub node_address: Option<crate::isodep::NodeAddress>,
 }
 
 /// Invalid NFC-B activation data or unsupported standard-frame parameters.

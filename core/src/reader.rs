@@ -619,6 +619,13 @@ impl<T: Transport> Reader<T> {
             [0] => Ok(None),
             [1, target, data @ ..] if *target != 0 => {
                 let observation = nfcb::Observation::parse(data).map_err(Error::TypeB)?;
+                if options.node_address.is_some()
+                    && !(observation.supports_iso_dep() && observation.nad_supported())
+                {
+                    return Err(Error::IsoDepParameters(
+                        isodep::ParameterError::NadUnsupported,
+                    ));
+                }
                 if !observation.supports_iso_dep() {
                     return Ok(Some(TypeBSelection::Frame(TypeBFrameCard {
                         target: TypeBTarget {
@@ -641,6 +648,7 @@ impl<T: Transport> Reader<T> {
                     cid,
                     wait,
                     observation.maximum_command_bytes(),
+                    options.node_address,
                 )
                 .map_err(Error::IsoDepParameters)?;
                 let (info, response_timeout) = match &self.state {
@@ -890,10 +898,14 @@ impl<T: Transport> TypeBCard<'_, T> {
         // 3280 ms step. A0 keeps its independent FWI/WTX wait; individual
         // blocks do not reprogram 1C.
         let setup = reader.prepare_exchange_timing(protocol, ResponseTimeout::Ms3280);
-        exchange.exchange(setup, |block, wait| {
-            let timeout = RfTimeout::new(wait)?;
-            reader.exchange_rf(block, timeout, protocol)
-        })
+        exchange.exchange(
+            setup,
+            |error| matches!(error, Error::RfStatus(status) if status & 0x3f == 1),
+            |block, wait| {
+                let timeout = RfTimeout::new(wait)?;
+                reader.exchange_rf(block, timeout, protocol)
+            },
+        )
     }
 }
 
