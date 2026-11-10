@@ -1130,6 +1130,76 @@ fn incomplete_raw_type_a_response_requires_reader_recovery() -> Result<(), Box<d
 }
 
 #[test]
+fn raw_type_a_stops_collecting_at_the_fragment_limit() -> Result<(), Box<dyn Error>> {
+    let mut steps = initialization(&ab_config_image());
+    steps.extend(ab_mode(false));
+    steps.extend([
+        command(0x4a, &[1, 0], &type_a_response(7)),
+        command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
+        command(0x40, &[7, 0xa4], &[0x40]),
+    ]);
+    steps.extend((1..256).map(|_| command(0x40, &[7], &[0x40])));
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut raw = reader
+        .poll_type_a(timeout()?)?
+        .ok_or("expected NFC-A card")?
+        .into_raw();
+    raw.exchange(&[0xa4])?;
+    for _ in 1..256 {
+        assert_eq!(
+            raw.receive_continuation()?
+                .ok_or("expected fragment")?
+                .status,
+            0x40
+        );
+    }
+    assert!(matches!(
+        raw.receive_continuation(),
+        Err(TypeAExchangeError::FragmentLimit)
+    ));
+    assert!(matches!(
+        raw.exchange(&[0xa4]),
+        Err(TypeAExchangeError::SessionInvalid)
+    ));
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn failed_field_cycle_does_not_grant_a_new_typed_selection() -> Result<(), Box<dyn Error>> {
+    let mut steps = initialization(&ab_config_image());
+    steps.extend(ab_mode(false));
+    steps.extend([
+        command(0x4a, &[1, 0], &type_a_response(7)),
+        command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
+        command(0x40, &[7, 0xa4], &[0]),
+        command(0x32, &[1, 0], &[1]),
+    ]);
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    reader
+        .poll_type_a(timeout()?)?
+        .ok_or("expected NFC-A card")?
+        .into_raw()
+        .exchange(&[0xa4])?;
+    assert!(matches!(
+        reader.poll_type_a(timeout()?),
+        Err(ReaderError::Response("RF off response length"))
+    ));
+    let before = journal.borrow().requests.len();
+    assert!(matches!(
+        reader.poll_type_a(timeout()?),
+        Err(ReaderError::NotInitialized)
+    ));
+    assert_eq!(journal.borrow().requests.len(), before);
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
 fn type_b_apdu_uses_software_blocks_without_felica_mode() -> Result<(), Box<dyn Error>> {
     let mut steps = type_b_exchange_steps(&type_b_response());
     steps.push(command(0xa0, &[11, 0, 2, 0, 0xa4, 4, 0], &[0, 2, 0x90, 0]));
