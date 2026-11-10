@@ -348,10 +348,7 @@ impl<T: Transport> Reader<T> {
         self.state = State::NeedsInitialization;
         self.link.recover().map_err(Error::Recovery)?;
         let wait = Duration::from_secs(1);
-        let reset = self.command(0x18, &[1], wait)?;
-        if !reset.is_empty() {
-            return Err(Error::Response("reset response"));
-        }
+        self.command(0x18, &[1], wait)?;
         self.link.host_ack(wait).map_err(Error::Transaction)?;
         let firmware: [u8; 4] = self
             .command(2, &[], wait)?

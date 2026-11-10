@@ -77,6 +77,8 @@ pub enum Failure<E> {
         /// Received response command.
         actual: u8,
     },
+    /// Reset must return an empty response body. Holds the received body length.
+    ResetResponseLength(usize),
     /// A valid response was followed by unconsumed bytes.
     TrailingData,
 }
@@ -151,14 +153,21 @@ impl<T: Transport> Link<T> {
     }
 
     /// Send one command and return its matching response. No automatic replay.
+    ///
+    /// # Errors
+    ///
+    /// ACK and response bytes must be returned by the backend before their
+    /// respective deadlines. Backend completion itself may take longer.
+    /// A failed transaction after the first write attempt requires recovery.
+    /// Reset (`18 01`) requires an empty response before a host ACK can commit it.
     pub fn command(
         &mut self,
         command: u8,
         args: &[u8],
         timeout: Duration,
     ) -> Result<Response, TransactionError<T::Error>> {
-        if self.state != StreamState::Ready
-            && !(self.state == StreamState::NeedsReset && command == 0x18 && args == [1])
+        let is_reset = command == 0x18 && args == [1];
+        if self.state != StreamState::Ready && !(self.state == StreamState::NeedsReset && is_reset)
         {
             return Err(TransactionError {
                 progress: Progress::NotSent,
@@ -256,15 +265,22 @@ impl<T: Transport> Link<T> {
                             failure: Failure::TrailingData,
                         });
                     }
-                    let response = Response {
-                        command: actual,
-                        data: data.to_vec(),
-                    };
-                    self.state = if command == 0x18 && args == [1] {
+                    let next_state = if is_reset {
+                        if !data.is_empty() {
+                            return Err(TransactionError {
+                                progress,
+                                failure: Failure::ResetResponseLength(data.len()),
+                            });
+                        }
                         StreamState::ResetCommitPending
                     } else {
                         StreamState::Ready
                     };
+                    let response = Response {
+                        command: actual,
+                        data: data.to_vec(),
+                    };
+                    self.state = next_state;
                     return Ok(response);
                 }
                 Frame::Ack | Frame::Data { .. } => {
@@ -369,7 +385,7 @@ fn next_frame<T: Transport>(
         let n = transport
             .read(&mut buffer, remaining)
             .map_err(Failure::Io)?;
-        if n == 0 {
+        if n == 0 || deadline.remaining(transport.monotonic_time()).is_none() {
             return Err(Failure::Deadline);
         }
         let bytes = buffer.get(..n).ok_or(Failure::ReceiveLength {

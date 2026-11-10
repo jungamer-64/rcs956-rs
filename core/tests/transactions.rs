@@ -36,6 +36,7 @@ struct Journal {
 #[derive(Debug)]
 struct Script {
     reads: VecDeque<Read>,
+    read_delays: VecDeque<Duration>,
     writes: VecDeque<Write>,
     recovery_results: VecDeque<Result<(), io::ErrorKind>>,
     journal: Rc<RefCell<Journal>>,
@@ -47,6 +48,7 @@ impl Script {
         (
             Self {
                 reads: reads.into_iter().collect(),
+                read_delays: VecDeque::new(),
                 writes: VecDeque::new(),
                 recovery_results: VecDeque::new(),
                 journal: Rc::clone(&journal),
@@ -79,7 +81,11 @@ impl Transport for Script {
 
     fn read(&mut self, buffer: &mut [u8], timeout: Duration) -> io::Result<usize> {
         assert!(!timeout.is_zero(), "expired read reached the backend");
-        self.journal.borrow_mut().read_timeouts.push(timeout);
+        {
+            let mut journal = self.journal.borrow_mut();
+            journal.read_timeouts.push(timeout);
+            journal.elapsed += self.read_delays.pop_front().unwrap_or_default();
+        }
         match self.reads.pop_front() {
             Some(Read::Bytes(bytes)) => {
                 let capacity = buffer.len();
@@ -348,6 +354,85 @@ fn reset_commit_waits_before_admitting_the_next_command() -> Result<(), Box<dyn 
     assert!(journal.borrow().elapsed >= start + Duration::from_millis(10));
     link.command(2, &[], TIMEOUT)?;
     assert_eq!(journal.borrow().writes.len(), 3);
+    Ok(())
+}
+
+#[test]
+fn malformed_reset_response_cannot_authorize_the_commit_ack() -> Result<(), Box<dyn Error>> {
+    let reset_with_body = [0, 0, 0xff, 3, 0xfd, 0xd5, 0x19, 1, 0x11, 0];
+    let (script, journal) = Script::new([Read::Bytes(
+        [wire::ACK.as_slice(), reset_with_body.as_slice()].concat(),
+    )]);
+    let mut link = Link::new(script);
+    link.recover()?;
+    assert!(matches!(
+        link.command(0x18, &[1], TIMEOUT),
+        Err(TransactionError {
+            progress: Progress::Acknowledged,
+            failure: Failure::ResetResponseLength(1),
+        })
+    ));
+    for result in [
+        link.host_ack(TIMEOUT),
+        link.command(2, &[], TIMEOUT).map(|_| ()),
+    ] {
+        assert!(matches!(
+            result,
+            Err(TransactionError {
+                progress: Progress::NotSent,
+                failure: Failure::RecoveryRequired,
+            })
+        ));
+    }
+    assert_eq!(journal.borrow().writes.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn coalesced_response_cannot_extend_the_ack_deadline() {
+    let (mut script, journal) = Script::new([Read::Bytes(acknowledged_response())]);
+    script.read_delays.push_back(Duration::from_millis(21));
+    let mut link = Link::new(script);
+    assert!(matches!(
+        link.command(2, &[], TIMEOUT),
+        Err(TransactionError {
+            progress: Progress::Sent,
+            failure: Failure::Deadline,
+        })
+    ));
+    assert_eq!(journal.borrow().writes.len(), 1);
+}
+
+#[test]
+fn a_complete_response_must_arrive_before_the_command_deadline() -> Result<(), Box<dyn Error>> {
+    for read_us in [499, 500, 600] {
+        let (mut script, journal) = Script::new([
+            Read::Bytes(wire::ACK.to_vec()),
+            Read::Bytes(FIRMWARE_RESPONSE.to_vec()),
+        ]);
+        script.read_delays = [Duration::ZERO, Duration::from_micros(read_us)].into();
+        let mut link = Link::new(script);
+        let result = link.command(2, &[], Duration::from_micros(2500));
+        if read_us < 500 {
+            assert_eq!(result?.data, [0x32, 1, 6, 7]);
+        } else {
+            assert!(matches!(
+                result,
+                Err(TransactionError {
+                    progress: Progress::Acknowledged,
+                    failure: Failure::Deadline,
+                })
+            ));
+            assert!(matches!(
+                link.command(2, &[], TIMEOUT),
+                Err(TransactionError {
+                    progress: Progress::NotSent,
+                    failure: Failure::RecoveryRequired,
+                })
+            ));
+        }
+        assert_eq!(journal.borrow().writes.len(), 1);
+    }
     Ok(())
 }
 
