@@ -1,6 +1,6 @@
 # Build and device validation
 
-`rcs956-core`はフレーム、取引状態、RF設定、カードプロトコルを所有する。`no_std`と`alloc`で動作し、crate全体で`unsafe_code`を禁止する。Rustからは`rcs956_core::reader::Reader`などを使用する。coreが定義する`Transport`へ同期転送、pipe回復、単調時計、待機を委譲し、期限・待機時間とエラー時の状態遷移はcoreで決める。`rcs956`は`rcs956::windows::WinUsb`を提供し、`rcs956-cli`が両ライブラリを組み合わせて`rcs956`コマンドを提供する。
+`rcs956-core`はフレーム、取引状態、RF設定、カードプロトコルを所有する。`no_std`と`alloc`で動作し、crate全体で`unsafe_code`を禁止する。Rustからは`rcs956_core::reader::Reader`などを使用する。coreが定義する`Transport`へ同期転送、pipe回復、単調時計、待機を委譲し、期限・待機時間とエラー時の状態遷移はcoreで決める。`rcs956`はWindowsのWinUSBドライバに接続する`rcs956::windows::WinUsb`を提供する。
 
 ## Windowsでのビルドと検証
 
@@ -8,7 +8,7 @@
 
 ```powershell
 rustup target add x86_64-unknown-none
-cargo build --workspace --locked
+cargo build --locked
 cargo fmt --all --check
 cargo check --locked -p rcs956-core --lib --target x86_64-unknown-none
 cargo test --locked --workspace
@@ -16,7 +16,9 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo doc --locked --workspace --no-deps --config "build.rustdocflags=['-Dwarnings']"
 ```
 
-## 実機での実行例
+## 実機検証ツール
+
+[`tools/cli`](tools/cli)の`rcs956-cli`は両ライブラリを使う実機検証ツールで、実行ファイル名は`rcs956`。ルートからの既定のビルドはライブラリを対象とし、CLIはpackageを明示して実行する。
 
 ```powershell
 cargo run --locked -p rcs956-cli -- devices

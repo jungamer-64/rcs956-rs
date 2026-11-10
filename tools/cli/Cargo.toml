@@ -11,10 +11,10 @@ path = "src/main.rs"
 doc = false
 
 [dependencies]
-rcs956-core = { path = "../core", version = "0.1" }
+rcs956-core = { path = "../../core", version = "0.1" }
 
 [target.'cfg(windows)'.dependencies]
-rcs956 = { path = "..", version = "0.1" }
+rcs956 = { path = "../..", version = "0.1" }
 
 [lints]
 workspace = true

@@ -1,5 +1,6 @@
 [workspace]
-members = ["core", "cli"]
+members = ["core", "tools/cli"]
+default-members = [".", "core"]
 resolver = "3"
 
 [workspace.package]
