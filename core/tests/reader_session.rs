@@ -87,12 +87,18 @@ impl Script {
     }
 }
 
-// Independent normal-frame oracle. Reader test packets are at most 66 payload
-// bytes; the production encoder is deliberately not used to construct responses.
+// Independent response-frame oracle for the simulated reader.
 fn reader_response(cc: u8, data: &[u8]) -> io::Result<Vec<u8>> {
-    let length = u8::try_from(data.len() + 2)
+    let length = u16::try_from(data.len() + 2)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-    let mut bytes = vec![0, 0, 0xff, length, length.wrapping_neg(), 0xd5, cc];
+    let mut bytes = vec![0, 0, 0xff];
+    if let Ok(length) = u8::try_from(length) {
+        bytes.extend([length, length.wrapping_neg()]);
+    } else {
+        let [high, low] = length.to_be_bytes();
+        bytes.extend([0xff, 0xff, high, low, high.wrapping_add(low).wrapping_neg()]);
+    }
+    bytes.extend([0xd5, cc]);
     bytes.extend_from_slice(data);
     let checksum = data
         .iter()
@@ -362,7 +368,10 @@ fn type_three_ndef_preserves_update_progress_and_detects_the_write_flag()
         Err(ndef::WriteError::Update {
             stage: ndef::UpdateStage::Data,
             acknowledged_bytes: 16,
-            ..
+            cause: ndef::Error::Exchange(ReaderError::FelicaResponse(CardError::Status {
+                flag1: 1,
+                flag2: 0xa2,
+            })),
         })
     ));
     assert!(matches!(tag.read_ndef(), Err(ndef::Error::WriteInProgress)));
@@ -428,16 +437,64 @@ fn felica_424_selects_card_and_exchanges_discovery_and_write_packets() -> Result
     };
     assert!(matches!(
         card.write_without_encryption(9, &[write; 13]),
-        Err(ReaderError::Card(CardError::Length { .. }))
+        Err(ReaderError::FelicaRequest(CardError::Length { .. }))
     ));
     assert!(matches!(
         card.write_without_encryption(9, &[write]),
-        Err(ReaderError::Card(CardError::Status {
+        Err(ReaderError::FelicaResponse(CardError::Status {
             flag1: 1,
             flag2: 0xa2
         }))
     ));
     card.write_without_encryption(9, &[write])?;
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn felica_write_length_errors_distinguish_request_rejection_from_sent_command()
+-> Result<(), Box<dyn Error>> {
+    let mut steps = initialization(&config_image());
+    steps.extend(mode_configuration());
+    steps.push(command(
+        0x4a,
+        &[1, 2, 0, 0x12, 0x34, 1, 0],
+        &poll_response(),
+    ));
+    let mut args = vec![0xc8, 0, 32, 0x08];
+    args.extend(IDENTITY);
+    args.extend([1, 9, 0, 1, 0x80, 1]);
+    args.extend([0x5a; 16]);
+    let mut reply = vec![0; 262];
+    reply[1] = 255;
+    steps.push(command(0xa0, &args, &reply));
+
+    let (transport, journal) = Script::new(steps);
+    let mut reader = Reader::new(transport);
+    reader.initialize()?;
+    let mut card = reader
+        .poll_felica(BitRate::Kbps424, poll_request()?, timeout()?)?
+        .ok_or("expected FeliCa card")?;
+    let block = BlockWrite {
+        block: 256,
+        data: [0x5a; 16],
+    };
+    assert!(matches!(
+        card.write_without_encryption(9, &[block; 13]),
+        Err(ReaderError::FelicaRequest(CardError::Length {
+            expected: 255,
+            actual: 261
+        }))
+    ));
+    assert_eq!(journal.borrow().remaining, 1);
+    let block = BlockWrite { block: 1, ..block };
+    assert!(matches!(
+        card.write_without_encryption(9, &[block]),
+        Err(ReaderError::FelicaResponse(CardError::Length {
+            expected: 255,
+            actual: 261
+        }))
+    ));
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
 }
@@ -464,12 +521,12 @@ fn raw_felica_exchanges_opaque_packets_after_selection() -> Result<(), Box<dyn E
             .into_raw();
         assert!(matches!(
             raw.exchange_packet(&[3, 0]),
-            Err(ReaderError::Card(CardError::Length { .. }))
+            Err(ReaderError::FelicaRequest(CardError::Length { .. }))
         ));
         assert_eq!(raw.exchange_packet(&packet)?, raw_response[1..]);
         assert!(matches!(
             raw.exchange_packet(&packet),
-            Err(ReaderError::Card(CardError::Length { .. }))
+            Err(ReaderError::FelicaResponse(CardError::Length { .. }))
         ));
     }
     assert!(

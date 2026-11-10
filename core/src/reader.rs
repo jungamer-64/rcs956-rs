@@ -32,8 +32,11 @@ pub enum Error<E> {
     RegisterStatus(u8),
     /// Raw RF status and its command-specific classification.
     RfStatus(u8),
-    /// Card-level response validation failed.
-    Card(CardError),
+    /// FeliCa request validation failed before the command was sent.
+    FelicaRequest(CardError),
+    /// The FeliCa command was sent but the card reply reported an error or
+    /// failed validation. The command may have taken effect.
+    FelicaResponse(CardError),
     /// The requested RF wait cannot be encoded as nonzero half-ms ticks.
     Timeout(TimeoutRange),
     /// NFC-A activation data failed validation.
@@ -60,18 +63,13 @@ impl<E: error::Error + 'static> error::Error for Error<E> {
         match self {
             Self::Transaction(error) | Self::Recovery(error) => Some(error),
             Self::Configuration(error) => Some(error),
-            Self::Card(error) => Some(error),
+            Self::FelicaRequest(error) | Self::FelicaResponse(error) => Some(error),
             Self::Timeout(error) => Some(error),
             Self::TypeA(error) => Some(error),
             Self::TypeB(error) => Some(error),
             Self::IsoDepParameters(error) => Some(error),
             _ => None,
         }
-    }
-}
-impl<E> From<CardError> for Error<E> {
-    fn from(e: CardError) -> Self {
-        Self::Card(e)
     }
 }
 impl<E> From<TimeoutRange> for Error<E> {
@@ -541,7 +539,7 @@ impl<T: Transport> Reader<T> {
         match response.as_slice() {
             [0] => Ok(None),
             [1, target, packet @ ..] if *target != 0 => {
-                let observation = PollResponse::parse(packet)?;
+                let observation = PollResponse::parse(packet).map_err(Error::FelicaResponse)?;
                 Ok(Some(FelicaCard {
                     reader: self,
                     observation,
@@ -1170,38 +1168,39 @@ impl<'a, T: Transport> FelicaCard<'a, T> {
         service: u16,
         blocks: &[u16],
     ) -> Result<ReadResponse, Error<T::Error>> {
-        let request = felica::read_without_encryption(self.observation.idm, service, blocks)?;
+        let request = felica::read_without_encryption(self.observation.idm, service, blocks)
+            .map_err(Error::FelicaRequest)?;
         let response = self
             .reader
             .exchange_rf(&request, self.timeout, RfProtocol::Felica)?;
-        Ok(ReadResponse::parse(
-            &response,
-            self.observation.idm,
-            blocks.len(),
-        )?)
+        ReadResponse::parse(&response, self.observation.idm, blocks.len())
+            .map_err(Error::FelicaResponse)
     }
 
     /// Write blocks to one service with Write Without Encryption. Card-specific
-    /// limits still apply. A failure after sending can leave the write outcome
-    /// uncertain. Inspect card status or transport progress before retrying.
+    /// limits still apply. [`Error::FelicaRequest`] means validation stopped
+    /// the command before sending. [`Error::FelicaResponse`] means it was sent
+    /// and the write outcome may be uncertain. Transport failures carry their
+    /// own transaction progress.
     pub fn write_without_encryption(
         &mut self,
         service: u16,
         blocks: &[BlockWrite],
     ) -> Result<(), Error<T::Error>> {
         let idm = self.observation.idm;
-        let request = felica::write_without_encryption(idm, service, blocks)?;
+        let request =
+            felica::write_without_encryption(idm, service, blocks).map_err(Error::FelicaRequest)?;
         let response = self
             .reader
             .exchange_rf(&request, self.timeout, RfProtocol::Felica)?;
-        Ok(felica::write_response(&response, idm)?)
+        felica::write_response(&response, idm).map_err(Error::FelicaResponse)
     }
 
     /// Request the system codes exposed by this card. Card products can omit this command.
     pub fn request_system_codes(&mut self) -> Result<Vec<u16>, Error<T::Error>> {
         let idm = self.observation.idm;
         let response = self.exchange_addressed(0x0c, &[])?;
-        Ok(felica::system_codes(&response, idm)?)
+        felica::system_codes(&response, idm).map_err(Error::FelicaResponse)
     }
 
     /// Look up one service or area index within the selected system.
@@ -1212,7 +1211,7 @@ impl<'a, T: Transport> FelicaCard<'a, T> {
     ) -> Result<Option<ServiceEntry>, Error<T::Error>> {
         let idm = self.observation.idm;
         let response = self.exchange_addressed(0x0a, &index.to_le_bytes())?;
-        Ok(felica::service_entry(&response, idm)?)
+        felica::service_entry(&response, idm).map_err(Error::FelicaResponse)
     }
 
     /// Send a caller-supplied FeliCa command with the selected IDm. `parameters`
@@ -1226,11 +1225,14 @@ impl<'a, T: Transport> FelicaCard<'a, T> {
     ) -> Result<Vec<u8>, Error<T::Error>> {
         let idm = self.observation.idm;
         let response = self.exchange_addressed(command, parameters)?;
-        Ok(felica::addressed_response(&response, idm, response_code)?.to_vec())
+        felica::addressed_response(&response, idm, response_code)
+            .map(<[u8]>::to_vec)
+            .map_err(Error::FelicaResponse)
     }
 
     fn exchange_addressed(&mut self, command: u8, data: &[u8]) -> Result<Vec<u8>, Error<T::Error>> {
-        let request = felica::addressed_command(self.observation.idm, command, data)?;
+        let request = felica::addressed_command(self.observation.idm, command, data)
+            .map_err(Error::FelicaRequest)?;
         self.reader
             .exchange_rf(&request, self.timeout, RfProtocol::Felica)
     }
@@ -1258,11 +1260,11 @@ impl<T: Transport> RawFelicaCard<'_, T> {
     /// their FeliCa length byte. Address, command, status, and any ciphertext
     /// belong to the caller; packet effects are never replayed automatically.
     pub fn exchange_packet(&mut self, packet: &[u8]) -> Result<Vec<u8>, Error<T::Error>> {
-        felica::validate_length(packet, 2)?;
+        felica::validate_length(packet, 2).map_err(Error::FelicaRequest)?;
         let response = self
             .reader
             .exchange_rf(packet, self.timeout, RfProtocol::Felica)?;
-        felica::validate_length(&response, 2)?;
+        felica::validate_length(&response, 2).map_err(Error::FelicaResponse)?;
         Ok(response)
     }
 }

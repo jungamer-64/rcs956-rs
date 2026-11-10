@@ -59,7 +59,7 @@ MIFARE Classicはcallerが指定したkeyでreaderが認証し、成功したsec
 
 選択済みFeliCaのRF待機には`A0`のhalf-ms fieldと`1C`のreader timerを設定する。reader timerはRF待機を秒単位へ切り上げてから`(ms-10)/10`をLE16で送り、成功した設定だけをRF modeに保持する。`raw-felica`は`4A`で選択を成立させてから`A0`で任意のpacketを交換する。送受信ともFeliCaの長さbyteを含み、アドレス・コマンド・暗号化の解釈は呼出側が行う。任意packetを許可した時点でtyped card handleのIDm authorityは消費される。
 
-`systems`と`service-at`はカードが公開するsystem codeと選択system内のservice／areaを照会する。`write`は指定した単一の非暗号化サービスに16 bytes単位で送信する。13ブロック以下でも、block listとデータの合計がpacket長上限を超える要求は拒否する。カード固有の書込み制限はカードが判定する。送信後のエラーでは書込み結果が不明な場合があり、自動再送や読戻しは行わない。認証・暗号化の処理を持つ呼出側は`FelicaCard::exchange_command`で選択済みIDm宛てにコマンドを交換できる。
+`systems`と`service-at`はカードが公開するsystem codeと選択system内のservice／areaを照会する。`write`は指定した単一の非暗号化サービスに16 bytes単位で送信する。13ブロック以下でも、block listとデータの合計がpacket長上限を超える要求は拒否する。カード固有の書込み制限はカードが判定する。`Error::FelicaRequest`は送信前の要求拒否、`Error::FelicaResponse`は送信後の応答異常を表す。送信後は書込み結果が不明な場合があり、自動再送や読戻しは行わない。認証・暗号化の処理を持つ呼出側は`FelicaCard::exchange_command`で選択済みIDm宛てにコマンドを交換できる。
 
 取引のACKと応答は、それぞれの期限より前に完了した読み取りのbytesだけを受理する。同期I/Oの回収に必要な時間はbackendの契約に従う。
 

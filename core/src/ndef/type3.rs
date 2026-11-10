@@ -23,7 +23,8 @@ impl<T: Transport> Reader<T> {
         rate: BitRate,
         timeout: RfTimeout,
     ) -> Result<Option<Type3Tag<'_, T>>, reader::Error<T::Error>> {
-        self.poll_felica(rate, PollRequest::new(SYSTEM, 0, 0)?, timeout)
+        let request = PollRequest::new(SYSTEM, 0, 0).map_err(reader::Error::FelicaRequest)?;
+        self.poll_felica(rate, request, timeout)
             .map(|card| card.map(Type3Tag))
     }
 }
