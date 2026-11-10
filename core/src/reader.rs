@@ -742,6 +742,27 @@ impl<T: Transport> Reader<T> {
             .map_err(TypeAExchangeError::Preparation)
     }
 
+    fn exchange_type_a_single_response(
+        &mut self,
+        target: u8,
+        data: &[u8],
+        timeout: ResponseTimeout,
+    ) -> Result<TargetResponse, TypeAExchangeError<T::Error>> {
+        self.prepare_type_a_exchange(timeout)?;
+        let response = self.exchange_target(target, data, timeout);
+        // These commands cannot collect a pending fragment. A missing status
+        // also leaves the continuation state unknown.
+        if match &response {
+            Ok(reply) => reply.status & TYPE_A_MORE_INFORMATION != 0,
+            Err(Error::RfStatus(status)) => status & TYPE_A_MORE_INFORMATION != 0,
+            Err(Error::Response(_)) => true,
+            Err(_) => false,
+        } {
+            self.state = State::NeedsInitialization;
+        }
+        response.map_err(TypeAExchangeError::Exchange)
+    }
+
     fn disable_rf(&mut self) -> Result<(), Error<T::Error>> {
         let response = self.command(0x32, &[1, 0], Duration::from_secs(1))?;
         if !response.is_empty() {
@@ -862,17 +883,8 @@ impl<'a, T: Transport> TypeACard<'a, T> {
             return Err(TypeAExchangeError::InputLength(data.len()));
         }
         let timeout = ResponseTimeout::for_request(self.timeout);
-        self.reader.prepare_type_a_exchange(timeout)?;
-        let response = self.reader.exchange_target(self.target, data, timeout);
-        if match &response {
-            Ok(reply) => reply.status & TYPE_A_MORE_INFORMATION != 0,
-            Err(Error::RfStatus(status)) => status & TYPE_A_MORE_INFORMATION != 0,
-            Err(Error::Response(_)) => true,
-            Err(_) => false,
-        } {
-            self.reader.state = State::NeedsInitialization;
-        }
-        response.map_err(TypeAExchangeError::Exchange)
+        self.reader
+            .exchange_type_a_single_response(self.target, data, timeout)
     }
 
     /// Exchange one ISO-DEP APDU and collect reader-reported continuation

@@ -1809,6 +1809,53 @@ fn type_one_ndef_uses_rid_rall_and_byte_writes() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn type_one_pending_fragment_requires_reinitialization() -> Result<(), Box<dyn Error>> {
+    let configuration = ab_config_image();
+    for status in [0x40, 0x41] {
+        let mut steps = initialization(&configuration);
+        steps.extend(ab_mode(false));
+        steps.extend([
+            command(0x4a, &[1, 4], &[1, 7, 0, 0x0c, 1, 2, 3, 4]),
+            command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
+            command(
+                0x40,
+                &[7, 0x78, 0, 0, 0, 0, 0, 0],
+                &[0, 0x11, 0x48, 1, 2, 3, 4],
+            ),
+            command(0x40, &[7, 0, 0, 0, 1, 2, 3, 4], &[status, 0x11, 0x48]),
+        ]);
+        steps.extend(initialization(&configuration));
+        steps.extend(ab_mode(false));
+        steps.push(command(0x4a, &[1, 0], &type_a_response(7)));
+
+        let (script, journal) = Script::new(steps);
+        let mut reader = Reader::new(script);
+        reader.initialize()?;
+        {
+            let mut tag = reader.poll_type1(timeout()?)?.ok_or("Type 1 tag absent")?;
+            assert!(matches!(
+                tag.read_ndef(),
+                Err(ndef::Error::Exchange(TypeAExchangeError::Exchange(
+                    ReaderError::RfStatus(actual)
+                ))) if actual == status
+            ));
+            assert!(matches!(
+                tag.read_ndef(),
+                Err(ndef::Error::Exchange(TypeAExchangeError::SessionInvalid))
+            ));
+        }
+        assert!(matches!(
+            reader.poll_type_a(timeout()?),
+            Err(ReaderError::NotInitialized)
+        ));
+        reader.initialize()?;
+        assert!(reader.poll_type_a(timeout()?)?.is_some());
+        assert_eq!(journal.borrow().remaining, 0);
+    }
+    Ok(())
+}
+
+#[test]
 fn type_one_dynamic_memory_is_rejected_before_read_or_write() -> Result<(), Box<dyn Error>> {
     let mut steps = initialization(&ab_config_image());
     steps.extend(ab_mode(false));

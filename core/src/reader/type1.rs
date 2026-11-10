@@ -4,6 +4,8 @@ use alloc::vec::Vec;
 
 /// A selected NFC-A Type 1 tag. Its UID is the four-byte command address
 /// returned by RID; it is scoped to this selection.
+/// If the reader reports a pending response fragment, reinitialize before
+/// selecting another tag or sending another card command.
 #[derive(Debug)]
 pub struct Type1Tag<'a, T: Transport> {
     reader: &'a mut Reader<T>,
@@ -15,6 +17,7 @@ pub struct Type1Tag<'a, T: Transport> {
 
 impl<T: Transport> Reader<T> {
     /// Activate one legacy Type 1 target at 106 kbps and request its identity.
+    /// A pending response fragment during identification requires reinitialization.
     pub fn poll_type1(
         &mut self,
         timeout: RfTimeout,
@@ -30,7 +33,6 @@ impl<T: Transport> Reader<T> {
             _ => return Err(response_error("Type 1 selection layout")),
         };
         let timeout = ResponseTimeout::for_request(timeout);
-        self.prepare_type_a_exchange(timeout)?;
         let identity = type1_exchange(self, target, timeout, &[0x78, 0, 0, 0, 0, 0, 0])?;
         let [hr0, hr1, a, b, c, d] = identity.as_slice() else {
             return Err(response_error("Type 1 RID layout"));
@@ -87,7 +89,6 @@ impl<T: Transport> Type1Tag<'_, T> {
         address: u8,
         data: u8,
     ) -> Result<Vec<u8>, TypeAExchangeError<T::Error>> {
-        self.reader.prepare_type_a_exchange(self.timeout)?;
         let [a, b, c, d] = self.uid;
         type1_exchange(
             self.reader,
@@ -104,11 +105,11 @@ fn type1_exchange<T: Transport>(
     timeout: ResponseTimeout,
     command: &[u8],
 ) -> Result<Vec<u8>, TypeAExchangeError<T::Error>> {
-    let response = reader
-        .exchange_target(target, command, timeout)
-        .map_err(TypeAExchangeError::Exchange)?;
+    let response = reader.exchange_type_a_single_response(target, command, timeout)?;
     if response.status != 0 {
-        return Err(response_error("Type 1 reader status"));
+        return Err(TypeAExchangeError::Exchange(Error::RfStatus(
+            response.status,
+        )));
     }
     Ok(response.data)
 }
