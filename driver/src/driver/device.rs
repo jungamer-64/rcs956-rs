@@ -3,8 +3,6 @@ use core::{
     ptr::{null, null_mut},
 };
 use std::sync::Mutex;
-#[cfg(feature = "pcsc")]
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use wdk_sys::{
     _WDF_EXECUTION_LEVEL, _WDF_IO_QUEUE_DISPATCH_TYPE, _WDF_SYNCHRONIZATION_SCOPE, _WDF_TRI_STATE,
@@ -15,6 +13,8 @@ use wdk_sys::{
 #[cfg(feature = "pcsc")]
 use windows_sys::Win32::Security::Credentials::GUID_DEVINTERFACE_SMARTCARD_READER;
 
+#[cfg(feature = "pcsc")]
+use super::unit::UnitLease;
 use super::{
     queue::{Queues, Request},
     status::{self, Status},
@@ -22,8 +22,6 @@ use super::{
     worker::Worker,
 };
 
-#[cfg(feature = "pcsc")]
-static NEXT_UNIT: AtomicU32 = AtomicU32::new(0);
 #[cfg(feature = "pcsc")]
 const INTERFACE: GUID = GUID {
     Data1: GUID_DEVINTERFACE_SMARTCARD_READER.data1,
@@ -44,8 +42,9 @@ struct DeviceState {
     queues: Queues,
     usb: Option<UsbDevice>,
     worker: Option<Worker>,
+    /// Released with the device context at cleanup.
     #[cfg(feature = "pcsc")]
-    unit: u32,
+    unit: UnitLease,
 }
 
 struct ContextType(WDF_OBJECT_CONTEXT_TYPE_INFO);
@@ -108,7 +107,7 @@ fn create(device: WDFDEVICE) -> Result<(), Status> {
         usb: None,
         worker: None,
         #[cfg(feature = "pcsc")]
-        unit: NEXT_UNIT.fetch_add(1, Ordering::Relaxed),
+        unit: UnitLease::acquire()?,
     }));
     // SAFETY: WDF allocated an aligned pointer slot. No device callback can
     // use it until device creation returns. Cleanup now owns this allocation.
@@ -184,7 +183,7 @@ extern "C" fn d0_entry(device: WDFDEVICE, _: WDF_DEVICE_POWER_STATE) -> NTSTATUS
             #[cfg(feature = "usb")]
             usb.release,
             #[cfg(feature = "pcsc")]
-            state.unit,
+            state.unit.unit(),
         ) {
             Ok(worker) => {
                 state.worker = Some(worker);

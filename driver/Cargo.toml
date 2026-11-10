@@ -8,7 +8,7 @@ publish = false
 
 [features]
 usb = ["dep:rcs956-usb-abi"]
-pcsc = ["windows-sys/Win32_Security_Credentials"]
+pcsc = ["windows-sys/Win32_Security_Credentials", "windows-sys/Win32_System_Threading"]
 
 [lib]
 crate-type = ["cdylib"]

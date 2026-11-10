@@ -6,7 +6,7 @@ use std::{
     ptr::{null, null_mut},
 };
 
-use rcs956::reader::MAX_TYPE_A_COMMAND_BYTES;
+use rcs956::isodep::MAX_APDU_BYTES;
 use windows_sys::Win32::Security::Credentials::{
     SCARD_IO_REQUEST, SCARD_LEAVE_CARD, SCARD_PROTOCOL_T1, SCARD_SCOPE_SYSTEM, SCARD_SHARE_SHARED,
     SCardConnectW, SCardDisconnect, SCardEstablishContext, SCardListReadersW, SCardReleaseContext,
@@ -59,13 +59,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn parse_apdu(hex: &str) -> Result<Vec<u8>, io::Error> {
-    if !(8..=2 * MAX_TYPE_A_COMMAND_BYTES).contains(&hex.len())
+    if !(8..=2 * MAX_APDU_BYTES).contains(&hex.len())
         || !hex.len().is_multiple_of(2)
         || !hex.is_ascii()
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("expected a 4–{MAX_TYPE_A_COMMAND_BYTES} byte hexadecimal APDU"),
+            format!("expected a 4–{MAX_APDU_BYTES} byte hexadecimal APDU"),
         ));
     }
     (0..hex.len())

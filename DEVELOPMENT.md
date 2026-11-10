@@ -52,7 +52,9 @@ read例のservice／systemは対象カードに存在するものを指定する
 
 USB モードは単一のクライアントに USB 転送を許可する。reader の初期化、取引の回復、NDEF と各カードプロトコルはクライアントで動作する。ドライバは転送長とタイムアウトを検査して USB I/O を直列化する。デバイス記述子の `bcdDevice` は、bind 時に検査した記述子の値を USB 転送なしで返す。アプリケーションコマンドをドライバ内で再実行しない。
 
-PC/SC モードでは Smart Card Resource Manager が USB デバイスを NFC-A／NFC-B の ISO-DEP リーダーとして利用する。T=1 の ATR を生成し、WinSCard から最大262 bytesの APDU を選択中のカードに送る。カードの待機中は挿入と離脱をポーリングする。接続中のカードの離脱は APDU 交換の失敗、または電源解除後の再ポーリングで検出する。FeliCa とストレージカードの疑似 APDU は PC/SC モードの対象外。
+PC/SC モードでは Smart Card Resource Manager が USB デバイスを NFC-A／NFC-B の非接触 ISO-DEP リーダーとして利用する。T=1 の ATR を生成する。NFC-A の ATS の historical bytes は、ATR に収まる先頭15 bytesだけを使う。WinSCard からの APDU は、選択中のカードの上限（NFC-A は262 bytes、NFC-B は ISO-DEP session の上限）まで受け付ける。上限を超える APDU はカードへ送らずに拒否し、session を保持する。リーダー名の unit 番号は、全ホストプロセスで使用中のものを除いた最小値になる。
+
+電源の入っていないカードは、再選択して挿入と離脱を確認する。電源の入った NFC-B カードには ISO-DEP の presence check を送る。NFC-A の ISO-DEP は reader firmware が処理するため、カードの状態を変えない presence check がなく、電源中の離脱は APDU 交換の失敗で検出する。失った session のカードのプロトコル状態は回復できない。そのため、電源中のカードとの session が APDU 交換や presence check の失敗で失われた場合は、カードがまだ場にあっても離脱として通知し、次の選択を挿入として扱う。APDU 交換の待機は ISO-DEP の block 待機と各 budget で制限し、APDU 全体の時間上限は設けない。FeliCa とストレージカードの疑似 APDU は PC/SC モードの対象外。
 
 ```powershell
 cargo run --locked -p rcs956-driver --features pcsc --example pcsc_probe -- list

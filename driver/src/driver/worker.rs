@@ -28,9 +28,17 @@ impl Control {
         self.stop.load(Ordering::Acquire)
     }
 
+    /// Limit the remaining USB I/O of a reader-management step.
     #[cfg(feature = "pcsc")]
     pub(crate) fn bound(&self, wait: Duration) {
         self.deadline.set(Some(Instant::now() + wait));
+    }
+
+    /// Leave card exchanges to the block waits and budgets of the card
+    /// protocol. Stopping still refuses the next transfer.
+    #[cfg(feature = "pcsc")]
+    pub(crate) fn unbound(&self) {
+        self.deadline.set(None);
     }
 
     pub(crate) fn wait_budget(&self, requested: Duration) -> Result<Duration, Status> {

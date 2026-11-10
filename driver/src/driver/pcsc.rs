@@ -1,9 +1,13 @@
 use core::mem::size_of;
 
-use rcs956::{nfca, nfcb, reader::MAX_TYPE_A_COMMAND_BYTES};
+use rcs956::{isodep::MAX_APDU_BYTES, nfca, nfcb};
 use windows_sys::Win32::Security::Credentials::{
-    SCARD_IO_REQUEST, SCARD_PROTOCOL_DEFAULT, SCARD_PROTOCOL_RAW, SCARD_PROTOCOL_T0,
-    SCARD_PROTOCOL_T1,
+    SCARD_ABSENT, SCARD_CLASS_COMMUNICATIONS, SCARD_CLASS_ICC_STATE, SCARD_CLASS_IFD_PROTOCOL,
+    SCARD_CLASS_MECHANICAL, SCARD_CLASS_POWER_MGMT, SCARD_CLASS_PROTOCOL, SCARD_CLASS_SYSTEM,
+    SCARD_CLASS_VENDOR_DEFINED, SCARD_CLASS_VENDOR_INFO, SCARD_COLD_RESET, SCARD_IO_REQUEST,
+    SCARD_NEGOTIABLE, SCARD_POWER_DOWN, SCARD_PROTOCOL_DEFAULT, SCARD_PROTOCOL_OPTIMAL,
+    SCARD_PROTOCOL_RAW, SCARD_PROTOCOL_T0, SCARD_PROTOCOL_T1, SCARD_READER_CONTACTLESS,
+    SCARD_SPECIFIC, SCARD_SWALLOWED, SCARD_WARM_RESET,
 };
 
 use super::status::{self, Status};
@@ -26,42 +30,114 @@ const SET_PROTOCOL: u32 = ioctl(12);
 const GET_STATE: u32 = ioctl(14);
 const GET_FEATURES: u32 = ioctl(3400);
 pub(crate) const PCI_BYTES: usize = size_of::<SCARD_IO_REQUEST>();
-pub(crate) const MAX_INPUT: usize = PCI_BYTES + MAX_TYPE_A_COMMAND_BYTES;
+/// Largest accepted IOCTL input: a transmit header and the largest APDU that
+/// any selection can admit. Each selection applies its own smaller limit.
+pub(crate) const MAX_INPUT: usize = PCI_BYTES + MAX_APDU_BYTES;
+/// PC/SC carries at most 15 historical bytes in the T0 nibble of the ATR.
+const MAX_HISTORICAL_BYTES: usize = 15;
 
 const fn attribute(class: u32, tag: u32) -> u32 {
     (class << 16) | tag
 }
 
-const VENDOR_NAME: u32 = attribute(1, 0x100);
-const IFD_TYPE: u32 = attribute(1, 0x101);
-const CHANNEL_ID: u32 = attribute(2, 0x110);
-const PROTOCOL_TYPES: u32 = attribute(3, 0x120);
-const POWER_MGMT_SUPPORT: u32 = attribute(4, 0x131);
-const CHARACTERISTICS: u32 = attribute(6, 0x150);
-const CURRENT_PROTOCOL: u32 = attribute(8, 0x201);
-const ICC_PRESENCE: u32 = attribute(9, 0x300);
-const ICC_INTERFACE_STATUS: u32 = attribute(9, 0x301);
-const ATR_STRING: u32 = attribute(9, 0x303);
-const MAXINPUT: u32 = attribute(7, 0xa007);
-const DEVICE_UNIT: u32 = attribute(0x7fff, 1);
-const DEVICE_IN_USE: u32 = attribute(0x7fff, 2);
-const SUPPRESS_T1_IFS: u32 = attribute(0x7fff, 7);
+const VENDOR_NAME: u32 = attribute(SCARD_CLASS_VENDOR_INFO, 0x100);
+const IFD_TYPE: u32 = attribute(SCARD_CLASS_VENDOR_INFO, 0x101);
+const CHANNEL_ID: u32 = attribute(SCARD_CLASS_COMMUNICATIONS, 0x110);
+const PROTOCOL_TYPES: u32 = attribute(SCARD_CLASS_PROTOCOL, 0x120);
+const POWER_MGMT_SUPPORT: u32 = attribute(SCARD_CLASS_POWER_MGMT, 0x131);
+const CHARACTERISTICS: u32 = attribute(SCARD_CLASS_MECHANICAL, 0x150);
+const CURRENT_PROTOCOL: u32 = attribute(SCARD_CLASS_IFD_PROTOCOL, 0x201);
+const ICC_PRESENCE: u32 = attribute(SCARD_CLASS_ICC_STATE, 0x300);
+const ICC_INTERFACE_STATUS: u32 = attribute(SCARD_CLASS_ICC_STATE, 0x301);
+const ATR_STRING: u32 = attribute(SCARD_CLASS_ICC_STATE, 0x303);
+const ICC_TYPE_PER_ATR: u32 = attribute(SCARD_CLASS_ICC_STATE, 0x304);
+const MAXINPUT: u32 = attribute(SCARD_CLASS_VENDOR_DEFINED, 0xa007);
+const DEVICE_UNIT: u32 = attribute(SCARD_CLASS_SYSTEM, 1);
+const DEVICE_IN_USE: u32 = attribute(SCARD_CLASS_SYSTEM, 2);
+const SUPPRESS_T1_IFS: u32 = attribute(SCARD_CLASS_SYSTEM, 7);
 
+/// The contactless interface that activated an [`Icc`], as reported by
+/// `SCARD_ATTR_ICC_TYPE_PER_ATR`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum State {
-    Absent,
-    Detected,
+enum Interface {
+    Iso14443A,
+    Iso14443B,
+}
+
+/// What PC/SC observes of one ISO-DEP selection.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct Icc {
+    atr: Vec<u8>,
+    interface: Interface,
+    maximum_apdu_bytes: usize,
+}
+
+impl Icc {
+    /// PC/SC Part 3 contactless ATR with the ATS historical bytes. Bytes
+    /// beyond the ATR's 15-byte capacity are omitted.
+    pub(crate) fn type_a(ats: &nfca::Ats, maximum_apdu_bytes: usize) -> Self {
+        let history = ats.historical_bytes();
+        Self {
+            atr: atr(&history[..history.len().min(MAX_HISTORICAL_BYTES)]),
+            interface: Interface::Iso14443A,
+            maximum_apdu_bytes,
+        }
+    }
+
+    /// PC/SC Part 3 contactless ATR for ISO/IEC 14443-B: ATQB application data
+    /// and protocol info, then the ATTRIB MBLI in the upper nibble.
+    pub(crate) fn type_b(activation: &nfcb::Observation, maximum_apdu_bytes: usize) -> Self {
+        let mut history = [0; 8];
+        history[..4].copy_from_slice(&activation.application_data());
+        history[4..7].copy_from_slice(&activation.protocol_info());
+        history[7] = activation.mbli() << 4;
+        Self {
+            atr: atr(&history),
+            interface: Interface::Iso14443B,
+            maximum_apdu_bytes,
+        }
+    }
+
+    pub(crate) fn atr(&self) -> &[u8] {
+        &self.atr
+    }
+}
+
+fn atr(history: &[u8]) -> Vec<u8> {
+    // Direct convention, TD1 announcing T=1, TD2 T=1, then TCK.
+    let mut bytes = vec![0x3b, 0x80 | history.len() as u8, 0x80, 1];
+    bytes.extend_from_slice(history);
+    bytes.push(bytes[1..].iter().fold(0, |tck, &byte| tck ^ byte));
+    bytes
+}
+
+/// Card power as negotiated with the resource manager.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Power {
+    /// Selected but not reset by the resource manager.
+    Unpowered,
+    /// The ATR was returned; no protocol has been selected.
     Negotiable,
+    /// T=1 was selected; APDUs are admitted.
     Specific,
 }
 
-impl State {
-    pub(crate) fn value(self) -> u32 {
+/// The reader slot as reported to the resource manager.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Slot<'a> {
+    Empty,
+    Occupied { icc: &'a Icc, power: Power },
+}
+
+impl Slot<'_> {
+    fn state(self) -> u32 {
         match self {
-            Self::Absent => 1,
-            Self::Detected => 3,
-            Self::Negotiable => 5,
-            Self::Specific => 6,
+            Self::Empty => SCARD_ABSENT,
+            Self::Occupied { power, .. } => match power {
+                Power::Unpowered => SCARD_SWALLOWED,
+                Power::Negotiable => SCARD_NEGOTIABLE,
+                Power::Specific => SCARD_SPECIFIC,
+            },
         }
     }
 }
@@ -95,8 +171,8 @@ pub(crate) fn parse(code: u32, data: &[u8]) -> Result<Command<'_>, Status> {
         }
         SWALLOW if data.is_empty() => Command::Swallow,
         POWER => match dword(data)? {
-            0 => Command::PowerDown,
-            1 | 2 => Command::Reset,
+            SCARD_POWER_DOWN => Command::PowerDown,
+            SCARD_COLD_RESET | SCARD_WARM_RESET => Command::Reset,
             _ => return Err(Status(status::INVALID_PARAMETER)),
         },
         SET_PROTOCOL => {
@@ -110,23 +186,28 @@ pub(crate) fn parse(code: u32, data: &[u8]) -> Result<Command<'_>, Status> {
             {
                 return Err(Status(status::INVALID_DEVICE_REQUEST));
             }
-            if mask != 0 && mask & SCARD_PROTOCOL_T1 == 0 && mask != SCARD_PROTOCOL_DEFAULT {
+            // OPTIMAL (no protocol bit) and DEFAULT leave the choice to the
+            // reader; otherwise the caller must permit T=1.
+            let requested = mask & !SCARD_PROTOCOL_DEFAULT;
+            if requested != SCARD_PROTOCOL_OPTIMAL && requested & SCARD_PROTOCOL_T1 == 0 {
                 return Err(Status(status::NOT_SUPPORTED));
             }
             Command::SelectT1
         }
         TRANSMIT => {
-            let pci = data
+            let header = data
                 .get(..PCI_BYTES)
                 .ok_or(Status(status::INVALID_PARAMETER))?;
-            if dword(&pci[..4])? != SCARD_PROTOCOL_T1 {
+            if dword(&header[..4])? != SCARD_PROTOCOL_T1 {
                 return Err(Status(status::INVALID_DEVICE_STATE));
             }
-            if dword(&pci[4..])? as usize != PCI_BYTES {
+            // cbPciLength includes any protocol information after the header.
+            let pci = dword(&header[4..])? as usize;
+            if pci < PCI_BYTES {
                 return Err(Status(status::INVALID_PARAMETER));
             }
-            let apdu = &data[PCI_BYTES..];
-            if !(4..=MAX_TYPE_A_COMMAND_BYTES).contains(&apdu.len()) {
+            let apdu = data.get(pci..).ok_or(Status(status::INVALID_PARAMETER))?;
+            if apdu.len() < 4 {
                 return Err(Status(status::INVALID_PARAMETER));
             }
             Command::Transmit(apdu)
@@ -150,6 +231,10 @@ pub(crate) fn t1() -> [u8; 4] {
     SCARD_PROTOCOL_T1.to_le_bytes()
 }
 
+pub(crate) fn get_state(slot: Slot<'_>) -> Vec<u8> {
+    slot.state().to_le_bytes().to_vec()
+}
+
 pub(crate) fn transmit_reply(apdu: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(PCI_BYTES + apdu.len());
     bytes.extend_from_slice(&t1());
@@ -158,87 +243,102 @@ pub(crate) fn transmit_reply(apdu: &[u8]) -> Vec<u8> {
     bytes
 }
 
-pub(crate) fn read_attribute(
-    tag: u32,
-    state: State,
-    atr: Option<&[u8]>,
-    unit: u32,
-) -> Result<Vec<u8>, Status> {
+pub(crate) fn read_attribute(tag: u32, slot: Slot<'_>, unit: u32) -> Result<Vec<u8>, Status> {
+    let dword = |value: u32| value.to_le_bytes().to_vec();
+    let icc = match slot {
+        Slot::Empty => None,
+        Slot::Occupied { icc, .. } => Some(icc),
+    };
+    let present = || icc.ok_or(Status(status::NO_MEDIA));
     Ok(match tag {
         VENDOR_NAME => b"rcs956-rs\0".to_vec(),
         IFD_TYPE => b"RC-S956\0".to_vec(),
-        CHANNEL_ID => (0x0020_0000 | (unit & 0xffff)).to_le_bytes().to_vec(),
-        DEVICE_UNIT => unit.to_le_bytes().to_vec(),
-        CHARACTERISTICS => 0u32.to_le_bytes().to_vec(),
-        POWER_MGMT_SUPPORT | SUPPRESS_T1_IFS => 1u32.to_le_bytes().to_vec(),
+        // DDDD = 0x0020 (USB), CCCC = device number.
+        CHANNEL_ID => dword(0x0020_0000 | (unit & 0xffff)),
+        DEVICE_UNIT => dword(unit),
+        CHARACTERISTICS => dword(SCARD_READER_CONTACTLESS),
+        POWER_MGMT_SUPPORT | SUPPRESS_T1_IFS => dword(1),
         PROTOCOL_TYPES => t1().to_vec(),
-        CURRENT_PROTOCOL if state == State::Specific => t1().to_vec(),
-        CURRENT_PROTOCOL => 0u32.to_le_bytes().to_vec(),
-        ICC_PRESENCE => vec![u8::from(state != State::Absent)],
+        CURRENT_PROTOCOL => match slot {
+            Slot::Occupied {
+                power: Power::Specific,
+                ..
+            } => t1().to_vec(),
+            _ => dword(0),
+        },
+        ICC_PRESENCE => vec![u8::from(icc.is_some())],
         ICC_INTERFACE_STATUS => vec![u8::from(matches!(
-            state,
-            State::Negotiable | State::Specific
+            slot,
+            Slot::Occupied {
+                power: Power::Negotiable | Power::Specific,
+                ..
+            }
         ))],
-        MAXINPUT => (MAX_TYPE_A_COMMAND_BYTES as u32).to_le_bytes().to_vec(),
-        ATR_STRING => atr.ok_or(Status(status::NO_MEDIA))?.to_vec(),
+        ATR_STRING => present()?.atr.clone(),
+        ICC_TYPE_PER_ATR => vec![match present()?.interface {
+            Interface::Iso14443A => 5,
+            Interface::Iso14443B => 6,
+        }],
+        MAXINPUT => dword(icc.map_or(MAX_APDU_BYTES, |icc| icc.maximum_apdu_bytes) as u32),
         _ => return Err(Status(status::NOT_SUPPORTED)),
     })
-}
-
-pub(crate) fn atr_a(ats: &nfca::Ats) -> Option<Vec<u8>> {
-    let history = ats.historical_bytes();
-    (history.len() <= 15).then(|| atr(history))
-}
-
-pub(crate) fn atr_b(activation: &nfcb::Observation) -> Vec<u8> {
-    let mut history = [0; 8];
-    history[..4].copy_from_slice(&activation.application_data());
-    history[4..7].copy_from_slice(&activation.protocol_info());
-    history[7] = activation.mbli() << 4;
-    atr(&history)
-}
-
-fn atr(history: &[u8]) -> Vec<u8> {
-    // PC/SC Part 3 Table 3-5, direct convention, T=1.
-    let mut bytes = vec![0x3b, 0x80 | history.len() as u8, 0x80, 1];
-    bytes.extend_from_slice(history);
-    bytes.push(bytes[1..].iter().fold(0, |tck, &byte| tck ^ byte));
-    bytes
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn type_a(history: usize) -> Result<Icc, Box<dyn std::error::Error>> {
+        let mut record = vec![0, 4, 0x20, 4, 1, 2, 3, 4, 2 + history as u8, 0];
+        record.extend((0..history).map(|byte| byte as u8));
+        let observation = nfca::Observation::parse(&record)?;
+        let ats = observation.ats().ok_or("expected ATS")?;
+        Ok(Icc::type_a(ats, 262))
+    }
+
     #[test]
-    fn pcsc_transmit_has_an_eight_byte_pci_and_a_distinct_apdu() {
+    fn transmit_apdu_starts_after_the_declared_pci() {
         let data = [2, 0, 0, 0, 8, 0, 0, 0, 0, 0xa4, 4, 0];
         assert_eq!(parse(0x31_0014, &data), Ok(Command::Transmit(&data[8..])));
         assert_eq!(
             transmit_reply(&[0x90, 0]),
             [2, 0, 0, 0, 8, 0, 0, 0, 0x90, 0]
         );
-        let mut malformed = data;
-        malformed[4] = 7;
+        let extended = [2, 0, 0, 0, 10, 0, 0, 0, 0xee, 0xee, 0, 0xa4, 4, 0];
         assert_eq!(
-            parse(TRANSMIT, &malformed),
-            Err(Status(status::INVALID_PARAMETER))
+            parse(TRANSMIT, &extended),
+            Ok(Command::Transmit(&extended[10..]))
         );
+        for pci in [7, 13] {
+            let mut malformed = extended;
+            malformed[4] = pci;
+            assert_eq!(
+                parse(TRANSMIT, &malformed),
+                Err(Status(status::INVALID_PARAMETER))
+            );
+        }
         assert_eq!(
             parse(TRANSMIT, &data[..8]),
             Err(Status(status::INVALID_PARAMETER))
         );
-        malformed[0] = 1;
+        let mut t0 = data;
+        t0[0] = 1;
         assert_eq!(
-            parse(TRANSMIT, &malformed),
+            parse(TRANSMIT, &t0),
             Err(Status(status::INVALID_DEVICE_STATE))
         );
     }
 
     #[test]
-    fn contactless_atr_has_t1_history_and_checksum() {
+    fn contactless_atr_has_t1_history_and_checksum() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(atr(&[]), [0x3b, 0x80, 0x80, 1, 1]);
         assert_eq!(atr(&[0x80, 0x73]), [0x3b, 0x82, 0x80, 1, 0x80, 0x73, 0xf0]);
+        let long = type_a(20)?;
+        assert_eq!(long.atr()[1], 0x8f);
+        assert_eq!(long.atr()[4..19], (0..15).collect::<Vec<u8>>()[..]);
+        assert_eq!(long.atr().len(), 4 + 15 + 1);
+        assert_eq!(long.atr()[1..].iter().fold(0, |tck, &byte| tck ^ byte), 0);
+        Ok(())
     }
 
     #[test]
@@ -254,22 +354,68 @@ mod tests {
 
     #[test]
     fn resource_manager_sees_a_single_t1_protocol() {
-        assert_eq!(parse(0x31_0030, &[3, 0, 0, 0]), Ok(Command::SelectT1));
+        for mask in [0, 2, 3, 0x8000_0000, 0x8000_0002] {
+            assert_eq!(
+                parse(0x31_0030, &u32::to_le_bytes(mask)),
+                Ok(Command::SelectT1)
+            );
+        }
+        for mask in [1, 0x1_0000, 0x8000_0001] {
+            assert_eq!(
+                parse(0x31_0030, &u32::to_le_bytes(mask)),
+                Err(Status(status::NOT_SUPPORTED))
+            );
+        }
+    }
+
+    #[test]
+    fn attributes_follow_the_slot() -> Result<(), Box<dyn std::error::Error>> {
+        let icc = type_a(2)?;
+        let empty = Slot::Empty;
+        let unpowered = Slot::Occupied {
+            icc: &icc,
+            power: Power::Unpowered,
+        };
+        let specific = Slot::Occupied {
+            icc: &icc,
+            power: Power::Specific,
+        };
+        assert_eq!(get_state(empty), [1, 0, 0, 0]);
+        assert_eq!(get_state(unpowered), [3, 0, 0, 0]);
+        assert_eq!(get_state(specific), [6, 0, 0, 0]);
         assert_eq!(
-            parse(0x31_0030, &[1, 0, 0, 0]),
-            Err(Status(status::NOT_SUPPORTED))
+            read_attribute(CHARACTERISTICS, empty, 0),
+            Ok(vec![8, 0, 0, 0])
+        );
+        assert_eq!(read_attribute(ICC_PRESENCE, empty, 0), Ok(vec![0]));
+        assert_eq!(
+            read_attribute(ATR_STRING, empty, 0),
+            Err(Status(status::NO_MEDIA))
         );
         assert_eq!(
-            read_attribute(ICC_PRESENCE, State::Absent, None, 0),
+            read_attribute(MAXINPUT, empty, 0),
+            Ok(u32::to_le_bytes(65_535).to_vec())
+        );
+        assert_eq!(read_attribute(ICC_PRESENCE, unpowered, 0), Ok(vec![1]));
+        assert_eq!(
+            read_attribute(ICC_INTERFACE_STATUS, unpowered, 0),
             Ok(vec![0])
         );
         assert_eq!(
-            read_attribute(CURRENT_PROTOCOL, State::Negotiable, None, 0),
+            read_attribute(CURRENT_PROTOCOL, unpowered, 0),
             Ok(vec![0; 4])
         );
+        assert_eq!(read_attribute(ATR_STRING, specific, 0), Ok(icc.atr.clone()));
+        assert_eq!(read_attribute(ICC_TYPE_PER_ATR, specific, 0), Ok(vec![5]));
         assert_eq!(
-            read_attribute(CURRENT_PROTOCOL, State::Specific, None, 0),
+            read_attribute(CURRENT_PROTOCOL, specific, 0),
             Ok(vec![2, 0, 0, 0])
         );
+        assert_eq!(
+            read_attribute(MAXINPUT, specific, 0),
+            Ok(u32::to_le_bytes(262).to_vec())
+        );
+        assert_eq!(read_attribute(DEVICE_UNIT, empty, 3), Ok(vec![3, 0, 0, 0]));
+        Ok(())
     }
 }

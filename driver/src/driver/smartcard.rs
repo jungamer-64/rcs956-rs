@@ -11,7 +11,7 @@ use rcs956::{
 };
 
 use super::{
-    pcsc::{self, Command, State},
+    pcsc::{self, Command, Icc, Power, Slot},
     queue::{Queues, Request},
     status::{self, Status},
     usb::UsbTransport,
@@ -20,8 +20,8 @@ use super::{
 
 const SCAN_PERIOD: Duration = Duration::from_millis(200);
 const SCAN_WAIT: Duration = Duration::from_millis(100);
+const PRESENCE_PERIOD: Duration = Duration::from_millis(200);
 const INIT_BUDGET: Duration = Duration::from_secs(6);
-const EXCHANGE_BUDGET: Duration = Duration::from_secs(10);
 
 pub(crate) struct Frontend {
     service: Service,
@@ -39,6 +39,8 @@ impl Frontend {
             queues,
             unit,
             control,
+            scan: RfTimeout::new(SCAN_WAIT)
+                .map_err(|_| Status(status::DEVICE_CONFIGURATION_ERROR))?,
         };
         let mut reader = Reader::new(transport);
         service.initialize(&mut reader)?;
@@ -62,6 +64,7 @@ struct Service {
     queues: Queues,
     unit: u32,
     control: Rc<Control>,
+    scan: RfTimeout,
 }
 
 #[derive(Clone, Copy)]
@@ -85,17 +88,20 @@ enum Card<'a> {
 }
 
 impl Card<'_> {
-    fn atr(&self) -> Option<Vec<u8>> {
-        match self {
-            Self::A(card) => card.observation().ats().and_then(pcsc::atr_a),
-            Self::B(card) => Some(pcsc::atr_b(card.observation())),
-        }
-    }
-
     fn exchange(&mut self, apdu: &[u8]) -> Result<Vec<u8>, isodep::Error<ReaderError<Status>>> {
         match self {
             Self::A(card) => card.exchange_apdu(apdu),
             Self::B(card) => card.exchange_apdu(apdu),
+        }
+    }
+
+    /// `None` when the selection offers no probe that leaves the card's
+    /// protocol state unchanged. The reader firmware owns NFC-A ISO-DEP
+    /// blocks, so only NFC-B sessions are probed.
+    fn check_presence(&mut self) -> Option<Result<(), isodep::PresenceError<ReaderError<Status>>>> {
+        match self {
+            Self::A(_) => None,
+            Self::B(card) => Some(card.check_presence()),
         }
     }
 }
@@ -105,11 +111,19 @@ struct Reset {
     output_capacity: usize,
 }
 
+/// How a selection ended, and what the resource manager must observe.
 enum Next {
-    Scan,
+    /// Re-select an unpowered card to observe its continued presence.
+    Rescan,
+    /// The resource manager requested a reset; reply with the next ATR.
     Reset(Reset),
+    /// The resource manager requested power down.
     PowerDown(Request),
-    Invalidated,
+    /// The powered card session was lost. Its protocol state cannot be
+    /// recovered, so the resource manager observes a removal.
+    Departed,
+    /// Selection failed in the reader; reinitialize before scanning.
+    ReaderFault,
     Stop,
 }
 
@@ -120,9 +134,6 @@ impl Service {
     }
 
     fn run(&self, reader: &mut Reader<UsbTransport>) {
-        let Ok(timeout) = RfTimeout::new(SCAN_WAIT) else {
-            return;
-        };
         let mut technology = Technology::A;
         let mut reset = None;
         let mut ready = true;
@@ -138,22 +149,19 @@ impl Service {
                 }
             }
             self.control.bound(INIT_BUDGET);
-            let next = match select(reader, technology, timeout) {
-                Ok(Some(card)) => match card.atr() {
-                    Some(atr) => {
-                        self.queues.signal(true);
-                        self.selected(card, &atr, reset.take())
-                    }
-                    None => {
-                        self.no_card(&mut reset);
-                        technology = technology.alternate();
-                        Next::Scan
-                    }
-                },
+            let next = match select(reader, technology, self.scan) {
+                Ok(Some((card, icc))) => {
+                    self.queues.signal(true);
+                    self.selected(card, &icc, reset.take())
+                }
                 Ok(None) => {
-                    self.no_card(&mut reset);
+                    if let Some(reset) = reset.take() {
+                        reset.request.fail(Status(status::NO_MEDIA));
+                    }
+                    self.queues.signal(false);
+                    self.without_card(None);
                     technology = technology.alternate();
-                    Next::Scan
+                    Next::Rescan
                 }
                 Err(error) => {
                     let error = reader_status(error);
@@ -162,11 +170,14 @@ impl Service {
                     }
                     self.queues.fail_watches(error);
                     self.without_card(Some(error));
-                    Next::Invalidated
+                    Next::ReaderFault
                 }
             };
             if matches!(next, Next::Stop) {
                 break;
+            }
+            if matches!(next, Next::Departed) {
+                self.queues.signal(false);
             }
             self.control.bound(Duration::from_secs(1));
             let field = reader.rf_off().map_err(reader_status);
@@ -177,21 +188,13 @@ impl Service {
                     Err(error) => pending.request.fail(error),
                 },
                 Next::PowerDown(request) => complete(request, field.map(|()| Vec::new())),
-                Next::Invalidated => ready = false,
-                Next::Scan | Next::Stop => {}
+                Next::ReaderFault => ready = false,
+                Next::Rescan | Next::Departed | Next::Stop => {}
             }
         }
         if let Some(reset) = reset {
             reset.request.fail(Status(status::CANCELLED));
         }
-    }
-
-    fn no_card(&self, reset: &mut Option<Reset>) {
-        if let Some(reset) = reset.take() {
-            reset.request.fail(Status(status::NO_MEDIA));
-        }
-        self.queues.signal(false);
-        self.without_card(None);
     }
 
     fn without_card(&self, failure: Option<Status>) {
@@ -223,42 +226,64 @@ impl Service {
                 }
                 continue;
             }
-            let result =
-                self.common(&command, State::Absent, None)
+            let result = match (&command, failure) {
+                (Command::GetState, Some(error)) => Err(error),
+                _ => self
+                    .common(&command, Slot::Empty)
                     .unwrap_or_else(|| match command {
                         Command::PowerDown => Ok(Vec::new()),
                         _ => Err(failure.unwrap_or(Status(status::NO_MEDIA))),
-                    });
-            let result = match (&command, failure) {
-                (Command::GetState, Some(error)) => Err(error),
-                _ => result,
+                    }),
             };
             complete(request, result);
         }
     }
 
-    fn selected(&self, mut card: Card<'_>, atr: &[u8], reset: Option<Reset>) -> Next {
-        let mut phase = match reset {
+    fn selected(&self, mut card: Card<'_>, icc: &Icc, reset: Option<Reset>) -> Next {
+        let atr = icc.atr();
+        let mut power = match reset {
             Some(reset) if reset.output_capacity >= atr.len() => {
                 reset.request.reply(atr);
-                State::Negotiable
+                Power::Negotiable
             }
             Some(reset) => {
                 reset.request.fail(Status(status::BUFFER_TOO_SMALL));
-                State::Detected
+                Power::Unpowered
             }
-            None => State::Detected,
+            None => Power::Unpowered,
         };
-        let refresh = Instant::now() + SCAN_PERIOD;
+        // An unpowered card is re-selected; a powered one is probed instead,
+        // because selection would discard its protocol state.
+        let rescan = Instant::now() + SCAN_PERIOD;
+        let mut probe = Some(Instant::now() + PRESENCE_PERIOD);
         while !self.control.stopping() {
-            if phase == State::Detected && Instant::now() >= refresh {
-                return Next::Scan;
+            let deadline = match power {
+                Power::Unpowered => Some(rescan),
+                Power::Negotiable | Power::Specific => probe,
+            };
+            if let Some(deadline) = deadline
+                && Instant::now() >= deadline
+            {
+                if power == Power::Unpowered {
+                    return Next::Rescan;
+                }
+                self.control.unbound();
+                match card.check_presence() {
+                    None => probe = None,
+                    Some(Ok(())) => probe = Some(Instant::now() + PRESENCE_PERIOD),
+                    Some(Err(error)) => {
+                        super::trace(format_args!("presence check: {error}"));
+                        return Next::Departed;
+                    }
+                }
+                continue;
             }
             let Some(request) = self.queues.pop() else {
-                if phase == State::Detected {
-                    thread::park_timeout(refresh.saturating_duration_since(Instant::now()));
-                } else {
-                    thread::park();
+                match deadline {
+                    Some(deadline) => {
+                        thread::park_timeout(deadline.saturating_duration_since(Instant::now()));
+                    }
+                    None => thread::park(),
                 }
                 continue;
             };
@@ -276,7 +301,7 @@ impl Service {
                     continue;
                 }
             };
-            if let Some(result) = self.common(&command, phase, Some(atr)) {
+            if let Some(result) = self.common(&command, Slot::Occupied { icc, power }) {
                 complete(request, result);
                 continue;
             }
@@ -294,35 +319,38 @@ impl Service {
                     });
                 }
                 Command::PowerDown => return Next::PowerDown(request),
-                Command::SelectT1 if phase == State::Detected => {
+                Command::SelectT1 if power == Power::Unpowered => {
                     request.fail(Status(status::INVALID_DEVICE_STATE))
                 }
                 Command::SelectT1 if output < 4 => request.fail(Status(status::BUFFER_TOO_SMALL)),
                 Command::SelectT1 => {
-                    phase = State::Specific;
+                    power = Power::Specific;
                     request.reply(&pcsc::t1());
                 }
-                Command::Transmit(_) if phase != State::Specific => {
+                Command::Transmit(_) if power != Power::Specific => {
                     request.fail(Status(status::INVALID_DEVICE_STATE))
                 }
                 Command::Transmit(_) if output < pcsc::PCI_BYTES + 2 => {
                     request.fail(Status(status::BUFFER_TOO_SMALL))
                 }
                 Command::Transmit(apdu) => {
-                    self.control.bound(EXCHANGE_BUDGET);
+                    self.control.unbound();
                     match card.exchange(apdu) {
-                        Ok(data) if data.len() >= 2 => request.reply(&pcsc::transmit_reply(&data)),
+                        Ok(data) if data.len() >= 2 => {
+                            request.reply(&pcsc::transmit_reply(&data));
+                            // A complete response confirms presence.
+                            probe = probe.map(|_| Instant::now() + PRESENCE_PERIOD);
+                        }
                         Ok(_) => {
                             request.fail(Status(status::DEVICE_PROTOCOL_ERROR));
-                            return Next::Invalidated;
+                            return Next::Departed;
+                        }
+                        Err(error) if rejected_before_rf(&error) => {
+                            request.fail(Status(status::INVALID_PARAMETER));
                         }
                         Err(error) => {
-                            let invalidates =
-                                !matches!(error.cause, isodep::Cause::InputLength { .. });
                             request.fail(apdu_status(error));
-                            if invalidates {
-                                return Next::Invalidated;
-                            }
+                            return Next::Departed;
                         }
                     }
                 }
@@ -332,45 +360,55 @@ impl Service {
         Next::Stop
     }
 
-    fn common(
-        &self,
-        command: &Command<'_>,
-        phase: State,
-        atr: Option<&[u8]>,
-    ) -> Option<Result<Vec<u8>, Status>> {
+    fn common(&self, command: &Command<'_>, slot: Slot<'_>) -> Option<Result<Vec<u8>, Status>> {
         match *command {
-            Command::GetState => Some(Ok(phase.value().to_le_bytes().to_vec())),
-            Command::Attribute(tag) => Some(pcsc::read_attribute(tag, phase, atr, self.unit)),
+            Command::GetState => Some(Ok(pcsc::get_state(slot))),
+            Command::Attribute(tag) => Some(pcsc::read_attribute(tag, slot, self.unit)),
             Command::DeviceInUse | Command::Features => Some(Ok(Vec::new())),
             _ => None,
         }
     }
 }
 
+/// Select one ISO-DEP card. Cards without ISO-DEP activation are outside
+/// PC/SC mode and are reported like an empty field.
 fn select(
     reader: &mut Reader<UsbTransport>,
     technology: Technology,
     timeout: RfTimeout,
-) -> Result<Option<Card<'_>>, ReaderError<Status>> {
-    match technology {
-        Technology::A => reader.poll_type_a(timeout).map(|selected| {
-            selected
-                .filter(|card| card.observation().supports_iso_dep())
-                .map(Card::A)
+) -> Result<Option<(Card<'_>, Icc)>, ReaderError<Status>> {
+    Ok(match technology {
+        Technology::A => reader.poll_type_a(timeout)?.and_then(|card| {
+            let observation = card.observation();
+            let ats = observation
+                .ats()
+                .filter(|_| observation.supports_iso_dep())?;
+            let icc = Icc::type_a(ats, card.maximum_apdu_bytes());
+            Some((Card::A(card), icc))
         }),
-        Technology::B => reader
-            .poll_type_b(Default::default(), timeout)
-            .map(|selected| match selected {
-                Some(TypeBSelection::IsoDep(card)) => Some(Card::B(card)),
-                _ => None,
-            }),
-    }
+        Technology::B => match reader.poll_type_b(Default::default(), timeout)? {
+            Some(TypeBSelection::IsoDep(card)) => {
+                let icc = Icc::type_b(card.observation(), card.maximum_apdu_bytes());
+                Some((Card::B(card), icc))
+            }
+            Some(TypeBSelection::Frame(_)) | None => None,
+        },
+    })
 }
 
 fn complete(request: Request, result: Result<Vec<u8>, Status>) {
     match result {
         Ok(data) => request.reply(&data),
         Err(error) => request.fail(error),
+    }
+}
+
+/// The selection refused the APDU before any RF transfer and remains usable.
+fn rejected_before_rf(error: &isodep::Error<ReaderError<Status>>) -> bool {
+    match error.cause {
+        isodep::Cause::InputLength { .. } => true,
+        isodep::Cause::Budget(isodep::Budget::Frames) => error.progress.frames == 0,
+        _ => false,
     }
 }
 
@@ -389,7 +427,6 @@ fn reader_status(error: ReaderError<Status>) -> Status {
 
 fn apdu_status(error: isodep::Error<ReaderError<Status>>) -> Status {
     match error.cause {
-        isodep::Cause::InputLength { .. } => Status(status::INVALID_PARAMETER),
         isodep::Cause::Deselected => Status(status::NO_MEDIA),
         isodep::Cause::Preparation(error)
         | isodep::Cause::Transport(error)

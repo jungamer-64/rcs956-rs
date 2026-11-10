@@ -9,6 +9,8 @@ mod frontend;
 mod pcsc;
 mod queue;
 mod status;
+#[cfg(feature = "pcsc")]
+mod unit;
 mod usb;
 mod worker;
 
