@@ -1,6 +1,7 @@
 //! Reader configuration and lifetime-bound NFC card access.
 
 mod dep;
+mod identity;
 mod type1;
 mod type2_target;
 
@@ -8,6 +9,7 @@ pub use dep::{
     DepActivation, DepError, DepInitiator, DepLink, DepMessage, DepMode, DepPeer, DepRate,
     DepRequest, DepTransferCause, MAX_DEP_MESSAGE_BYTES, PassiveDepTarget,
 };
+pub use identity::{DeviceNameError, Model, Product};
 pub use type1::Type1Tag;
 pub use type2_target::{
     MAX_TYPE2_EMULATED_NDEF_BYTES, Type2EmulationError, Type2Event, Type2Target,
@@ -20,7 +22,7 @@ use crate::{
     isodep, nfca, nfcb,
     transport::{Link, TransactionError, Transport},
 };
-use alloc::{vec, vec::Vec};
+use alloc::{string::String, vec, vec::Vec};
 use core::{error, fmt, num::NonZeroU8, time::Duration};
 
 /// Maximum card-command bytes accepted by the reader's NFC-A exchange.
@@ -156,7 +158,7 @@ impl error::Error for ConfigurationError {}
 #[derive(Debug, Clone)]
 pub struct ConfigImage {
     bytes: [u8; 256],
-    model: u16,
+    model: Model,
 }
 impl ConfigImage {
     /// Check the signature, three defined checksum ranges, and model class.
@@ -178,12 +180,23 @@ impl ConfigImage {
         if !matches!(bytes[253], 1 | 2) {
             return Err(ConfigurationError::ModelClass);
         }
-        let model = u16::from_be_bytes([bytes[253], bytes[254]]);
+        let model = Model::new(u16::from_be_bytes([bytes[253], bytes[254]]));
         Ok(Self { bytes, model })
     }
-    /// Model word from E[FD..FE], distinct from USB PID.
-    pub fn model(&self) -> u16 {
+    /// Model word from E[FD..FE].
+    pub fn model(&self) -> Model {
         self.model
+    }
+    /// Device name stored in the image, if `E[03]` announces one.
+    ///
+    /// The name is outside the RF configuration; a malformed name does not
+    /// invalidate the image.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeviceNameError`] if the announced name is malformed.
+    pub fn device_name(&self) -> Result<Option<String>, DeviceNameError> {
+        identity::device_name(&self.bytes)
     }
     /// Snapshot of the original 256 reader configuration bytes.
     pub fn bytes(&self) -> &[u8; 256] {
@@ -1376,7 +1389,7 @@ mod tests {
         e[2] = 1;
         e[253] = 1;
         e[254] = 0x31;
-        assert!(matches!(ConfigImage::parse(e),Ok(c) if c.model()==0x0131));
+        assert!(matches!(ConfigImage::parse(e),Ok(c) if c.model().word()==0x0131));
         e[0x40] = 1;
         assert!(matches!(
             ConfigImage::parse(e),

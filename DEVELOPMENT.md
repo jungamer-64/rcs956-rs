@@ -63,7 +63,7 @@ cargo run --locked -p rcs956-driver --features pcsc --example pcsc_probe -- conn
 
 ## 設定とカードsession
 
-初期化はreset／host ACK、設定bank読取、checksum／model検査、register設定、RF offを順に行う。失敗した初期化を成功状態として公開しない。RF modeはprotocolと適用済みtimerを保持し、protocol変更時には対応する設定imageのtableを適用する。`4A`はFeliCaを212または424 kbps、NFC-A／Bを106 kbpsで1 target検出する。
+初期化はreset／host ACK、設定bank読取、checksum／model検査、register設定、RF offを順に行う。失敗した初期化を成功状態として公開しない。設定imageの`E[FD..FE]`はUSB PIDとは別のmodel wordで、`Model::product`は既知のwordを製品へ対応付ける（`0211`はRC-S330/P、`0212`はRC-S330/S）。`E[03]`のbit 5は、`E[04]`（`72`〜`BA`）の位置に`E[BF]`より前で終わるUSB string descriptor形式の機器名があることを示す。機器名はRF設定に関与しないため、不正な機器名は`ConfigImage::device_name`のエラーとして返し、設定imageは失効させない。RF modeはprotocolと適用済みtimerを保持し、protocol変更時には対応する設定imageのtableを適用する。`4A`はFeliCaを212または424 kbps、NFC-A／Bを106 kbpsで1 target検出する。
 
 NFC-AはUID（4／7／10 bytes）、SAK、optional ATSのTLとinterface byte境界を検査する。`TypeACard::into_raw`は型付き操作の権限を消費して、最大262 bytesの任意commandを許可する。raw交換はfragmentごとにreader statusを保持し、継続中は空の`40 target`による回収だけを許可する。`exchange --type a`は各fragmentを表示する。継続中にhandleを手放した場合や回収が失敗した場合は再初期化が必要。完了したraw交換の後は、新たな選択前にRFを切り、Type 2のセクター選択などのカード状態を解消する。`--type a-apdu`はSAKとATSでISO-DEP activationを確認して継続応答をまとめ、交換に失敗した場合は部分応答を返す。
 
@@ -117,7 +117,7 @@ MIFARE Classicはcallerが指定したkeyでreaderが認証し、成功したsec
 
 固定packet vectorはデバイスに送るフレームと応答の解釈を検証する。実機captureはUSBとRFの観測範囲を別途記録する。
 
-実機検証では、`devices`による対象／service／path、`probe`のfirmware／model／設定checksum、`poll`のidentity／PMm、対象serviceを指定した`read`を別々に記録する。CLI出力はAPIの観測結果であり、USB bus上のZLPやRF timingのcaptureとは区別する。全firmware、PC/SC完全互換、全カードcommand／APDUの意味と副作用の成立は、この検証の対象に含めない。NFC-A／Bの固定vectorはカード実機の成功証拠ではない。
+実機検証では、`devices`による対象／service／path、`probe`のfirmware／model／製品名／機器名／設定checksum、`poll`のidentity／PMm、対象serviceを指定した`read`を別々に記録する。CLI出力はAPIの観測結果であり、USB bus上のZLPやRF timingのcaptureとは区別する。全firmware、PC/SC完全互換、全カードcommand／APDUの意味と副作用の成立は、この検証の対象に含めない。NFC-A／Bの固定vectorはカード実機の成功証拠ではない。
 
 ## 外部実装へ委譲する責務
 

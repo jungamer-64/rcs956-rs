@@ -812,7 +812,7 @@ fn initialization_commits_reset_and_loads_four_distinct_banks() -> Result<(), Bo
     let info = reader.initialize()?;
     assert_eq!(info.firmware, [0x32, 1, 6, 7]);
     assert_eq!(info.flags, 0x1c);
-    assert_eq!(info.configuration.model(), 0x0131);
+    assert_eq!(info.configuration.model().word(), 0x0131);
     assert_eq!(info.configuration.bytes(), &expected);
     assert_eq!(journal.borrow().recoveries, 2);
     assert_eq!(journal.borrow().remaining, 0);

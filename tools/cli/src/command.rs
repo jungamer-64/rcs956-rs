@@ -274,10 +274,18 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
             return type2_emulate(&mut reader, uid, message, timeout);
         }
         let info = reader.initialize()?;
+        let model = info.configuration.model();
+        let product = model
+            .product()
+            .map_or_else(|| "unknown".into(), |p| p.to_string());
+        let name = match info.configuration.device_name() {
+            Ok(Some(name)) => name,
+            Ok(None) => "none".into(),
+            Err(error) => format!("malformed ({error})"),
+        };
         println!(
-            "Firmware: {}\nModel: {:04X}\nReader flags: {:02X}\nConfiguration: 256 bytes; signature/checksums passed",
+            "Firmware: {}\nModel: {model} ({product})\nDevice name: {name}\nReader flags: {:02X}\nConfiguration: 256 bytes; signature/checksums passed",
             hex(&info.firmware),
-            info.configuration.model(),
             info.flags
         );
         let result = if command == "probe" {
