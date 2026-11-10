@@ -81,7 +81,7 @@ APDUの入力と最低frame数を検査してからreader設定を始める。�
 
 MIFARE Classicはcallerが指定したkeyでreaderが認証し、成功したsector内のブロックに限り読取・書込みを許す。ブロック交換失敗でsector handleは失効する。
 
-`ndef-read`と`ndef-write`は、`--type type1`で120-byte静的メモリのType 1、`--type a`でType 2／4A、`--type felica`でsystem 12FCのType 3、`--type b`でType 4Bを扱う。Type 2は必要に応じて物理セクターを切り替え、切替の第2パケットに対するRFタイムアウトをパッシブACKとして扱う。切替が不確定なら再初期化を要求する。Type 4はmapping 2.xのshort APDUで参照できる最初の公開読取可能なNDEF fileに限る。Type 1／2の書込みには初期化済みのNDEF TLVが必要で、置換後のTerminatorより後ろのTLVは参照されない。Type 3は属性ブロックのchecksumと更新中フラグを検査する。
+`ndef-read`と`ndef-write`は、`--type type1`で120-byte静的メモリのType 1、`--type a`でType 2／4A、`--type felica`でsystem 12FCのType 3、`--type b`でType 4Bを扱う。Type 2は必要に応じて物理セクターを切り替え、切替の第2パケットに対するRFタイムアウトをパッシブACKとして扱う。切替が不確定なら再初期化を要求する。Type 4はmapping 2.x／3.xの最初の公開読取可能なNDEF fileを扱う。通常・拡張ファイルの長さを区別し、mapping 3.xではオフセットオブジェクトで最大1 MiBのファイルを扱う。Type 1／2の書込みには初期化済みのNDEF TLVが必要で、置換後のTerminatorより後ろのTLVは参照されない。Type 3は属性ブロックのchecksumと更新中フラグを検査する。
 
 `ndef-write --data HEX`はタグを開く前にNDEFのレコード境界と長さを検査する。空の`--data`はメッセージを消去する。`ndef-read`は格納されたbytesを返す。`ndef-decode HEX`はオフラインでレコードを復元し、type、ID、payloadを表示する。アプリケーション固有のpayloadは各レコードの利用側が解釈する。
 

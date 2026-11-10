@@ -2657,6 +2657,109 @@ fn type_four_ndef_write_checks_access_and_capacity_then_publishes_nlen()
 }
 
 #[test]
+fn type_four_extended_ndef_uses_offset_objects_and_publishes_enlen() -> Result<(), Box<dyn Error>> {
+    fn select_extended() -> [Step; 5] {
+        [
+            command(
+                0x40,
+                &[7, 0, 0xa4, 4, 0, 7, 0xd2, 0x76, 0, 0, 0x85, 1, 1, 0],
+                &[0, 0x90, 0],
+            ),
+            command(0x40, &[7, 0, 0xa4, 0, 0x0c, 2, 0xe1, 3], &[0, 0x90, 0]),
+            command(
+                0x40,
+                &[7, 0, 0xb0, 0, 0, 7],
+                &[0, 0, 17, 0x30, 0, 255, 0, 255, 0x90, 0],
+            ),
+            command(
+                0x40,
+                &[7, 0, 0xb0, 0, 7, 10],
+                &[0, 6, 8, 0xe1, 4, 0, 0x20, 0, 0, 0, 0, 0x90, 0],
+            ),
+            command(0x40, &[7, 0, 0xa4, 0, 0x0c, 2, 0xe1, 4], &[0, 0x90, 0]),
+        ]
+    }
+    let message = vec![0x5a; 0x8000];
+    let mut steps = initialization(&ab_config_image());
+    steps.extend(ab_mode(false));
+    steps.extend([
+        command(0x4a, &[1, 0], &type_a_response(7)),
+        command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
+    ]);
+    steps.extend(select_extended());
+    steps.push(command(
+        0x40,
+        &[7, 0, 0xd6, 0, 0, 4, 0, 0, 0, 0],
+        &[0, 0x90, 0],
+    ));
+    for (index, chunk) in message.chunks(127).enumerate() {
+        let [_, a, b, c] = (4 + index as u32 * 127).to_be_bytes();
+        let mut request = vec![
+            7,
+            0,
+            0xd7,
+            0,
+            0,
+            chunk.len() as u8 + 7,
+            0x54,
+            3,
+            a,
+            b,
+            c,
+            0x53,
+            chunk.len() as u8,
+        ];
+        request.extend_from_slice(chunk);
+        steps.push(command(0x40, &request, &[0, 0x90, 0]));
+    }
+    steps.push(command(
+        0x40,
+        &[7, 0, 0xd6, 0, 0, 4, 0, 0, 0x80, 0],
+        &[0, 0x90, 0],
+    ));
+    steps.extend(select_extended());
+    steps.push(command(
+        0x40,
+        &[7, 0, 0xb0, 0, 0, 4],
+        &[0, 0, 0, 0x80, 0, 0x90, 0],
+    ));
+    for (index, chunk) in message.chunks(127).enumerate() {
+        let [_, a, b, c] = (4 + index as u32 * 127).to_be_bytes();
+        let mut reply = vec![0, 0x53, chunk.len() as u8];
+        reply.extend_from_slice(chunk);
+        reply.extend([0x90, 0]);
+        steps.push(command(
+            0x40,
+            &[7, 0, 0xb1, 0, 0, 5, 0x54, 3, a, b, c, chunk.len() as u8 + 2],
+            &reply,
+        ));
+    }
+    steps.extend(select_extended());
+    steps.push(command(
+        0x40,
+        &[7, 0, 0xb0, 0, 0, 4],
+        &[0, 0, 0x10, 0, 0, 0x90, 0],
+    ));
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut card = reader
+        .poll_type_a(timeout()?)?
+        .ok_or("Type 4A card absent")?;
+    card.write_type4_ndef(&message)?;
+    assert_eq!(card.read_type4_ndef()?, message);
+    assert!(matches!(
+        card.read_type4_ndef(),
+        Err(ndef::Error::Capacity {
+            requested: 1_048_576,
+            available: 1_048_572
+        })
+    ));
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
 fn type_four_rejects_reserved_ndef_file_identifiers_before_selecting_them()
 -> Result<(), Box<dyn Error>> {
     let mut steps = initialization(&ab_config_image());
