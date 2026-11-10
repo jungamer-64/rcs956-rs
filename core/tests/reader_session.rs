@@ -265,6 +265,111 @@ fn poll_response() -> Vec<u8> {
     packet
 }
 
+fn type_three_attribute(block: [u8; 16]) -> Step {
+    let mut reply = vec![0, 29, 7, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 1];
+    reply.extend(block);
+    command(
+        0xa0,
+        &[
+            0xc8, 0, 16, 6, 1, 2, 3, 4, 5, 6, 7, 8, 1, 0x0b, 0, 1, 0x80, 0,
+        ],
+        &reply,
+    )
+}
+
+fn type_three_update(block: u8, data: [u8; 16], status: [u8; 2]) -> Step {
+    let mut request = vec![
+        0xc8, 0, 32, 8, 1, 2, 3, 4, 5, 6, 7, 8, 1, 9, 0, 1, 0x80, block,
+    ];
+    request.extend(data);
+    command(
+        0xa0,
+        &request,
+        &[0, 12, 9, 1, 2, 3, 4, 5, 6, 7, 8, status[0], status[1]],
+    )
+}
+
+#[test]
+fn type_three_ndef_uses_the_ndef_system_and_publishes_length_last() -> Result<(), Box<dyn Error>> {
+    let attribute = [0x10, 1, 1, 0, 2, 0, 0, 0, 0, 0, 1, 0, 0, 3, 0, 0x18];
+    let started = [0x10, 1, 1, 0, 2, 0, 0, 0, 0, 0x0f, 1, 0, 0, 3, 0, 0x27];
+    let published = [0x10, 1, 1, 0, 2, 0, 0, 0, 0, 0, 1, 0, 0, 17, 0, 0x26];
+    let mut old_reply = vec![0, 29, 7, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 1];
+    old_reply.extend([0x32; 16]);
+    let mut last_block = [0; 16];
+    last_block[0] = 0x5a;
+    let mut steps = initialization(&config_image());
+    steps.extend(mode_configuration());
+    steps.extend([
+        command(0x4a, &[1, 1, 0, 0x12, 0xfc, 0, 0], &poll_response()),
+        type_three_attribute(attribute),
+        command(
+            0xa0,
+            &[
+                0xc8, 0, 16, 6, 1, 2, 3, 4, 5, 6, 7, 8, 1, 0x0b, 0, 1, 0x80, 1,
+            ],
+            &old_reply,
+        ),
+        type_three_attribute(attribute),
+        type_three_update(0, started, [0, 0]),
+        type_three_update(1, [0x5a; 16], [0, 0]),
+        type_three_update(2, last_block, [0, 0]),
+        type_three_update(0, published, [0, 0]),
+    ]);
+    let (transport, journal) = Script::new(steps);
+    let mut reader = Reader::new(transport);
+    reader.initialize()?;
+    let mut tag = reader
+        .poll_type3(BitRate::Kbps212, timeout()?)?
+        .ok_or("Type 3 tag absent")?;
+    assert_eq!(tag.read_ndef()?, [0x32; 3]);
+    tag.write_ndef(&[0x5a; 17])?;
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn type_three_ndef_preserves_update_progress_and_detects_the_write_flag()
+-> Result<(), Box<dyn Error>> {
+    let attribute = [0x10, 1, 1, 0, 2, 0, 0, 0, 0, 0, 1, 0, 0, 3, 0, 0x18];
+    let started = [0x10, 1, 1, 0, 2, 0, 0, 0, 0, 0x0f, 1, 0, 0, 3, 0, 0x27];
+    let mut steps = initialization(&config_image());
+    steps.extend(mode_configuration());
+    steps.extend([
+        command(0x4a, &[1, 1, 0, 0x12, 0xfc, 0, 0], &poll_response()),
+        type_three_attribute(attribute),
+        type_three_attribute(attribute),
+        type_three_update(0, started, [0, 0]),
+        type_three_update(1, [0; 16], [0, 0]),
+        type_three_update(2, [0; 16], [1, 0xa2]),
+        type_three_attribute(started),
+    ]);
+    let (transport, journal) = Script::new(steps);
+    let mut reader = Reader::new(transport);
+    reader.initialize()?;
+    let mut tag = reader
+        .poll_type3(BitRate::Kbps212, timeout()?)?
+        .ok_or("Type 3 tag absent")?;
+    assert!(matches!(
+        tag.write_ndef(&[0; 33]),
+        Err(ndef::WriteError::Preparation(ndef::Error::Capacity {
+            requested: 33,
+            available: 32
+        }))
+    ));
+    assert!(matches!(
+        tag.write_ndef(&[0; 17]),
+        Err(ndef::WriteError::Update {
+            stage: ndef::UpdateStage::Data,
+            acknowledged_bytes: 16,
+            ..
+        })
+    ));
+    assert!(matches!(tag.read_ndef(), Err(ndef::Error::WriteInProgress)));
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
 #[test]
 fn felica_424_selects_card_and_exchanges_discovery_and_write_packets() -> Result<(), Box<dyn Error>>
 {
