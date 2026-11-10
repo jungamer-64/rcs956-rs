@@ -107,6 +107,10 @@ MIFARE Classicはcallerが指定したkeyでreaderが認証し、成功したsec
 
 `dep-echo --data HEX`は6-byteの識別子suffixを指定して1要求を反射する。終了時の`finish`はresetと再初期化を行う。起動に失敗した場合は`initialize`で再同期する。
 
+## Type 2 ターゲット
+
+`Reader::listen_type2_ndef`は、08で始まる4-byte UIDと読み取り専用のNDEFを持つ106 kbpsのType 2ターゲットを起動する。`serve_next`はREADに応答し、HALTでセッションを終了する。他のコマンドには応答せず、データも変更しない。応答の結果が不明になった場合はセッションを失効させる。`finish`でreaderをRF-off状態に戻す。
+
 ## 検証境界
 
 固定packet vectorはデバイスに送るフレームと応答の解釈を検証する。実機captureはUSBとRFの観測範囲を別途記録する。

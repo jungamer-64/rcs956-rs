@@ -2,12 +2,16 @@
 
 mod dep;
 mod type1;
+mod type2_target;
 
 pub use dep::{
     DepActivation, DepError, DepInitiator, DepLink, DepMessage, DepMode, DepPeer, DepRate,
     DepRequest, DepTransferCause, MAX_DEP_MESSAGE_BYTES, PassiveDepTarget,
 };
 pub use type1::Type1Tag;
+pub use type2_target::{
+    MAX_TYPE2_EMULATED_NDEF_BYTES, Type2EmulationError, Type2Event, Type2Target,
+};
 
 use crate::{
     felica::{

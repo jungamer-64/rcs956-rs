@@ -9,7 +9,7 @@ use rcs956::{
     reader::{
         ConfigurationError, DepActivation, DepError, DepMode, DepRate, DepTransferCause,
         Error as ReaderError, MAX_DEP_MESSAGE_BYTES, Reader, RfTimeout, TimeoutRange,
-        TypeAExchangeError, TypeBCard, TypeBSelection,
+        Type2EmulationError, Type2Event, TypeAExchangeError, TypeBCard, TypeBSelection,
     },
     transport::{Progress, TransactionError, Transport},
     wire::{self, Direction, Frame},
@@ -2144,6 +2144,60 @@ fn dep_initiator_uses_meta_chaining_and_retains_partial_failure() -> Result<(), 
         Err(DepError::SessionUnavailable)
     ));
     link.finish()?;
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn type_two_target_serves_read_only_ndef_and_halts() -> Result<(), Box<dyn Error>> {
+    let configuration = ab_config_image();
+    let mut steps = initialization(&configuration);
+    let mut activation = [0; 35];
+    activation[..7].copy_from_slice(&[0, 4, 0, 1, 2, 3, 0]);
+    steps.extend([
+        command(8, &[0x03, 0x28, 0x59], &[0]),
+        command(8, &[0x63, 1, 0x3f], &[0]),
+        command(0x8c, &activation, &[0, 0x30, 3]),
+        command(
+            0x90,
+            &[
+                0xe1, 0x10, 6, 0x0f, 3, 4, 0xd5, 0, 1, 0x42, 0xfe, 0, 0, 0, 0, 0,
+            ],
+            &[0],
+        ),
+        command(0x88, &[], &[0, 0xa2, 4, 0, 0, 0, 0]),
+        command(0x88, &[], &[0, 0x30, 15]),
+        command(
+            0x90,
+            &[0, 0, 0, 0, 8, 1, 2, 3, 8, 0, 0, 0, 0, 0, 0xff, 0xff],
+            &[0],
+        ),
+        command(0x88, &[], &[0, 0x50, 0]),
+    ]);
+    steps.extend(initialization(&configuration));
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    assert!(matches!(
+        reader.listen_type2_ndef([1, 2, 3], &[0xd5, 0, 1], timeout()?),
+        Err(Type2EmulationError::Message(_))
+    ));
+    assert!(matches!(
+        reader.listen_type2_ndef([1, 2, 3], &[0; 47], timeout()?),
+        Err(Type2EmulationError::MessageLength(47))
+    ));
+    let mut tag = reader.listen_type2_ndef([1, 2, 3], &[0xd5, 0, 1, 0x42], timeout()?)?;
+    assert_eq!(tag.serve_next(timeout()?)?, Type2Event::Read(3));
+    assert_eq!(
+        tag.serve_next(timeout()?)?,
+        Type2Event::Ignored(vec![0xa2, 4, 0, 0, 0, 0])
+    );
+    assert_eq!(tag.serve_next(timeout()?)?, Type2Event::Read(15));
+    assert_eq!(tag.serve_next(timeout()?)?, Type2Event::Halted);
+    assert!(matches!(
+        tag.serve_next(timeout()?),
+        Err(Type2EmulationError::SessionUnavailable)
+    ));
+    tag.finish()?;
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
 }
