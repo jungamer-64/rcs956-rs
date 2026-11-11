@@ -20,7 +20,7 @@ use crate::{
         self, BitRate, BlockWrite, CardError, PollRequest, PollResponse, ReadResponse, ServiceEntry,
     },
     isodep, nfca, nfcb,
-    transport::{Link, TransactionError, Transport},
+    transport::{Failure, Link, Progress, TransactionError, Transport},
 };
 use alloc::{string::String, vec, vec::Vec};
 use core::{error, fmt, num::NonZeroU8, time::Duration};
@@ -379,7 +379,12 @@ impl<T: Transport> Reader<T> {
         match self.link.command(cc, args, wait) {
             Ok(r) => Ok(r.data),
             Err(e) => {
-                self.state = State::NeedsInitialization;
+                // A rejected, never-sent request leaves reader and card state
+                // unchanged unless the stream itself already requires recovery.
+                if e.progress != Progress::NotSent || matches!(e.failure, Failure::RecoveryRequired)
+                {
+                    self.state = State::NeedsInitialization;
+                }
                 Err(Error::Transaction(e))
             }
         }
