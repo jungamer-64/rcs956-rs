@@ -48,7 +48,9 @@ pub enum Error<E> {
     Configuration(ConfigurationError),
     /// Register write returned an error value.
     RegisterStatus(u8),
-    /// Raw RF status and its command-specific classification.
+    /// Raw RF status and its command-specific classification. A masked `0D`
+    /// requires reader initialization; a masked `0B` is returned only after a
+    /// 10 ms settle wait.
     RfStatus(u8),
     /// FeliCa request validation failed before the command was sent.
     FelicaRequest(CardError),
@@ -658,6 +660,7 @@ impl<T: Transport> Reader<T> {
 
     /// Activate one NFC-B target at 106 kbps. ATQB determines which exchange
     /// authority the result grants. The caller chooses the RF table and AFI.
+    /// `timeout` is the detection wait; ISO-DEP block waits come from ATQB.
     pub fn poll_type_b(
         &mut self,
         options: nfcb::PollOptions,
