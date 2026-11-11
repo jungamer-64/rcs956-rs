@@ -1969,6 +1969,7 @@ fn alternate_type_b_profile_exchanges_a_proprietary_target_command() -> Result<(
         command(0x32, &[0x0c, 0xa1, 0xa2, 0xa3], &[]),
         command(8, &[0x63, 0x0d, 0], &[0]),
         command(0x4a, &[1, 3, 0x12, 1], &response),
+        command(8, &[0x63, 3, 0x8b], &[0]),
         command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
         command(0x40, &[9, 0x42, 0x43], &[0, 0xa5]),
     ]);
@@ -2007,6 +2008,7 @@ fn type_b_frame_response_that_cannot_complete_revokes_the_selection() -> Result<
         steps.extend(ab_mode(true));
         steps.extend([
             command(0x4a, &[1, 3, 0, 1], &response),
+            command(8, &[0x63, 3, 0x8b], &[0]),
             command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
             command(0x40, &[9, 0x42], &reply),
         ]);

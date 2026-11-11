@@ -23,7 +23,7 @@ use crate::{
     transport::{Failure, Link, Progress, TransactionError, Transport},
 };
 use alloc::{string::String, vec, vec::Vec};
-use core::{error, fmt, num::NonZeroU8, time::Duration};
+use core::{error, fmt, mem, num::NonZeroU8, time::Duration};
 
 /// Maximum card-command bytes accepted by the reader's NFC-A exchange.
 pub const MAX_TYPE_A_COMMAND_BYTES: usize = 262;
@@ -677,65 +677,59 @@ impl<T: Transport> Reader<T> {
                         isodep::ParameterError::NadUnsupported,
                     ));
                 }
-                if !observation.supports_iso_dep() {
-                    return Ok(Some(TypeBSelection::Frame(TypeBFrameCard {
-                        target: TypeBTarget {
-                            reader: self,
-                            number: *target,
-                            observation,
-                            profile: options.profile,
-                        },
-                        timeout,
-                    })));
-                }
-                let wait = isodep::block_frame_wait(observation.fwi());
-                let cid = match observation.cid() {
-                    0 => None,
-                    cid => Some(cid),
+                let session = if observation.supports_iso_dep() {
+                    let cid = match observation.cid() {
+                        0 => None,
+                        cid => Some(cid),
+                    };
+                    let session = isodep::Session::new(
+                        observation.frame_size(),
+                        cid,
+                        isodep::block_frame_wait(observation.fwi()),
+                        observation.maximum_command_bytes(),
+                        options.node_address,
+                    )
+                    .map_err(Error::IsoDepParameters)?;
+                    Some(session)
+                } else {
+                    None
                 };
-                let session = isodep::Session::new(
-                    observation.frame_size(),
-                    cid,
-                    wait,
-                    observation.maximum_command_bytes(),
-                    options.node_address,
-                )
-                .map_err(Error::IsoDepParameters)?;
-                let (info, response_timeout) = match &self.state {
-                    State::Ready {
-                        info,
-                        response_timeout,
-                        ..
-                    } => (info.clone(), *response_timeout),
-                    State::NeedsInitialization => return Err(Error::NotInitialized),
+                self.apply_type_b_receiver()?;
+                let target = TypeBTarget {
+                    reader: self,
+                    number: *target,
+                    observation,
+                    profile: options.profile,
                 };
-                // The ordinary driver path configures software block exchange
-                // after activation. Failure must not publish a usable card.
-                self.state = State::NeedsInitialization;
-                self.write_register(0x6303, 0x8b)?;
-                // Re-establish the fully applied mode only after the write.
-                // The existing snapshot remains authoritative across this write.
-                self.state = State::Ready {
-                    info,
-                    rf: RfMode::Configured {
-                        protocol,
-                        timer: ReaderTimer::for_rf_timeout(timeout),
-                        selection: RfSelection::Ordinary,
-                    },
-                    response_timeout,
-                };
-                Ok(Some(TypeBSelection::IsoDep(TypeBCard {
-                    target: TypeBTarget {
-                        reader: self,
-                        number: *target,
-                        observation,
-                        profile: options.profile,
-                    },
-                    session,
-                })))
+                Ok(Some(match session {
+                    Some(session) => TypeBSelection::IsoDep(TypeBCard { target, session }),
+                    None => TypeBSelection::Frame(TypeBFrameCard { target, timeout }),
+                }))
             }
             _ => Err(Error::Response("NFC-B target count/layout")),
         }
+    }
+
+    /// Write the NFC-B receiver register (`63 03 = 8B`) that every activated
+    /// Type B selection exchanges under. A selection handle exists only after
+    /// this write succeeds; failure leaves the reader requiring initialization.
+    /// Other protocols do not restore the register.
+    fn apply_type_b_receiver(&mut self) -> Result<(), Error<T::Error>> {
+        let State::Ready {
+            info,
+            rf,
+            response_timeout,
+        } = mem::replace(&mut self.state, State::NeedsInitialization)
+        else {
+            return Err(Error::NotInitialized);
+        };
+        self.write_register(0x6303, 0x8b)?;
+        self.state = State::Ready {
+            info,
+            rf,
+            response_timeout,
+        };
+        Ok(())
     }
 
     fn exchange_rf(
