@@ -27,8 +27,11 @@ use core::{error, fmt, num::NonZeroU8, time::Duration};
 
 /// Maximum card-command bytes accepted by the reader's NFC-A exchange.
 pub const MAX_TYPE_A_COMMAND_BYTES: usize = 262;
+/// Maximum card-command bytes accepted by the reader's NFC-B `40` exchange.
+pub const MAX_TYPE_B_FRAME_COMMAND_BYTES: usize = 63;
 const MAX_TYPE_A_RESPONSE_FRAGMENTS: usize = 256;
-const TYPE_A_MORE_INFORMATION: u8 = 0x40;
+/// `40` reader status bit announcing a further response fragment.
+const TARGET_MORE_INFORMATION: u8 = 0x40;
 
 /// Failures of reader initialization, RF configuration, or card exchange.
 #[derive(Debug)]
@@ -795,45 +798,45 @@ impl<T: Transport> Reader<T> {
         Ok(TargetResponse { status, data })
     }
 
-    fn prepare_type_a_exchange(
+    fn prepare_target_exchange(
         &mut self,
+        protocol: RfProtocol,
         timeout: ResponseTimeout,
-    ) -> Result<(), TypeAExchangeError<T::Error>> {
+    ) -> Result<(), TargetExchangeError<T::Error>> {
         if !matches!(
             self.state,
             State::Ready {
-                rf: RfMode::Configured {
-                    protocol: RfProtocol::TypeA,
-                    ..
-                },
+                rf: RfMode::Configured { protocol: applied, .. },
                 ..
-            }
+            } if applied == protocol
         ) {
-            return Err(TypeAExchangeError::SessionInvalid);
+            return Err(TargetExchangeError::SessionInvalid);
         }
-        self.prepare_exchange_timing(RfProtocol::TypeA, timeout)
-            .map_err(TypeAExchangeError::Preparation)
+        self.prepare_exchange_timing(protocol, timeout)
+            .map_err(TargetExchangeError::Preparation)
     }
 
-    fn exchange_type_a_single_response(
+    /// Exchange one `40` command whose response is a single fragment.
+    fn exchange_single_response(
         &mut self,
+        protocol: RfProtocol,
         target: u8,
         data: &[u8],
         timeout: ResponseTimeout,
-    ) -> Result<TargetResponse, TypeAExchangeError<T::Error>> {
-        self.prepare_type_a_exchange(timeout)?;
+    ) -> Result<TargetResponse, TargetExchangeError<T::Error>> {
+        self.prepare_target_exchange(protocol, timeout)?;
         let response = self.exchange_target(target, data, timeout);
         // These commands cannot collect a pending fragment. A missing status
         // also leaves the continuation state unknown.
         if match &response {
-            Ok(reply) => reply.status & TYPE_A_MORE_INFORMATION != 0,
-            Err(Error::RfStatus(status)) => status & TYPE_A_MORE_INFORMATION != 0,
+            Ok(reply) => reply.status & TARGET_MORE_INFORMATION != 0,
+            Err(Error::RfStatus(status)) => status & TARGET_MORE_INFORMATION != 0,
             Err(Error::Response(_)) => true,
             Err(_) => false,
         } {
             self.state = State::NeedsInitialization;
         }
-        response.map_err(TypeAExchangeError::Exchange)
+        response.map_err(TargetExchangeError::Exchange)
     }
 
     fn disable_rf(&mut self) -> Result<(), Error<T::Error>> {
@@ -883,16 +886,23 @@ pub struct TargetResponse {
     pub data: Vec<u8>,
 }
 
-/// Failure of one NFC-A card command, classified by its application effect.
+/// Failure of one card command sent through the reader's `40` target
+/// exchange, classified by its application effect.
 #[derive(Debug)]
-pub enum TypeAExchangeError<E> {
-    /// The supplied byte count is outside `1..=MAX_TYPE_A_COMMAND_BYTES`.
-    InputLength(usize),
+pub enum TargetExchangeError<E> {
+    /// The supplied byte count is outside `1..=maximum` for the selection.
+    /// Nothing was sent and the selection remains usable.
+    InputLength {
+        /// Largest command the selection admits.
+        maximum: usize,
+        /// Supplied bytes.
+        actual: usize,
+    },
     /// The selection has already lost its operation authority.
     SessionInvalid,
-    /// A raw exchange has a response fragment waiting to be collected.
+    /// A raw NFC-A exchange has a response fragment waiting to be collected.
     ResponsePending,
-    /// The raw response exceeded the fragment budget. Reinitialize the reader.
+    /// The raw NFC-A response exceeded the fragment budget. Reinitialize the reader.
     FragmentLimit,
     /// Reader timing setup failed before any card command was sent.
     Preparation(Error<E>),
@@ -901,29 +911,28 @@ pub enum TypeAExchangeError<E> {
     Exchange(Error<E>),
 }
 
-impl<E: fmt::Debug> fmt::Display for TypeAExchangeError<E> {
+impl<E: fmt::Debug> fmt::Display for TargetExchangeError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InputLength(length) => write!(
-                f,
-                "NFC-A command of {length} bytes is outside 1..={MAX_TYPE_A_COMMAND_BYTES}"
-            ),
-            Self::SessionInvalid => f.write_str("NFC-A selection is no longer valid"),
+            Self::InputLength { maximum, actual } => {
+                write!(f, "card command of {actual} bytes is outside 1..={maximum}")
+            }
+            Self::SessionInvalid => f.write_str("card selection is no longer valid"),
             Self::ResponsePending => f.write_str("an NFC-A response fragment is pending"),
             Self::FragmentLimit => f.write_str("NFC-A response fragment limit exceeded"),
             Self::Preparation(_) => f.write_str("reader setup failed before the card command"),
             Self::Exchange(_) => {
-                f.write_str("NFC-A exchange failed; the command may have taken effect")
+                f.write_str("card exchange failed; the command may have taken effect")
             }
         }
     }
 }
 
-impl<E: error::Error + 'static> error::Error for TypeAExchangeError<E> {
+impl<E: error::Error + 'static> error::Error for TargetExchangeError<E> {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
             Self::Preparation(error) | Self::Exchange(error) => Some(error),
-            Self::InputLength(_)
+            Self::InputLength { .. }
             | Self::SessionInvalid
             | Self::ResponsePending
             | Self::FragmentLimit => None,
@@ -1005,13 +1014,11 @@ impl<'a, T: Transport> TypeACard<'a, T> {
     pub(crate) fn exchange(
         &mut self,
         data: &[u8],
-    ) -> Result<TargetResponse, TypeAExchangeError<T::Error>> {
-        if data.is_empty() || data.len() > MAX_TYPE_A_COMMAND_BYTES {
-            return Err(TypeAExchangeError::InputLength(data.len()));
-        }
+    ) -> Result<TargetResponse, TargetExchangeError<T::Error>> {
+        admit_command(data, MAX_TYPE_A_COMMAND_BYTES)?;
         let timeout = ResponseTimeout::for_request(self.timeout);
         self.reader
-            .exchange_type_a_single_response(self.target, data, timeout)
+            .exchange_single_response(RfProtocol::TypeA, self.target, data, timeout)
     }
 
     /// Exchange one ISO-DEP APDU and collect reader-reported continuation
@@ -1036,9 +1043,12 @@ impl<'a, T: Transport> TypeACard<'a, T> {
                 });
             }
             let timeout = ResponseTimeout::for_request(self.timeout);
-            match self.reader.prepare_type_a_exchange(timeout) {
+            match self
+                .reader
+                .prepare_target_exchange(RfProtocol::TypeA, timeout)
+            {
                 Ok(()) => {}
-                Err(TypeAExchangeError::Preparation(error)) => {
+                Err(TargetExchangeError::Preparation(error)) => {
                     return Err(isodep::Cause::Preparation(error));
                 }
                 Err(_) => return Err(isodep::Cause::SessionInvalid),
@@ -1061,7 +1071,7 @@ impl<'a, T: Transport> TypeACard<'a, T> {
                 }
                 output.extend_from_slice(&response.data);
                 progress.received_application_bytes = output.len();
-                if response.status & TYPE_A_MORE_INFORMATION == 0 {
+                if response.status & TARGET_MORE_INFORMATION == 0 {
                     return Ok(());
                 }
                 if progress.frames == MAX_TYPE_A_RESPONSE_FRAGMENTS {
@@ -1109,22 +1119,22 @@ impl<T: Transport> RawTypeACard<'_, T> {
     pub fn exchange(
         &mut self,
         data: &[u8],
-    ) -> Result<TargetResponse, TypeAExchangeError<T::Error>> {
-        if data.is_empty() || data.len() > MAX_TYPE_A_COMMAND_BYTES {
-            return Err(TypeAExchangeError::InputLength(data.len()));
-        }
+    ) -> Result<TargetResponse, TargetExchangeError<T::Error>> {
+        admit_command(data, MAX_TYPE_A_COMMAND_BYTES)?;
         match self.reader.state {
             State::Ready {
                 rf: RfMode::RawTypeA(RawTypeAResponse::Pending { .. }),
                 ..
             } => {
-                return Err(TypeAExchangeError::ResponsePending);
+                return Err(TargetExchangeError::ResponsePending);
             }
             State::Ready {
                 rf: RfMode::RawTypeA(RawTypeAResponse::Idle),
                 ..
             } => {}
-            _ => self.reader.prepare_type_a_exchange(self.timeout)?,
+            _ => self
+                .reader
+                .prepare_target_exchange(RfProtocol::TypeA, self.timeout)?,
         }
         // Record loss of typed selection before the first raw transfer. This
         // survives release of the handle and errors that leave the link usable.
@@ -1137,18 +1147,18 @@ impl<T: Transport> RawTypeACard<'_, T> {
     /// return up to 256 fragments. Continuation failure requires reinitialization.
     pub fn receive_continuation(
         &mut self,
-    ) -> Result<Option<TargetResponse>, TypeAExchangeError<T::Error>> {
+    ) -> Result<Option<TargetResponse>, TargetExchangeError<T::Error>> {
         let frames = match self.reader.state {
             State::Ready {
                 rf: RfMode::RawTypeA(RawTypeAResponse::Pending { frames }),
                 ..
             } => frames,
             State::Ready { .. } => return Ok(None),
-            State::NeedsInitialization => return Err(TypeAExchangeError::SessionInvalid),
+            State::NeedsInitialization => return Err(TargetExchangeError::SessionInvalid),
         };
         if frames == MAX_TYPE_A_RESPONSE_FRAGMENTS {
             self.reader.state = State::NeedsInitialization;
-            return Err(TypeAExchangeError::FragmentLimit);
+            return Err(TargetExchangeError::FragmentLimit);
         }
         self.transfer(&[], frames + 1).map(Some)
     }
@@ -1163,11 +1173,11 @@ impl<T: Transport> RawTypeACard<'_, T> {
         &mut self,
         data: &[u8],
         frames: usize,
-    ) -> Result<TargetResponse, TypeAExchangeError<T::Error>> {
+    ) -> Result<TargetResponse, TargetExchangeError<T::Error>> {
         let result = self.reader.exchange_target(self.target, data, self.timeout);
         match &result {
             Ok(response) => {
-                let next = if response.status & TYPE_A_MORE_INFORMATION != 0 {
+                let next = if response.status & TARGET_MORE_INFORMATION != 0 {
                     RawTypeAResponse::Pending { frames }
                 } else {
                     RawTypeAResponse::Idle
@@ -1175,10 +1185,10 @@ impl<T: Transport> RawTypeACard<'_, T> {
                 self.set_response(next);
             }
             Err(Error::RfStatus(status))
-                if frames == 1 && status & TYPE_A_MORE_INFORMATION == 0 => {}
+                if frames == 1 && status & TARGET_MORE_INFORMATION == 0 => {}
             Err(_) => self.reader.state = State::NeedsInitialization,
         }
-        result.map_err(TypeAExchangeError::Exchange)
+        result.map_err(TargetExchangeError::Exchange)
     }
 }
 
@@ -1294,24 +1304,34 @@ pub struct TypeBFrameCard<'a, T: Transport> {
 }
 
 impl<T: Transport> TypeBFrameCard<'_, T> {
-    /// Send one target command through `40`. The reader's Type B command
-    /// limit is 63 bytes. Card-specific command semantics belong to the caller.
-    pub fn exchange(&mut self, data: &[u8]) -> Result<TargetResponse, Error<T::Error>> {
-        if !(1..=63).contains(&data.len()) {
-            return Err(Error::InputLength {
-                maximum: 63,
-                actual: data.len(),
-            });
-        }
+    /// Send one target command through `40` and return its single response
+    /// fragment. The reader's Type B command limit is
+    /// [`MAX_TYPE_B_FRAME_COMMAND_BYTES`]. Card-specific command semantics
+    /// belong to the caller. A response announcing a further fragment, or
+    /// lacking its reader status, cannot be collected through this handle and
+    /// invalidates the selection.
+    pub fn exchange(
+        &mut self,
+        data: &[u8],
+    ) -> Result<TargetResponse, TargetExchangeError<T::Error>> {
+        admit_command(data, MAX_TYPE_B_FRAME_COMMAND_BYTES)?;
         let protocol = RfProtocol::TypeB(self.target.profile);
         let timeout = ResponseTimeout::for_request(self.timeout);
         self.target
             .reader
-            .prepare_exchange_timing(protocol, timeout)?;
-        self.target
-            .reader
-            .exchange_target(self.target.number, data, timeout)
+            .exchange_single_response(protocol, self.target.number, data, timeout)
     }
+}
+
+/// Reject an empty or oversized card command before any reader setup.
+fn admit_command<E>(data: &[u8], maximum: usize) -> Result<(), TargetExchangeError<E>> {
+    if data.is_empty() || data.len() > maximum {
+        return Err(TargetExchangeError::InputLength {
+            maximum,
+            actual: data.len(),
+        });
+    }
+    Ok(())
 }
 
 /// Selected card identity whose operation authority is tied to one reader borrow.

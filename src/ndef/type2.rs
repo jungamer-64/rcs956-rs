@@ -1,16 +1,16 @@
 use super::{Error, UpdateStage, WriteError, control_range};
 use crate::{
-    reader::{self, TypeACard, TypeAExchangeError},
+    reader::{self, TargetExchangeError, TypeACard},
     transport::Transport,
 };
 use alloc::{collections::BTreeMap, vec::Vec};
 use core::ops::Range;
 
 /// Failure while replacing a Type 2 message over NFC-A.
-pub type Type2WriteError<E> = WriteError<TypeAExchangeError<E>>;
+pub type Type2WriteError<E> = WriteError<TargetExchangeError<E>>;
 
 /// Failure while retrieving a Type 2 message over NFC-A.
-pub type Type2Error<E> = Error<TypeAExchangeError<E>>;
+pub type Type2Error<E> = Error<TargetExchangeError<E>>;
 
 impl<T: Transport> TypeACard<'_, T> {
     /// Read the NDEF message across the tag's Type 2 memory sectors.
@@ -343,7 +343,7 @@ fn select_sector<T: Transport>(
         // The second packet succeeds with a passive ACK. Only a reader RF
         // timeout demonstrates silence; a lost USB response leaves it unknown.
         match card.exchange(&[sector, 0, 0, 0]) {
-            Err(TypeAExchangeError::Exchange(reader::Error::RfStatus(1))) => Ok(()),
+            Err(TargetExchangeError::Exchange(reader::Error::RfStatus(1))) => Ok(()),
             Ok(reply) if reply.status == 0 => match reply.data.as_slice() {
                 [nak @ (0 | 1 | 4 | 5)] => Err(Error::Type2Nak(*nak)),
                 _ => Err(Error::Layout("Type 2 SECTOR SELECT second response")),

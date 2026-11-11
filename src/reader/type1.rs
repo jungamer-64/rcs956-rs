@@ -1,4 +1,4 @@
-use super::{Error, Reader, ResponseTimeout, RfProtocol, RfTimeout, TypeAExchangeError};
+use super::{Error, Reader, ResponseTimeout, RfProtocol, RfTimeout, TargetExchangeError};
 use crate::transport::Transport;
 use alloc::vec::Vec;
 
@@ -21,12 +21,12 @@ impl<T: Transport> Reader<T> {
     pub fn poll_type1(
         &mut self,
         timeout: RfTimeout,
-    ) -> Result<Option<Type1Tag<'_, T>>, TypeAExchangeError<T::Error>> {
+    ) -> Result<Option<Type1Tag<'_, T>>, TargetExchangeError<T::Error>> {
         self.configure_rf(RfProtocol::TypeA, timeout)
-            .map_err(TypeAExchangeError::Preparation)?;
+            .map_err(TargetExchangeError::Preparation)?;
         let selection = self
             .command(0x4a, &[1, 4], timeout.host_wait())
-            .map_err(TypeAExchangeError::Exchange)?;
+            .map_err(TargetExchangeError::Exchange)?;
         let target = match selection.as_slice() {
             [0] => return Ok(None),
             [1, target, _, _, _, _, _, _] if *target != 0 => *target,
@@ -58,7 +58,7 @@ impl<T: Transport> Type1Tag<'_, T> {
         self.header_rom
     }
 
-    pub(crate) fn read_static(&mut self) -> Result<[u8; 120], TypeAExchangeError<T::Error>> {
+    pub(crate) fn read_static(&mut self) -> Result<[u8; 120], TargetExchangeError<T::Error>> {
         let reply = self.command(0, 0, 0)?;
         let [hr0, _, memory @ ..] = reply.as_slice() else {
             return Err(response_error("Type 1 RALL layout"));
@@ -75,7 +75,7 @@ impl<T: Transport> Type1Tag<'_, T> {
         &mut self,
         address: u8,
         value: u8,
-    ) -> Result<(), TypeAExchangeError<T::Error>> {
+    ) -> Result<(), TargetExchangeError<T::Error>> {
         let reply = self.command(0x53, address, value)?;
         if reply != [address, value] {
             return Err(response_error("Type 1 WRITE-E echo"));
@@ -88,7 +88,7 @@ impl<T: Transport> Type1Tag<'_, T> {
         code: u8,
         address: u8,
         data: u8,
-    ) -> Result<Vec<u8>, TypeAExchangeError<T::Error>> {
+    ) -> Result<Vec<u8>, TargetExchangeError<T::Error>> {
         let [a, b, c, d] = self.uid;
         type1_exchange(
             self.reader,
@@ -104,16 +104,16 @@ fn type1_exchange<T: Transport>(
     target: u8,
     timeout: ResponseTimeout,
     command: &[u8],
-) -> Result<Vec<u8>, TypeAExchangeError<T::Error>> {
-    let response = reader.exchange_type_a_single_response(target, command, timeout)?;
+) -> Result<Vec<u8>, TargetExchangeError<T::Error>> {
+    let response = reader.exchange_single_response(RfProtocol::TypeA, target, command, timeout)?;
     if response.status != 0 {
-        return Err(TypeAExchangeError::Exchange(Error::RfStatus(
+        return Err(TargetExchangeError::Exchange(Error::RfStatus(
             response.status,
         )));
     }
     Ok(response.data)
 }
 
-fn response_error<E>(reason: &'static str) -> TypeAExchangeError<E> {
-    TypeAExchangeError::Exchange(Error::Response(reason))
+fn response_error<E>(reason: &'static str) -> TargetExchangeError<E> {
+    TargetExchangeError::Exchange(Error::Response(reason))
 }

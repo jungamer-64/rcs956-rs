@@ -8,8 +8,8 @@ use rcs956::{
     nfcb::{PollOptions, RfProfile},
     reader::{
         ConfigurationError, DepActivation, DepError, DepMode, DepRate, DepTransferCause,
-        Error as ReaderError, MAX_DEP_MESSAGE_BYTES, Reader, RfTimeout, TimeoutRange,
-        Type2EmulationError, Type2Event, TypeAExchangeError, TypeBCard, TypeBSelection,
+        Error as ReaderError, MAX_DEP_MESSAGE_BYTES, Reader, RfTimeout, TargetExchangeError,
+        TimeoutRange, Type2EmulationError, Type2Event, TypeBCard, TypeBSelection,
     },
     transport::{Progress, TransactionError, Transport},
     wire::{self, Direction, Frame},
@@ -1324,7 +1324,10 @@ fn raw_type_a_recovers_pending_fragments_before_sending_another_command()
     let before = journal.borrow().requests.len();
     assert!(matches!(
         card.exchange(&vec![0; 263]),
-        Err(TypeAExchangeError::InputLength(263))
+        Err(TargetExchangeError::InputLength {
+            maximum: 262,
+            actual: 263
+        })
     ));
     assert!(card.receive_continuation()?.is_none());
     assert_eq!(journal.borrow().requests.len(), before);
@@ -1334,7 +1337,7 @@ fn raw_type_a_recovers_pending_fragments_before_sending_another_command()
     let before = journal.borrow().requests.len();
     assert!(matches!(
         card.exchange(&[0x30, 0]),
-        Err(TypeAExchangeError::ResponsePending)
+        Err(TargetExchangeError::ResponsePending)
     ));
     assert_eq!(journal.borrow().requests.len(), before);
     let reply = card
@@ -1344,7 +1347,7 @@ fn raw_type_a_recovers_pending_fragments_before_sending_another_command()
     assert_eq!(reply.data, [0x11]);
     assert!(matches!(
         card.exchange(&[0x30, 0]),
-        Err(TypeAExchangeError::ResponsePending)
+        Err(TargetExchangeError::ResponsePending)
     ));
     let reply = card
         .receive_continuation()?
@@ -1354,12 +1357,12 @@ fn raw_type_a_recovers_pending_fragments_before_sending_another_command()
     assert!(card.receive_continuation()?.is_none());
     assert!(matches!(
         card.exchange(&[0x30, 0]),
-        Err(TypeAExchangeError::Exchange(ReaderError::RfStatus(0x0d)))
+        Err(TargetExchangeError::Exchange(ReaderError::RfStatus(0x0d)))
     ));
     let before = journal.borrow().requests.len();
     assert!(matches!(
         card.exchange(&[0x30, 0]),
-        Err(TypeAExchangeError::SessionInvalid)
+        Err(TargetExchangeError::SessionInvalid)
     ));
     assert_eq!(journal.borrow().requests.len(), before);
     assert_eq!(journal.borrow().remaining, 0);
@@ -1394,11 +1397,11 @@ fn incomplete_raw_type_a_response_requires_reader_recovery() -> Result<(), Box<d
             if read_continuation {
                 assert!(matches!(
                     card.receive_continuation(),
-                    Err(TypeAExchangeError::Exchange(ReaderError::RfStatus(1)))
+                    Err(TargetExchangeError::Exchange(ReaderError::RfStatus(1)))
                 ));
                 assert!(matches!(
                     card.exchange(&[0xa4]),
-                    Err(TypeAExchangeError::SessionInvalid)
+                    Err(TargetExchangeError::SessionInvalid)
                 ));
             }
         }
@@ -1444,11 +1447,11 @@ fn raw_type_a_stops_collecting_at_the_fragment_limit() -> Result<(), Box<dyn Err
     }
     assert!(matches!(
         raw.receive_continuation(),
-        Err(TypeAExchangeError::FragmentLimit)
+        Err(TargetExchangeError::FragmentLimit)
     ));
     assert!(matches!(
         raw.exchange(&[0xa4]),
-        Err(TypeAExchangeError::SessionInvalid)
+        Err(TargetExchangeError::SessionInvalid)
     ));
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
@@ -1982,13 +1985,53 @@ fn alternate_type_b_profile_exchanges_a_proprietary_target_command() -> Result<(
     };
     assert!(matches!(
         card.exchange(&[0; 64]),
-        Err(ReaderError::InputLength {
+        Err(TargetExchangeError::InputLength {
             maximum: 63,
             actual: 64
         })
     ));
     assert_eq!(card.exchange(&[0x42, 0x43])?.data, [0xa5]);
     assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn type_b_frame_response_that_cannot_complete_revokes_the_selection() -> Result<(), Box<dyn Error>>
+{
+    let mut response = type_b_response();
+    response[12] = 0x50; // ATQB protocol type 0, FSCI5.
+    // A further fragment and an absent status both leave the reader's
+    // continuation state unknown.
+    for reply in [vec![0x40, 0xa5], vec![]] {
+        let mut steps = initialization(&ab_config_image());
+        steps.extend(ab_mode(true));
+        steps.extend([
+            command(0x4a, &[1, 3, 0, 1], &response),
+            command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
+            command(0x40, &[9, 0x42], &reply),
+        ]);
+        let (script, journal) = Script::new(steps);
+        let mut reader = Reader::new(script);
+        reader.initialize()?;
+        let Some(TypeBSelection::Frame(mut card)) =
+            reader.poll_type_b(PollOptions::default(), timeout()?)?
+        else {
+            return Err("expected a frame selection".into());
+        };
+        let first = card.exchange(&[0x42]);
+        assert!(match reply.as_slice() {
+            [0x40, ..] => matches!(first, Ok(ref r) if r.status == 0x40),
+            _ => matches!(
+                first,
+                Err(TargetExchangeError::Exchange(ReaderError::Response(_)))
+            ),
+        });
+        assert!(matches!(
+            card.exchange(&[0x43]),
+            Err(TargetExchangeError::SessionInvalid)
+        ));
+        assert_eq!(journal.borrow().remaining, 0);
+    }
     Ok(())
 }
 
@@ -2067,7 +2110,7 @@ fn mifare_classic_authority_is_limited_to_the_authenticated_sector() -> Result<(
     assert_eq!(sector.read_block(143)?, [0x44; 16]);
     assert!(matches!(
         sector.write_block(130, &[0x5a; 16]),
-        Err(mifare::Error::Exchange(TypeAExchangeError::Exchange(
+        Err(mifare::Error::Exchange(TargetExchangeError::Exchange(
             ReaderError::RfStatus(0x0b)
         )))
     ));
@@ -2160,13 +2203,13 @@ fn type_one_pending_fragment_requires_reinitialization() -> Result<(), Box<dyn E
             let mut tag = reader.poll_type1(timeout()?)?.ok_or("Type 1 tag absent")?;
             assert!(matches!(
                 tag.read_ndef(),
-                Err(ndef::Error::Exchange(TypeAExchangeError::Exchange(
+                Err(ndef::Error::Exchange(TargetExchangeError::Exchange(
                     ReaderError::RfStatus(actual)
                 ))) if actual == status
             ));
             assert!(matches!(
                 tag.read_ndef(),
-                Err(ndef::Error::Exchange(TypeAExchangeError::SessionInvalid))
+                Err(ndef::Error::Exchange(TargetExchangeError::SessionInvalid))
             ));
         }
         assert!(matches!(
@@ -2483,7 +2526,7 @@ fn type_two_ndef_revokes_selection_on_sector_select_nak() -> Result<(), Box<dyn 
     ));
     assert!(matches!(
         card.read_type2_ndef(),
-        Err(ndef::Error::Exchange(TypeAExchangeError::SessionInvalid))
+        Err(ndef::Error::Exchange(TargetExchangeError::SessionInvalid))
     ));
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
@@ -2606,7 +2649,7 @@ fn typed_type_two_read_reselects_after_raw_sector_change() -> Result<(), Box<dyn
         raw.exchange(&[0xc2, 0xff])?;
         assert!(matches!(
             raw.exchange(&[1, 0, 0, 0]),
-            Err(TypeAExchangeError::Exchange(ReaderError::RfStatus(1)))
+            Err(TargetExchangeError::Exchange(ReaderError::RfStatus(1)))
         ));
     }
     let mut card = reader
@@ -3027,8 +3070,8 @@ fn type_a_failures_distinguish_timing_setup_from_card_exchange() -> Result<(), B
             .into_raw();
         let result = card.exchange(&[0xa4]);
         let error = match result {
-            Err(TypeAExchangeError::Exchange(error)) if lost_command == 0x40 => error,
-            Err(TypeAExchangeError::Preparation(error)) if lost_command != 0x40 => error,
+            Err(TargetExchangeError::Exchange(error)) if lost_command == 0x40 => error,
+            Err(TargetExchangeError::Preparation(error)) if lost_command != 0x40 => error,
             other => {
                 return Err(
                     format!("unexpected error phase for {lost_command:02x}: {other:?}").into(),
@@ -3046,7 +3089,7 @@ fn type_a_failures_distinguish_timing_setup_from_card_exchange() -> Result<(), B
         let count = journal.borrow().requests.len();
         assert!(matches!(
             card.exchange(&[0xa4]),
-            Err(TypeAExchangeError::SessionInvalid)
+            Err(TargetExchangeError::SessionInvalid)
         ));
         assert_eq!(journal.borrow().requests.len(), count);
         assert_eq!(journal.borrow().remaining, 0);

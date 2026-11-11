@@ -1,7 +1,7 @@
 //! MIFARE Classic block access over the reader's target command interface.
 
 use crate::{
-    reader::{TypeACard, TypeAExchangeError},
+    reader::{TargetExchangeError, TypeACard},
     transport::Transport,
 };
 use core::{fmt, ops::RangeInclusive};
@@ -32,7 +32,7 @@ pub enum Error<E> {
         length: usize,
     },
     /// Failure at the reader command boundary.
-    Exchange(TypeAExchangeError<E>),
+    Exchange(TargetExchangeError<E>),
 }
 
 impl<E: fmt::Debug> fmt::Display for Error<E> {

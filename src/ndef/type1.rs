@@ -1,15 +1,15 @@
 use super::{Error, UpdateStage, WriteError, control_range};
 use crate::{
-    reader::{Type1Tag, TypeAExchangeError},
+    reader::{TargetExchangeError, Type1Tag},
     transport::Transport,
 };
 use alloc::vec::Vec;
 
 /// Failure while retrieving an NDEF message from a Type 1 tag.
-pub type Type1Error<E> = Error<TypeAExchangeError<E>>;
+pub type Type1Error<E> = Error<TargetExchangeError<E>>;
 
 /// Failure while replacing an NDEF message on a Type 1 tag.
-pub type Type1WriteError<E> = WriteError<TypeAExchangeError<E>>;
+pub type Type1WriteError<E> = WriteError<TargetExchangeError<E>>;
 
 impl<T: Transport> Type1Tag<'_, T> {
     /// Read the first NDEF TLV on a legacy Type 1 tag with 120 bytes of
