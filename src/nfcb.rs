@@ -49,8 +49,6 @@ pub enum Error {
     MissingAttrib,
     /// FSCI lies outside the supported standard-frame range `0..=8`.
     FrameSizeIndex(u8),
-    /// RC-S956's optional activation extension has an unsupported reader FSDI.
-    ReaderFrameSizeIndex(u8),
     /// FWI contains the reserved value 15.
     FrameWaitIndex(u8),
     /// ATTRIB assigns reserved CID 15.
@@ -70,7 +68,6 @@ impl fmt::Display for Error {
             Self::AtqbResponseCode(code) => write!(f, "ATQB response code {code:02X}, expected 50"),
             Self::MissingAttrib => f.write_str("card returned no ATTRIB response"),
             Self::FrameSizeIndex(index) => write!(f, "unsupported FSCI {index}"),
-            Self::ReaderFrameSizeIndex(index) => write!(f, "unsupported reader FSDI {index}"),
             Self::FrameWaitIndex(index) => write!(f, "reserved FWI {index}"),
             Self::ReservedCid => f.write_str("ATTRIB assigned reserved CID 15"),
             Self::UnsupportedCid(cid) => {
@@ -90,7 +87,6 @@ pub struct Observation {
     atqb: [u8; 12],
     attrib: Vec<u8>,
     frame_size: u16,
-    reader_frame_size: u16,
 }
 impl Observation {
     /// Parse ATQB, the reader's length byte, and its exact ATTRIB response tail.
@@ -120,11 +116,6 @@ impl Observation {
         }
         let fsci = data[10] >> 4;
         let frame_size = crate::isodep::frame_size(fsci).ok_or(Error::FrameSizeIndex(fsci))?;
-        // The RC-S956 extended activation tail encodes reader FSDI in the
-        // second ATTRIB byte; absent that extension, the driver uses FSDI5.
-        let reader_fsdi = data.get(14).copied().unwrap_or(5) & 0x0f;
-        let reader_frame_size = crate::isodep::frame_size(reader_fsdi)
-            .ok_or(Error::ReaderFrameSizeIndex(reader_fsdi))?;
         let fwi = data[11] >> 4;
         if fwi == 15 {
             return Err(Error::FrameWaitIndex(fwi));
@@ -142,7 +133,6 @@ impl Observation {
             atqb,
             attrib: data[13..].to_vec(),
             frame_size,
-            reader_frame_size,
         })
     }
     /// Original 12-byte ATQB without CRC.
@@ -161,13 +151,16 @@ impl Observation {
     pub fn protocol_info(&self) -> [u8; 3] {
         [self.atqb[9], self.atqb[10], self.atqb[11]]
     }
-    /// Reader-returned ATTRIB tail, including MBLI/CID and any reader extension.
+    /// ATTRIB response: the MBLI/CID byte followed by the card's optional
+    /// higher-layer response, which is preserved without interpretation.
     pub fn attrib_response(&self) -> &[u8] {
         &self.attrib
     }
-    /// ATQB advertises protocol type1, the ISO-DEP block protocol.
+    /// Protocol_Type bit b1 advertises the ISO-DEP block protocol. Bits b3-b2
+    /// carry the card's minimum TR2 and do not affect the protocol; a set b4
+    /// is outside this profile and is not treated as ISO-DEP.
     pub fn supports_iso_dep(&self) -> bool {
-        self.atqb[10] & 0x0f == 1
+        self.atqb[10] & 0x09 == 0x01
     }
     /// Maximum card frame size including protocol overhead and CRC.
     pub fn frame_size(&self) -> u16 {
@@ -200,11 +193,6 @@ impl Observation {
     /// Raw maximum-buffer-length index from the ATTRIB response.
     pub fn mbli(&self) -> u8 {
         self.attrib[0] >> 4
-    }
-    /// Reader receive frame capacity from its activation extension, including CRC.
-    /// Without that extension this RC-S956 profile uses 64 bytes.
-    pub fn reader_frame_size(&self) -> u16 {
-        self.reader_frame_size
     }
     /// Advertised command buffer limit, or unknown when MBLI is zero.
     /// A nonzero MBLI encodes `FSC * 2^(MBLI - 1)`.
@@ -253,20 +241,25 @@ mod tests {
     }
 
     #[test]
-    fn activation_extension_and_mbli_bound_different_directions() -> Result<(), Error> {
+    fn higher_layer_response_is_preserved_and_mbli_bounds_commands() -> Result<(), Error> {
         let mut data = CARD.to_vec();
-        data[12] = 2;
+        data[12] = 3;
         data[13] = 0x21;
-        data.push(2);
+        data.extend([0x9f, 0x0f]);
         let observation = Observation::parse(&data)?;
         assert_eq!(observation.frame_size(), 64);
-        assert_eq!(observation.reader_frame_size(), 32);
+        assert_eq!(observation.attrib_response(), [0x21, 0x9f, 0x0f]);
         assert_eq!(observation.maximum_command_bytes(), Some(128));
-        data[14] = 9;
-        assert!(matches!(
-            Observation::parse(&data),
-            Err(Error::ReaderFrameSizeIndex(9))
-        ));
+        Ok(())
+    }
+
+    #[test]
+    fn minimum_tr2_bits_keep_iso_dep_and_b4_withholds_it() -> Result<(), Error> {
+        let mut data = CARD;
+        for (protocol_type, iso_dep) in [(1, true), (3, true), (5, true), (7, true), (9, false)] {
+            data[10] = 0x50 | protocol_type;
+            assert_eq!(Observation::parse(&data)?.supports_iso_dep(), iso_dep);
+        }
         Ok(())
     }
 

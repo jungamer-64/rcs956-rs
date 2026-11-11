@@ -695,7 +695,6 @@ impl<T: Transport> Reader<T> {
                 };
                 let session = isodep::Session::new(
                     observation.frame_size(),
-                    observation.reader_frame_size(),
                     cid,
                     wait,
                     observation.maximum_command_bytes(),

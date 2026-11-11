@@ -14,6 +14,8 @@ const MAX_FRAMES: usize = 2048;
 const MAX_WTX: usize = 32;
 const MAX_RETRANSMISSIONS: usize = 2;
 const MAX_BLOCK_WAIT: Duration = block_frame_wait(14);
+/// RC-S956 block buffer in each direction, including the reader-owned CRC.
+const READER_FRAME_BYTES: u16 = 64;
 
 pub(crate) fn frame_size(index: u8) -> Option<u16> {
     [16, 24, 32, 40, 48, 64, 96, 128, 256]
@@ -254,18 +256,17 @@ enum Outbound {
 }
 
 impl Session {
+    /// `size` is the card's FSC. Received blocks are bounded by the reader's
+    /// block buffer, which also bounds every transmitted frame.
     pub(crate) fn new(
         size: u16,
-        receive_size: u16,
         cid: Option<u8>,
         wait: Duration,
         card_buffer: Option<usize>,
         nad: Option<NodeAddress>,
     ) -> Result<Self, ParameterError> {
-        for size in [size, receive_size] {
-            if !(0..=8).any(|index| frame_size(index) == Some(size)) {
-                return Err(ParameterError::FrameSize(size));
-            }
+        if !(0..=8).any(|index| frame_size(index) == Some(size)) {
+            return Err(ParameterError::FrameSize(size));
         }
         if let Some(cid) = cid
             && !(1..=14).contains(&cid)
@@ -277,8 +278,8 @@ impl Session {
         }
         Ok(Self {
             state: State::Active(0),
-            maximum_frame_bytes: usize::from(size.min(64)) - 2,
-            maximum_receive_bytes: usize::from(receive_size.min(64)) - 2,
+            maximum_frame_bytes: usize::from(size.min(READER_FRAME_BYTES)) - 2,
+            maximum_receive_bytes: usize::from(READER_FRAME_BYTES) - 2,
             maximum_application_bytes: card_buffer.unwrap_or(MAX_APDU_BYTES).min(MAX_APDU_BYTES),
             cid,
             nad,
@@ -661,7 +662,7 @@ mod tests {
     use std::io;
 
     fn session(size: u16, cid: Option<u8>) -> Result<Session, ParameterError> {
-        Session::new(size, 64, cid, block_frame_wait(4), None, None)
+        Session::new(size, cid, block_frame_wait(4), None, None)
     }
 
     #[test]
@@ -960,9 +961,9 @@ mod tests {
     }
 
     #[test]
-    fn negotiated_receive_and_card_buffer_limits_are_distinct()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut link = Session::new(64, 32, None, block_frame_wait(4), Some(128), None)?;
+    fn reader_receive_and_card_buffer_limits_are_distinct() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut link = Session::new(16, None, block_frame_wait(4), Some(128), None)?;
         let error = link
             .prepare::<io::Error>(&[0; 129])
             .err()
@@ -977,7 +978,7 @@ mod tests {
         assert_eq!(error.progress.frames, 0);
         let error = link
             .prepare::<io::Error>(&[1])?
-            .exchange(Ok(()), |_| false, |_, _| Ok::<_, io::Error>(vec![2; 31]))
+            .exchange(Ok(()), |_| false, |_, _| Ok::<_, io::Error>(vec![2; 63]))
             .err()
             .ok_or("expected receive limit")?;
         assert!(matches!(error.cause, Cause::InvalidBlock("RF block size")));
