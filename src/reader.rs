@@ -423,7 +423,7 @@ impl<T: Transport> Reader<T> {
         let wait = Duration::from_secs(1);
         self.link
             .reset(wait)
-            .and_then(|commit| commit.commit(wait))
+            .and_then(|commit| commit.commit())
             .map_err(Error::Transaction)?;
         let firmware: [u8; 4] = self
             .command(2, &[], wait)?

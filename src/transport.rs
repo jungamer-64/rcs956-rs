@@ -2,7 +2,7 @@
 
 use crate::wire::{self, Direction, Frame, FrameError};
 use alloc::vec::Vec;
-use core::{error, fmt, time::Duration};
+use core::{cmp::Ordering, error, fmt, time::Duration};
 
 /// Backend transfer contract. Reads return initialized bytes only; each operation
 /// must finish or cancel and reap its I/O before returning. A write error may have
@@ -57,6 +57,13 @@ pub enum Failure<E> {
         /// Confirmed bytes.
         transferred: usize,
     },
+    /// The backend reported more bytes than the frame it was given.
+    TransmitLength {
+        /// Frame bytes supplied to the backend.
+        requested: usize,
+        /// Reported bytes.
+        reported: usize,
+    },
     /// The backend reported more bytes than the supplied buffer could hold.
     ReceiveLength {
         /// Available buffer bytes.
@@ -106,6 +113,13 @@ impl<E: fmt::Debug> fmt::Display for TransactionError<E> {
                 requested,
                 transferred,
             } => write!(f, "short write of {transferred} of {requested} bytes")?,
+            Failure::TransmitLength {
+                requested,
+                reported,
+            } => write!(
+                f,
+                "backend reported {reported} bytes written for a {requested}-byte frame"
+            )?,
             Failure::ReceiveLength { capacity, reported } => {
                 write!(
                     f,
@@ -228,8 +242,8 @@ impl<T: Transport> Link<T> {
     }
 
     /// Send reset (`18 01`) and require its empty response. The returned
-    /// commit must send the host ACK before the link admits commands; dropping
-    /// it leaves the link requiring [`Link::recover`].
+    /// commit must send the host ACK, using the same timeout, before the link
+    /// admits commands; dropping it leaves the link requiring [`Link::recover`].
     ///
     /// # Errors
     ///
@@ -250,7 +264,11 @@ impl<T: Transport> Link<T> {
                 failure: Failure::ResetResponseLength(data.len()),
             });
         }
-        Ok(ResetCommit { link: self })
+        // `transact` rejected a zero timeout before sending the reset.
+        Ok(ResetCommit {
+            link: self,
+            timeout,
+        })
     }
 
     /// Run one admitted transaction. The stream stays in `RecoveryRequired`
@@ -271,24 +289,7 @@ impl<T: Transport> Link<T> {
         let remaining = deadline
             .remaining(self.transport.monotonic_time())
             .ok_or(not_sent(Failure::Deadline))?;
-        // Set the failure state before starting the first externally visible effect.
-        self.state = StreamState::RecoveryRequired;
-        let sent = self
-            .transport
-            .write(&frame, remaining)
-            .map_err(|e| TransactionError {
-                progress: Progress::Sending,
-                failure: Failure::Io(e),
-            })?;
-        if sent != frame.len() {
-            return Err(TransactionError {
-                progress: Progress::Sending,
-                failure: Failure::ShortWrite {
-                    requested: frame.len(),
-                    transferred: sent,
-                },
-            });
-        }
+        self.send_frame(&frame, remaining)?;
         self.wait(Duration::from_millis(2));
         let ack_deadline =
             Deadline::after(self.transport.monotonic_time(), Duration::from_millis(20))
@@ -348,25 +349,33 @@ impl<T: Transport> Link<T> {
         }
     }
 
-    fn send_host_ack(&mut self, timeout: Duration) -> Result<(), TransactionError<T::Error>> {
+    /// Write one complete host frame. The stream requires recovery from the
+    /// write attempt until the caller publishes the next state.
+    fn send_frame(
+        &mut self,
+        frame: &[u8],
+        timeout: Duration,
+    ) -> Result<(), TransactionError<T::Error>> {
         self.state = StreamState::RecoveryRequired;
-        let n = self
+        let sending = |failure| TransactionError {
+            progress: Progress::Sending,
+            failure,
+        };
+        let reported = self
             .transport
-            .write(&wire::ACK, timeout)
-            .map_err(|e| TransactionError {
-                progress: Progress::Sending,
-                failure: Failure::Io(e),
-            })?;
-        if n != wire::ACK.len() {
-            return Err(TransactionError {
-                progress: Progress::Sending,
-                failure: Failure::ShortWrite {
-                    requested: wire::ACK.len(),
-                    transferred: n,
-                },
-            });
+            .write(frame, timeout)
+            .map_err(|e| sending(Failure::Io(e)))?;
+        match reported.cmp(&frame.len()) {
+            Ordering::Equal => Ok(()),
+            Ordering::Less => Err(sending(Failure::ShortWrite {
+                requested: frame.len(),
+                transferred: reported,
+            })),
+            Ordering::Greater => Err(sending(Failure::TransmitLength {
+                requested: frame.len(),
+                reported,
+            })),
         }
-        Ok(())
     }
 
     /// Clear pipe state, cancel an unfinished reader command with an out-of-band
@@ -379,7 +388,7 @@ impl<T: Transport> Link<T> {
         self.transport
             .recover()
             .map_err(|e| not_sent(Failure::Io(e)))?;
-        self.send_host_ack(Duration::from_secs(1))?;
+        self.send_frame(&wire::ACK, Duration::from_secs(1))?;
         self.wait(Duration::from_millis(10));
         self.transport.recover().map_err(|e| TransactionError {
             progress: Progress::Sent,
@@ -400,22 +409,20 @@ impl<T: Transport> Link<T> {
 #[derive(Debug)]
 pub struct ResetCommit<'a, T: Transport> {
     link: &'a mut Link<T>,
+    /// The nonzero timeout admitted by [`Link::reset`].
+    timeout: Duration,
 }
 
 impl<T: Transport> ResetCommit<'_, T> {
-    /// Send the host ACK that commits the reset, then wait 10ms before the link
-    /// admits commands.
+    /// Send the host ACK that commits the reset within the timeout admitted by
+    /// [`Link::reset`], then wait 10ms before the link admits commands.
     ///
     /// # Errors
     ///
-    /// A zero timeout sends nothing and leaves the link requiring recovery. A
-    /// failed or short ACK write leaves the commit uncertain and also requires
-    /// [`Link::recover`].
-    pub fn commit(self, timeout: Duration) -> Result<(), TransactionError<T::Error>> {
-        if timeout.is_zero() {
-            return Err(not_sent(Failure::Deadline));
-        }
-        self.link.send_host_ack(timeout)?;
+    /// A failed, short or over-reported ACK write leaves the commit uncertain
+    /// and requires [`Link::recover`].
+    pub fn commit(self) -> Result<(), TransactionError<T::Error>> {
+        self.link.send_frame(&wire::ACK, self.timeout)?;
         self.link.wait(Duration::from_millis(10));
         self.link.state = StreamState::Ready;
         Ok(())

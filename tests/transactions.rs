@@ -21,7 +21,7 @@ enum Read {
 #[derive(Debug)]
 enum Write {
     Complete,
-    Short(usize),
+    Reported(usize),
     Error(io::ErrorKind),
 }
 
@@ -74,7 +74,7 @@ impl Transport for Script {
         self.journal.borrow_mut().writes.push(frame.to_vec());
         match self.writes.pop_front().unwrap_or(Write::Complete) {
             Write::Complete => Ok(frame.len()),
-            Write::Short(n) => Ok(n),
+            Write::Reported(n) => Ok(n),
             Write::Error(kind) => Err(io::Error::new(kind, "scripted write failure")),
         }
     }
@@ -186,7 +186,7 @@ fn ack_loss_is_not_replayed_and_requires_explicit_recovery() -> Result<(), Box<d
             ..
         })
     ));
-    link.reset(TIMEOUT)?.commit(TIMEOUT)?;
+    link.reset(TIMEOUT)?.commit()?;
     assert_eq!(link.command(2, &[], TIMEOUT)?.command, 3);
     assert_eq!(journal.borrow().writes.len(), 5);
     Ok(())
@@ -254,7 +254,7 @@ fn recovery_and_reset_ack_failures_preserve_poison_and_progress() -> Result<(), 
     assert!(journal.borrow().writes.is_empty());
 
     let (mut script, journal) = Script::new([]);
-    script.writes.push_back(Write::Short(3));
+    script.writes.push_back(Write::Reported(3));
     let mut link = Link::new(script);
     assert!(matches!(
         link.recover(),
@@ -301,11 +301,11 @@ fn recovery_and_reset_ack_failures_preserve_poison_and_progress() -> Result<(), 
     )]);
     script
         .writes
-        .extend([Write::Complete, Write::Complete, Write::Short(2)]);
+        .extend([Write::Complete, Write::Complete, Write::Reported(2)]);
     let mut link = Link::new(script);
     link.recover()?;
     assert!(matches!(
-        link.reset(TIMEOUT)?.commit(TIMEOUT),
+        link.reset(TIMEOUT)?.commit(),
         Err(TransactionError {
             progress: Progress::Sending,
             failure: Failure::ShortWrite {
@@ -334,7 +334,7 @@ fn reset_commit_waits_before_admitting_the_next_command() -> Result<(), Box<dyn 
     let mut link = Link::new(script);
     let commit = link.reset(TIMEOUT)?;
     let start = journal.borrow().elapsed;
-    commit.commit(TIMEOUT)?;
+    commit.commit()?;
     assert!(journal.borrow().elapsed >= start + Duration::from_millis(10));
     assert_eq!(journal.borrow().writes[1], wire::ACK);
     link.command(2, &[], TIMEOUT)?;
@@ -513,8 +513,12 @@ fn response_mismatch_preserves_ack_progress_and_poison() {
 }
 
 #[test]
-fn short_write_and_write_error_preserve_uncertain_send_progress() {
-    for outcome in [Write::Short(3), Write::Error(io::ErrorKind::BrokenPipe)] {
+fn incomplete_or_misreported_write_preserves_uncertain_send_progress() {
+    for outcome in [
+        Write::Reported(3),
+        Write::Reported(10),
+        Write::Error(io::ErrorKind::BrokenPipe),
+    ] {
         let (mut script, journal) = Script::new([]);
         script.writes.push_back(outcome);
         let mut link = Link::new(script);
@@ -526,6 +530,9 @@ fn short_write_and_write_error_preserve_uncertain_send_progress() {
                 failure: Failure::ShortWrite {
                     requested: 9,
                     transferred: 3
+                } | Failure::TransmitLength {
+                    requested: 9,
+                    reported: 10
                 } | Failure::Io(_)
             })
         ));
@@ -603,10 +610,8 @@ fn input_rejection_keeps_a_never_sent_stream_reusable() -> Result<(), Box<dyn Er
 }
 
 #[test]
-fn zero_duration_never_starts_a_device_effect() -> Result<(), Box<dyn Error>> {
-    let (script, journal) = Script::new([Read::Bytes(
-        [wire::ACK.as_slice(), RESET_RESPONSE.as_slice()].concat(),
-    )]);
+fn zero_duration_never_starts_a_device_effect() {
+    let (script, journal) = Script::new([]);
     let mut link = Link::new(script);
     for result in [
         link.command(2, &[], Duration::ZERO).map(|_| ()),
@@ -621,15 +626,6 @@ fn zero_duration_never_starts_a_device_effect() -> Result<(), Box<dyn Error>> {
         ));
     }
     assert!(journal.borrow().writes.is_empty());
-    assert!(matches!(
-        link.reset(TIMEOUT)?.commit(Duration::ZERO),
-        Err(TransactionError {
-            progress: Progress::NotSent,
-            failure: Failure::Deadline
-        })
-    ));
-    assert_eq!(journal.borrow().writes.len(), 1);
-    Ok(())
 }
 
 #[test]
