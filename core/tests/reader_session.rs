@@ -170,14 +170,13 @@ impl Transport for Script {
     fn read(&mut self, buffer: &mut [u8], timeout: Duration) -> io::Result<usize> {
         assert!(!timeout.is_zero());
         match self.input.pop_front() {
-            Some(Input::Bytes(bytes)) => {
-                let output = buffer.get_mut(..bytes.len()).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "response exceeds read capacity",
-                    )
-                })?;
-                output.copy_from_slice(&bytes);
+            Some(Input::Bytes(mut bytes)) => {
+                // A read returns at most the supplied capacity; the rest stays queued.
+                if bytes.len() > buffer.len() {
+                    self.input
+                        .push_front(Input::Bytes(bytes.split_off(buffer.len())));
+                }
+                buffer[..bytes.len()].copy_from_slice(&bytes);
                 self.journal.borrow_mut().last_read_completed = Some(self.elapsed);
                 Ok(bytes.len())
             }
