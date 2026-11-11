@@ -1,8 +1,8 @@
 [package]
 name = "rcs956"
 version = "0.1.0"
-edition.workspace = true
-license.workspace = true
+edition = "2024"
+license = "MIT OR Apache-2.0"
 description = "RC-S956 reader framing, transactions, and NFC card protocols"
 
 [features]
@@ -19,5 +19,22 @@ zeroize = { version = "1", default-features = false, features = ["alloc"], optio
 [dev-dependencies]
 serde_json = "1"
 
-[lints]
-workspace = true
+[lints.rust]
+missing_docs = "deny"
+missing_debug_implementations = "deny"
+unreachable_pub = "deny"
+unnameable_types = "deny"
+unsafe_op_in_unsafe_fn = "forbid"
+unused = { level = "deny", priority = -1 }
+unfulfilled_lint_expectations = "deny"
+
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+allow_attributes_without_reason = "deny"
