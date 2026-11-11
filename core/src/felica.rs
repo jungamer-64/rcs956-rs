@@ -230,10 +230,9 @@ pub fn read_without_encryption(
     service_code: u16,
     blocks: &[u16],
 ) -> Result<Vec<u8>, CardError> {
-    if !(1..=MAX_READ_BLOCKS).contains(&blocks.len()) {
-        return Err(CardError::BlockCount(blocks.len()));
-    }
-    let mut packet = block_list(0x06, idm, service_code, blocks.iter().copied());
+    let count =
+        block_count(blocks.len(), MAX_READ_BLOCKS).ok_or(CardError::BlockCount(blocks.len()))?;
+    let mut packet = block_list(0x06, idm, service_code, count, blocks.iter().copied());
     set_length(&mut packet)?;
     Ok(packet)
 }
@@ -252,10 +251,15 @@ pub(crate) fn write_without_encryption(
     service: u16,
     blocks: &[BlockWrite],
 ) -> Result<Vec<u8>, CardError> {
-    if !(1..=MAX_WRITE_BLOCKS).contains(&blocks.len()) {
-        return Err(CardError::WriteBlockCount(blocks.len()));
-    }
-    let mut packet = block_list(0x08, idm, service, blocks.iter().map(|entry| entry.block));
+    let count = block_count(blocks.len(), MAX_WRITE_BLOCKS)
+        .ok_or(CardError::WriteBlockCount(blocks.len()))?;
+    let mut packet = block_list(
+        0x08,
+        idm,
+        service,
+        count,
+        blocks.iter().map(|entry| entry.block),
+    );
     for entry in blocks {
         packet.extend_from_slice(&entry.data);
     }
@@ -263,18 +267,26 @@ pub(crate) fn write_without_encryption(
     Ok(packet)
 }
 
+/// The packet's block-count byte for 1 to `maximum` blocks.
+fn block_count(blocks: usize, maximum: usize) -> Option<u8> {
+    u8::try_from(blocks)
+        .ok()
+        .filter(|count| (1..=maximum).contains(&usize::from(*count)))
+}
+
 fn block_list(
     command: u8,
     idm: Idm,
     service: u16,
-    blocks: impl ExactSizeIterator<Item = u16>,
+    count: u8,
+    blocks: impl Iterator<Item = u16>,
 ) -> Vec<u8> {
-    let mut packet = Vec::with_capacity(14 + blocks.len() * 3);
+    let mut packet = Vec::with_capacity(14 + usize::from(count) * 3);
     packet.extend_from_slice(&[0, command]);
     packet.extend_from_slice(idm.as_bytes());
     packet.push(1);
     packet.extend_from_slice(&service.to_le_bytes());
-    packet.push(blocks.len() as u8);
+    packet.push(count);
     for block in blocks {
         let [low, high] = block.to_le_bytes();
         if high == 0 {

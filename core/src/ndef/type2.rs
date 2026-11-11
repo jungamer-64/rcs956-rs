@@ -230,14 +230,19 @@ impl<'card, 'reader, T: Transport> Type2Data<'card, 'reader, T> {
                 available,
             });
         }
-        let length = if message.len() <= 254 {
-            message.len() as u8
-        } else {
-            0xff
+        let (length, extended) = match u8::try_from(message.len()) {
+            Ok(length @ 0..=254) => (length, None),
+            _ => (
+                0xff,
+                Some(u16::try_from(message.len()).map_err(|_| Error::Capacity {
+                    requested: message.len(),
+                    available,
+                })?),
+            ),
         };
         let mut data = BTreeMap::new();
-        if length == 0xff {
-            for byte in (message.len() as u16).to_be_bytes() {
+        if let Some(extended) = extended {
+            for byte in extended.to_be_bytes() {
                 self.patch_byte(&mut data, byte, 0)?;
             }
         }

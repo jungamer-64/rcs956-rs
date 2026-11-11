@@ -41,12 +41,14 @@ impl<T: Transport> Type1Tag<'_, T> {
                 "Type 1 TLV length address",
             )));
         };
-        if data.len() > slots.len() {
-            return Err(WriteError::Preparation(Error::Capacity {
+        // The static mapping has fewer TLV slots than a one-byte length can count.
+        let encoded_length = u8::try_from(data.len())
+            .ok()
+            .filter(|_| data.len() <= slots.len())
+            .ok_or(WriteError::Preparation(Error::Capacity {
                 requested: data.len(),
                 available: slots.len(),
-            }));
-        }
+            }))?;
         let terminator = slots.get(data.len()).copied();
         let locks = u16::from_le_bytes([memory[112], memory[113]]);
         let touched = core::iter::once(*length_address)
@@ -71,8 +73,7 @@ impl<T: Transport> Type1Tag<'_, T> {
             })?;
         }
         if !data.is_empty() {
-            // There are only 92 TLV bytes in this static mapping.
-            self.write_byte(*length_address, data.len() as u8)
+            self.write_byte(*length_address, encoded_length)
                 .map_err(|error| {
                     WriteError::update(UpdateStage::Publish, data.len(), Error::Exchange(error))
                 })?;

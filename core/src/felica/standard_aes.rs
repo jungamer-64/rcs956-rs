@@ -96,6 +96,9 @@ pub enum Error<E> {
         /// Second status flag.
         second: u8,
     },
+    /// A secure payload exceeds one FeliCa packet. Nothing was sent and the
+    /// session remains usable.
+    PayloadLength(usize),
     /// The previous secure exchange failed, revoking the session.
     SessionUnavailable,
 }
@@ -137,9 +140,10 @@ impl<'a, T: Transport> FelicaCard<'a, T> {
         operation_parameter: u8,
         challenge: [u8; 16],
     ) -> Result<Session<'a, T>, Error<T::Error>> {
-        if !(1..=16).contains(&nodes.len()) {
-            return Err(Error::Nodes(nodes.len()));
-        }
+        let node_count = u8::try_from(nodes.len())
+            .ok()
+            .filter(|count| (1..=16).contains(count))
+            .ok_or(Error::Nodes(nodes.len()))?;
         let mut group = Zeroizing::new([0; 16]);
         group[..2].copy_from_slice(&[1, 1]);
         group[15] = 0x80;
@@ -160,7 +164,7 @@ impl<'a, T: Transport> FelicaCard<'a, T> {
         let mut proof = *challenge;
         alpha.encrypt_block((&mut proof).into());
         let mut parameters = Vec::with_capacity(18 + 2 * nodes.len());
-        parameters.extend([operation_parameter, nodes.len() as u8]);
+        parameters.extend([operation_parameter, node_count]);
         for node in nodes {
             parameters.extend(node.code.to_le_bytes());
         }
@@ -282,7 +286,7 @@ impl<T: Transport> Session<'_, T> {
             return Err(Error::BlockCount(count));
         }
         let mut request = Zeroizing::new(Vec::with_capacity(1 + count * 19));
-        request.push(count as u8);
+        request.push(u8::try_from(count).map_err(|_| Error::BlockCount(count))?);
         for block in blocks {
             if usize::from(block.service_index) >= self.nodes {
                 return Err(Error::ServiceIndex(block.service_index));
@@ -303,13 +307,16 @@ impl<T: Transport> Session<'_, T> {
         mut payload: Zeroizing<Vec<u8>>,
         decode: impl FnOnce(&[u8]) -> Result<U, Error<T::Error>>,
     ) -> Result<U, Error<T::Error>> {
-        let mut secure = self.secure.take().ok_or(Error::SessionUnavailable)?;
+        let secure = self.secure.as_ref().ok_or(Error::SessionUnavailable)?;
         let sent = secure
             .counter
             .checked_add(1)
             .filter(|counter| *counter < u16::MAX)
             .ok_or(Error::CounterExhausted)?;
-        let request = secure.seal(command, sent, &mut payload);
+        let request = secure
+            .seal(command, sent, &mut payload)
+            .ok_or(Error::PayloadLength(payload.len()))?;
+        let mut secure = self.secure.take().ok_or(Error::SessionUnavailable)?;
         let reply = exchange(&mut self.card, &request)?;
         let (received, plaintext) = secure.open(command + 1, reply)?;
         if received <= sent {
@@ -362,17 +369,18 @@ impl Secure {
         iv
     }
 
-    fn seal(&self, code: u8, counter: u16, payload: &mut [u8]) -> Vec<u8> {
-        let length = (SECURE_OVERHEAD + payload.len()) as u8;
+    /// Encrypt and authenticate a payload; `None` if it exceeds one packet.
+    fn seal(&self, code: u8, counter: u16, payload: &mut [u8]) -> Option<Vec<u8>> {
+        let length = u8::try_from(SECURE_OVERHEAD + payload.len()).ok()?;
         let counter = counter.to_le_bytes();
         let iv = self.iv(length, code, counter);
-        let mut mac = self.mac(iv, payload);
+        let mut mac = self.mac(iv, payload)?;
         self.crypt(iv, payload, &mut mac);
         let mut packet = Vec::with_capacity(usize::from(length));
         packet.extend([length, code, counter[0], counter[1]]);
         packet.extend_from_slice(payload);
         packet.extend(mac);
-        packet
+        Some(packet)
     }
 
     fn open<E>(&self, code: u8, packet: Vec<u8>) -> Result<(u16, Zeroizing<Vec<u8>>), Error<E>> {
@@ -387,7 +395,7 @@ impl Secure {
         let (payload, mac) = plaintext.split_at_mut(payload_len);
         let iv = self.iv(*length, code, [*low, *high]);
         self.crypt(iv, payload, mac);
-        if !bool::from(self.mac(iv, payload).ct_eq(mac)) {
+        if !bool::from(self.mac(iv, payload).ok_or(Error::Layout)?.ct_eq(mac)) {
             return Err(Error::Mac);
         }
         plaintext.truncate(payload_len);
@@ -403,14 +411,15 @@ impl Secure {
         }
     }
 
-    fn mac(&self, mut header: [u8; 16], payload: &[u8]) -> [u8; 8] {
+    /// CMAC over the header and payload; `None` if the length field overflows.
+    fn mac(&self, mut header: [u8; 16], payload: &[u8]) -> Option<[u8; 8]> {
         header[0] = 0x19;
-        header[14..].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+        header[14..].copy_from_slice(&u16::try_from(payload.len()).ok()?.to_be_bytes());
         let mut mac = <Cmac<Aes128> as cmac::KeyInit>::new((&*self.authentication).into());
         mac.update(&header);
         mac.update(payload);
         let tag = mac.finalize().into_bytes();
-        core::array::from_fn(|index| tag[index])
+        Some(core::array::from_fn(|index| tag[index]))
     }
 }
 

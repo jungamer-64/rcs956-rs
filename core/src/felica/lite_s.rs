@@ -290,7 +290,8 @@ impl SessionKeys {
     fn write_proof(&self, block: u16, data: &[u8; 16], counter: [u8; 3]) -> [u8; 16] {
         let [a, b, c] = counter;
         let [low, high] = block.to_le_bytes();
-        let header = [a, b, c, 0, low, high, MAC_A as u8, 0];
+        let [mac_low, mac_high] = MAC_A.to_le_bytes();
+        let header = [a, b, c, 0, low, high, mac_low, mac_high];
         let mut proof = [0; 16];
         proof[..8].copy_from_slice(&self.mac(&self.write, header, core::slice::from_ref(data)));
         proof[8..11].copy_from_slice(&counter);

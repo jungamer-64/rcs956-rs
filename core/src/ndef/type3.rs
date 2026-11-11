@@ -36,7 +36,7 @@ impl<T: Transport> Type3Tag<'_, T> {
         let attribute = self.attribute()?;
         let length = attribute.length();
         let mut data = Vec::with_capacity(length);
-        let mut blocks = BlockRange::for_bytes(length);
+        let mut blocks = BlockRange::for_bytes(length)?;
         let limit = usize::from(attribute.0[1]).min(MAX_READ_BLOCKS);
         while !blocks.is_empty() {
             let batch: Vec<_> = blocks.take(limit).collect();
@@ -63,20 +63,27 @@ impl<T: Transport> Type3Tag<'_, T> {
         if attribute.0[10] != 1 || limit == 0 {
             return Err(WriteError::Preparation(Error::WriteAccess));
         }
-        if message.len() > capacity {
-            return Err(WriteError::Preparation(Error::Capacity {
+        let capacity_error = || {
+            WriteError::Preparation(Error::Capacity {
                 requested: message.len(),
                 available: capacity,
-            }));
+            })
+        };
+        if message.len() > capacity {
+            return Err(capacity_error());
         }
+        let encoded_length = Attribute::encode_length(message.len()).ok_or_else(capacity_error)?;
+        let mut blocks = BlockRange::for_bytes(message.len()).map_err(WriteError::Preparation)?;
         self.write_attribute(attribute.update_started())
             .map_err(|cause| WriteError::update(UpdateStage::Begin, 0, cause))?;
-        let mut blocks = BlockRange::for_bytes(message.len());
         let mut written = 0;
         while !blocks.is_empty() {
             // A long block address uses one extra packet byte. Thirteen
             // long-addressed blocks would exceed the FeliCa length field.
-            let count = if blocks.next + limit <= 256 {
+            let count = if blocks
+                .next()
+                .is_some_and(|next| usize::from(next) + limit <= 256)
+            {
                 limit
             } else {
                 limit.min(12)
@@ -99,7 +106,7 @@ impl<T: Transport> Type3Tag<'_, T> {
                 })?;
             written = end;
         }
-        self.write_attribute(attribute.published(message.len()))
+        self.write_attribute(attribute.published(encoded_length))
             .map_err(|cause| WriteError::update(UpdateStage::Publish, written, cause))
     }
 
@@ -162,10 +169,17 @@ impl Attribute {
         block
     }
 
-    fn published(self, length: usize) -> [u8; 16] {
+    /// The attribute's 24-bit big-endian length field.
+    fn encode_length(length: usize) -> Option<[u8; 3]> {
+        match u32::try_from(length).map(u32::to_be_bytes) {
+            Ok([0, a, b, c]) => Some([a, b, c]),
+            _ => None,
+        }
+    }
+
+    fn published(self, length: [u8; 3]) -> [u8; 16] {
         let mut block = self.0;
-        // The admitted capacity is at most 65535 blocks of 16 bytes.
-        block[11..14].copy_from_slice(&(length as u32).to_be_bytes()[1..]);
+        block[11..14].copy_from_slice(&length);
         let checksum = checksum(&block);
         block[14..].copy_from_slice(&checksum.to_be_bytes());
         block
@@ -176,27 +190,25 @@ fn checksum(block: &[u8; 16]) -> u16 {
     block[..14].iter().copied().map(u16::from).sum()
 }
 
-struct BlockRange {
-    next: usize,
-    end: usize,
-}
+/// Data blocks 1 through the last block holding the message.
+struct BlockRange(core::ops::RangeInclusive<u16>);
 
 impl BlockRange {
-    fn for_bytes(length: usize) -> Self {
-        Self {
-            next: 1,
-            end: 1 + length.div_ceil(BLOCK_BYTES),
-        }
+    fn for_bytes<E>(length: usize) -> Result<Self, Error<E>> {
+        let last = u16::try_from(length.div_ceil(BLOCK_BYTES))
+            .map_err(|_| Error::Layout("Type 3 block number"))?;
+        Ok(Self(1..=last))
     }
 
     fn is_empty(&self) -> bool {
-        self.next == self.end
+        self.0.is_empty()
+    }
+
+    fn next(&self) -> Option<u16> {
+        self.0.clone().next()
     }
 
     fn take(&mut self, limit: usize) -> impl Iterator<Item = u16> {
-        let start = self.next;
-        self.next = self.end.min(start + limit);
-        // The attribute caps the final block number at u16::MAX.
-        (start..self.next).map(|block| block as u16)
+        self.0.by_ref().take(limit)
     }
 }

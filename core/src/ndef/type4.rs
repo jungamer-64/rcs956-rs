@@ -61,8 +61,12 @@ fn read_type4<E>(
     mut exchange: impl FnMut(&[u8]) -> Result<Vec<u8>, E>,
 ) -> Result<Vec<u8>, Error<E>> {
     let file = select_ndef_file(&mut exchange)?;
-    let length_bytes = file.control.length.bytes();
-    let encoded = read_binary(&mut exchange, BinaryAddress::Short(0), length_bytes as u8)?;
+    let encoded = read_binary(
+        &mut exchange,
+        BinaryAddress::Short(0),
+        file.control.length.bytes(),
+    )?;
+    let length_bytes = usize::from(file.control.length.bytes());
     let length = file.control.length.decode(&encoded)?;
     if length > file.control.capacity - length_bytes {
         return Err(Error::Layout("Type 4 NLEN exceeds file capacity"));
@@ -90,7 +94,7 @@ fn write_type4<E>(
     let max_write = file
         .max_write
         .min(max_apdu_bytes.saturating_sub(UPDATE_BINARY_HEADER_BYTES));
-    let length_bytes = file.control.length.bytes();
+    let length_bytes = usize::from(file.control.length.bytes());
     if max_write < length_bytes {
         // Publish the complete length in one UPDATE BINARY.
         return Err(WriteError::Preparation(Error::Layout(
@@ -104,7 +108,14 @@ fn write_type4<E>(
             available,
         }));
     }
-    let encoded_length = (message.len() as u32).to_be_bytes();
+    let encoded_length = u32::try_from(message.len())
+        .map_err(|_| {
+            WriteError::Preparation(Error::Capacity {
+                requested: message.len(),
+                available,
+            })
+        })?
+        .to_be_bytes();
     let length = &encoded_length[4 - length_bytes..];
     let addressing = file.addressing(message.len() + length_bytes);
     let chunk_size = match addressing {
@@ -128,7 +139,9 @@ fn write_type4<E>(
     .map_err(|cause| WriteError::update(UpdateStage::Begin, 0, cause))?;
     let mut written = 0;
     for chunk in message.chunks(chunk_size) {
-        let offset = addressing.address(written + length_bytes);
+        let offset = addressing
+            .address(written + length_bytes)
+            .map_err(|cause| WriteError::update(UpdateStage::Data, written, cause))?;
         update_binary(&mut exchange, offset, chunk)
             .map_err(|cause| WriteError::update(UpdateStage::Data, written, cause))?;
         written += chunk.len();
@@ -151,7 +164,7 @@ enum LengthField {
 }
 
 impl LengthField {
-    fn bytes(self) -> usize {
+    fn bytes(self) -> u8 {
         match self {
             Self::Nlen => 2,
             Self::Extended => 4,
@@ -160,7 +173,7 @@ impl LengthField {
 
     fn decode<E>(self, encoded: &[u8]) -> Result<usize, Error<E>> {
         let mut value = [0; 4];
-        value[4 - self.bytes()..].copy_from_slice(encoded);
+        value[4 - usize::from(self.bytes())..].copy_from_slice(encoded);
         usize::try_from(u32::from_be_bytes(value)).map_err(|_| Error::Layout("Type 4 ENLEN"))
     }
 }
@@ -168,7 +181,8 @@ impl LengthField {
 struct Type4File {
     control: FileControl,
     extended_addressing: bool,
-    max_read: usize,
+    /// READ BINARY limit from the capability container, at least 15.
+    max_read: u8,
     max_write: usize,
 }
 
@@ -179,7 +193,7 @@ impl Type4File {
         } else {
             SHORT_FILE_END
         };
-        self.control.capacity.min(addressable) - self.control.length.bytes()
+        self.control.capacity.min(addressable) - usize::from(self.control.length.bytes())
     }
 
     fn addressing(&self, end: usize) -> Addressing {
@@ -198,13 +212,17 @@ enum Addressing {
 }
 
 impl Addressing {
-    fn address(self, offset: usize) -> BinaryAddress {
+    /// Encode a file offset; callers bound files to the addressable range.
+    fn address<E>(self, offset: usize) -> Result<BinaryAddress, Error<E>> {
+        let invalid = || Error::Layout("Type 4 file offset");
         match self {
-            Self::Short => BinaryAddress::Short(offset as u16),
-            Self::OffsetObject => {
-                let [_, a, b, c] = (offset as u32).to_be_bytes();
-                BinaryAddress::OffsetObject([a, b, c])
-            }
+            Self::Short => u16::try_from(offset)
+                .map(BinaryAddress::Short)
+                .map_err(|_| invalid()),
+            Self::OffsetObject => match u32::try_from(offset).map(u32::to_be_bytes) {
+                Ok([0, a, b, c]) => Ok(BinaryAddress::OffsetObject([a, b, c])),
+                _ => Err(invalid()),
+            },
         }
     }
 }
@@ -231,7 +249,7 @@ fn select_ndef_file<E>(
     if !(15..=SHORT_FILE_END).contains(&length) {
         return Err(Error::Layout("Type 4 capability container length"));
     }
-    let max_read = usize::from(u16::from_be_bytes([header[3], header[4]])).min(255);
+    let max_read = u8::try_from(u16::from_be_bytes([header[3], header[4]])).unwrap_or(u8::MAX);
     if max_read < 15 {
         return Err(Error::Layout("Type 4 maximum read length"));
     }
@@ -282,7 +300,7 @@ fn ndef_file<E>(mut tlvs: &[u8]) -> Result<FileControl, Error<E>> {
         if read == 0 {
             let capacity =
                 usize::try_from(capacity).map_err(|_| Error::Layout("Type 4 file capacity"))?;
-            if capacity < length.bytes() {
+            if capacity < usize::from(length.bytes()) {
                 return Err(Error::Layout("Type 4 file cannot hold NLEN"));
             }
             return Ok(FileControl {
@@ -302,27 +320,17 @@ fn update_binary<E>(
     offset: BinaryAddress,
     data: &[u8],
 ) -> Result<(), Error<E>> {
+    let length_error = || Error::Layout("Type 4 UPDATE BINARY data length");
+    let length = u8::try_from(data.len()).map_err(|_| length_error())?;
     let mut command = Vec::with_capacity(UPDATE_BINARY_HEADER_BYTES + 7 + data.len());
     match offset {
         BinaryAddress::Short(offset) => {
             let [hi, lo] = offset.to_be_bytes();
-            command.extend([0, 0xd6, hi, lo, data.len() as u8]);
+            command.extend([0, 0xd6, hi, lo, length]);
         }
         BinaryAddress::OffsetObject([a, b, c]) => {
-            command.extend([
-                0,
-                0xd7,
-                0,
-                0,
-                (7 + data.len()) as u8,
-                0x54,
-                3,
-                a,
-                b,
-                c,
-                0x53,
-                data.len() as u8,
-            ]);
+            let field = length.checked_add(7).ok_or_else(length_error)?;
+            command.extend([0, 0xd7, 0, 0, field, 0x54, 3, a, b, c, 0x53, length]);
         }
     }
     command.extend_from_slice(data);
@@ -384,23 +392,20 @@ fn read_binary<E>(
 fn read_file<E>(
     exchange: &mut impl FnMut(&[u8]) -> Result<Vec<u8>, E>,
     range: Range<usize>,
-    max_read: usize,
+    max_read: u8,
     addressing: Addressing,
 ) -> Result<Vec<u8>, Error<E>> {
+    // An offset reply wraps the data in a two-byte object with a short length.
     let max_read = match addressing {
         Addressing::Short => max_read,
-        Addressing::OffsetObject => (max_read - 2).min(127),
+        Addressing::OffsetObject => max_read.saturating_sub(2).min(127),
     };
     let mut data = Vec::with_capacity(range.len());
     let mut offset = range.start;
     while offset < range.end {
-        let length = (range.end - offset).min(max_read);
-        data.extend(read_binary(
-            exchange,
-            addressing.address(offset),
-            length as u8,
-        )?);
-        offset += length;
+        let length = u8::try_from(range.end - offset).map_or(max_read, |rest| rest.min(max_read));
+        data.extend(read_binary(exchange, addressing.address(offset)?, length)?);
+        offset += usize::from(length);
     }
     Ok(data)
 }

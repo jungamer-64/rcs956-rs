@@ -174,9 +174,11 @@ fn memory_image<E>(
     uid_suffix: [u8; 3],
     message: &[u8],
 ) -> Result<[u8; MEMORY_BYTES], Type2EmulationError<E>> {
-    if message.len() > MAX_TYPE2_EMULATED_NDEF_BYTES {
-        return Err(Type2EmulationError::MessageLength(message.len()));
-    }
+    // The emulated area keeps the message within a one-byte TLV length.
+    let length = u8::try_from(message.len())
+        .ok()
+        .filter(|_| message.len() <= MAX_TYPE2_EMULATED_NDEF_BYTES)
+        .ok_or(Type2EmulationError::MessageLength(message.len()))?;
     if !message.is_empty() {
         Message::parse(message).map_err(Type2EmulationError::Message)?;
     }
@@ -184,7 +186,7 @@ fn memory_image<E>(
     let mut memory = [0; MEMORY_BYTES];
     memory[..5].copy_from_slice(&[UID_PREFIX, a, b, c, UID_PREFIX ^ a ^ b ^ c]);
     memory[10..16].copy_from_slice(&[0xff, 0xff, 0xe1, 0x10, 6, 0x0f]);
-    memory[16..18].copy_from_slice(&[3, message.len() as u8]);
+    memory[16..18].copy_from_slice(&[3, length]);
     memory[18..18 + message.len()].copy_from_slice(message);
     if let Some(terminator) = memory.get_mut(18 + message.len()) {
         *terminator = 0xfe;
