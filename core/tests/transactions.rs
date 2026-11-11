@@ -186,15 +186,7 @@ fn ack_loss_is_not_replayed_and_requires_explicit_recovery() -> Result<(), Box<d
             ..
         })
     ));
-    link.command(0x18, &[1], TIMEOUT)?;
-    assert!(matches!(
-        link.command(2, &[], TIMEOUT),
-        Err(TransactionError {
-            failure: Failure::RecoveryRequired,
-            ..
-        })
-    ));
-    link.host_ack(TIMEOUT)?;
+    link.reset(TIMEOUT)?.commit(TIMEOUT)?;
     assert_eq!(link.command(2, &[], TIMEOUT)?.command, 3);
     assert_eq!(journal.borrow().writes.len(), 5);
     Ok(())
@@ -218,7 +210,7 @@ fn recovery_rejects_a_stale_same_command_response_at_the_reset_barrier()
         })
     ));
     assert!(matches!(
-        link.command(0x18, &[1], TIMEOUT),
+        link.reset(TIMEOUT),
         Err(TransactionError {
             progress: Progress::Acknowledged,
             failure: Failure::ResponseCommand {
@@ -312,9 +304,8 @@ fn recovery_and_reset_ack_failures_preserve_poison_and_progress() -> Result<(), 
         .extend([Write::Complete, Write::Complete, Write::Short(2)]);
     let mut link = Link::new(script);
     link.recover()?;
-    link.command(0x18, &[1], TIMEOUT)?;
     assert!(matches!(
-        link.host_ack(TIMEOUT),
+        link.reset(TIMEOUT)?.commit(TIMEOUT),
         Err(TransactionError {
             progress: Progress::Sending,
             failure: Failure::ShortWrite {
@@ -341,19 +332,54 @@ fn reset_commit_waits_before_admitting_the_next_command() -> Result<(), Box<dyn 
         Read::Bytes(acknowledged_response()),
     ]);
     let mut link = Link::new(script);
-    link.command(0x18, &[1], TIMEOUT)?;
-    assert!(matches!(
-        link.command(2, &[], TIMEOUT),
-        Err(TransactionError {
-            failure: Failure::RecoveryRequired,
-            ..
-        })
-    ));
+    let commit = link.reset(TIMEOUT)?;
     let start = journal.borrow().elapsed;
-    link.host_ack(TIMEOUT)?;
+    commit.commit(TIMEOUT)?;
     assert!(journal.borrow().elapsed >= start + Duration::from_millis(10));
+    assert_eq!(journal.borrow().writes[1], wire::ACK);
     link.command(2, &[], TIMEOUT)?;
     assert_eq!(journal.borrow().writes.len(), 3);
+    Ok(())
+}
+
+#[test]
+fn an_uncommitted_reset_requires_recovery() -> Result<(), Box<dyn Error>> {
+    let (script, journal) = Script::new([Read::Bytes(
+        [wire::ACK.as_slice(), RESET_RESPONSE.as_slice()].concat(),
+    )]);
+    let mut link = Link::new(script);
+    drop(link.reset(TIMEOUT)?);
+    for result in [
+        link.command(2, &[], TIMEOUT).map(|_| ()),
+        link.reset(TIMEOUT).map(|_| ()),
+    ] {
+        assert!(matches!(
+            result,
+            Err(TransactionError {
+                progress: Progress::NotSent,
+                failure: Failure::RecoveryRequired,
+            })
+        ));
+    }
+    assert_eq!(journal.borrow().writes.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn ordinary_commands_cannot_send_reset_or_an_unanswerable_command() -> Result<(), Box<dyn Error>> {
+    let (script, journal) = Script::new([Read::Bytes(acknowledged_response())]);
+    let mut link = Link::new(script);
+    for (command, args) in [(0x18, [1].as_slice()), (0x18, &[]), (0xff, &[])] {
+        assert!(matches!(
+            link.command(command, args, TIMEOUT),
+            Err(TransactionError {
+                progress: Progress::NotSent,
+                failure: Failure::UnsupportedCommand(actual),
+            }) if actual == command
+        ));
+    }
+    assert!(journal.borrow().writes.is_empty());
+    assert_eq!(link.command(2, &[], TIMEOUT)?.command, 3);
     Ok(())
 }
 
@@ -366,14 +392,14 @@ fn malformed_reset_response_cannot_authorize_the_commit_ack() -> Result<(), Box<
     let mut link = Link::new(script);
     link.recover()?;
     assert!(matches!(
-        link.command(0x18, &[1], TIMEOUT),
+        link.reset(TIMEOUT),
         Err(TransactionError {
             progress: Progress::Acknowledged,
             failure: Failure::ResetResponseLength(1),
         })
     ));
     for result in [
-        link.host_ack(TIMEOUT),
+        link.reset(TIMEOUT).map(|_| ()),
         link.command(2, &[], TIMEOUT).map(|_| ()),
     ] {
         assert!(matches!(
@@ -560,17 +586,6 @@ fn extra_bytes_after_response_poison_the_stream() {
 }
 
 #[test]
-fn host_ack_is_an_out_only_operation() -> Result<(), Box<dyn Error>> {
-    let (script, journal) = Script::new([Read::Bytes(acknowledged_response())]);
-    let mut link = Link::new(script);
-    link.host_ack(TIMEOUT)?;
-    assert!(journal.borrow().read_timeouts.is_empty());
-    assert_eq!(journal.borrow().writes, [wire::ACK.to_vec()]);
-    assert_eq!(link.command(2, &[], TIMEOUT)?.command, 3);
-    Ok(())
-}
-
-#[test]
 fn input_rejection_keeps_a_never_sent_stream_reusable() -> Result<(), Box<dyn Error>> {
     let (script, journal) = Script::new([Read::Bytes(acknowledged_response())]);
     let mut link = Link::new(script);
@@ -588,24 +603,33 @@ fn input_rejection_keeps_a_never_sent_stream_reusable() -> Result<(), Box<dyn Er
 }
 
 #[test]
-fn zero_duration_never_starts_a_device_effect() {
-    let (script, journal) = Script::new([]);
+fn zero_duration_never_starts_a_device_effect() -> Result<(), Box<dyn Error>> {
+    let (script, journal) = Script::new([Read::Bytes(
+        [wire::ACK.as_slice(), RESET_RESPONSE.as_slice()].concat(),
+    )]);
     let mut link = Link::new(script);
-    assert!(matches!(
-        link.command(2, &[], Duration::ZERO),
-        Err(TransactionError {
-            progress: Progress::NotSent,
-            failure: Failure::Deadline
-        })
-    ));
-    assert!(matches!(
-        link.host_ack(Duration::ZERO),
-        Err(TransactionError {
-            progress: Progress::NotSent,
-            failure: Failure::Deadline
-        })
-    ));
+    for result in [
+        link.command(2, &[], Duration::ZERO).map(|_| ()),
+        link.reset(Duration::ZERO).map(|_| ()),
+    ] {
+        assert!(matches!(
+            result,
+            Err(TransactionError {
+                progress: Progress::NotSent,
+                failure: Failure::Deadline
+            })
+        ));
+    }
     assert!(journal.borrow().writes.is_empty());
+    assert!(matches!(
+        link.reset(TIMEOUT)?.commit(Duration::ZERO),
+        Err(TransactionError {
+            progress: Progress::NotSent,
+            failure: Failure::Deadline
+        })
+    ));
+    assert_eq!(journal.borrow().writes.len(), 1);
+    Ok(())
 }
 
 #[test]

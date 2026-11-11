@@ -70,6 +70,9 @@ pub enum Failure<E> {
     ReaderError,
     /// Frame was valid but occurred in the wrong transaction phase.
     UnexpectedFrame,
+    /// [`Link::command`] cannot transact this request command: reset (`18`)
+    /// requires [`Link::reset`], and `FF` has no response command.
+    UnsupportedCommand(u8),
     /// The response was for a different command.
     ResponseCommand {
         /// Expected response command.
@@ -127,8 +130,9 @@ enum StreamState {
     Ready,
     RecoveryRequired,
     NeedsReset,
-    ResetCommitPending,
 }
+
+const RESET: u8 = 0x18;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct Deadline(Duration);
@@ -159,47 +163,75 @@ impl<T: Transport> Link<T> {
     /// ACK and response bytes must be returned by the backend before their
     /// respective deadlines. Backend completion itself may take longer.
     /// A failed transaction after the first write attempt requires recovery.
-    /// Reset (`18 01`) requires an empty response before a host ACK can commit it.
+    /// Reset (`18`) is admitted only through [`Link::reset`], and `FF` has no
+    /// response command; both are rejected with [`Failure::UnsupportedCommand`].
     pub fn command(
         &mut self,
         command: u8,
         args: &[u8],
         timeout: Duration,
     ) -> Result<Response, TransactionError<T::Error>> {
-        let is_reset = command == 0x18 && args == [1];
-        if self.state != StreamState::Ready && !(self.state == StreamState::NeedsReset && is_reset)
-        {
+        if self.state != StreamState::Ready {
+            return Err(not_sent(Failure::RecoveryRequired));
+        }
+        if command == RESET {
+            return Err(not_sent(Failure::UnsupportedCommand(command)));
+        }
+        let expected = command
+            .checked_add(1)
+            .ok_or(not_sent(Failure::UnsupportedCommand(command)))?;
+        let data = self.transact(command, expected, args, timeout)?;
+        self.state = StreamState::Ready;
+        Ok(Response {
+            command: expected,
+            data,
+        })
+    }
+
+    /// Send reset (`18 01`) and require its empty response. The returned
+    /// commit must send the host ACK before the link admits commands; dropping
+    /// it leaves the link requiring [`Link::recover`].
+    ///
+    /// # Errors
+    ///
+    /// Admitted when the link is ready or [`Link::recover`] completed. Failures
+    /// follow [`Link::command`]; a nonempty body is
+    /// [`Failure::ResetResponseLength`] and is never committed.
+    pub fn reset(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<ResetCommit<'_, T>, TransactionError<T::Error>> {
+        if !matches!(self.state, StreamState::Ready | StreamState::NeedsReset) {
+            return Err(not_sent(Failure::RecoveryRequired));
+        }
+        let data = self.transact(RESET, RESET + 1, &[1], timeout)?;
+        if !data.is_empty() {
             return Err(TransactionError {
-                progress: Progress::NotSent,
-                failure: Failure::RecoveryRequired,
+                progress: Progress::Acknowledged,
+                failure: Failure::ResetResponseLength(data.len()),
             });
         }
+        Ok(ResetCommit { link: self })
+    }
+
+    /// Run one admitted transaction. The stream stays in `RecoveryRequired`
+    /// from the first write until the caller publishes the next state.
+    fn transact(
+        &mut self,
+        command: u8,
+        expected: u8,
+        args: &[u8],
+        timeout: Duration,
+    ) -> Result<Vec<u8>, TransactionError<T::Error>> {
         if timeout.is_zero() {
-            return Err(TransactionError {
-                progress: Progress::NotSent,
-                failure: Failure::Deadline,
-            });
+            return Err(not_sent(Failure::Deadline));
         }
-        let frame = wire::encode(command, args).map_err(|e| TransactionError {
-            progress: Progress::NotSent,
-            failure: Failure::Frame(e),
-        })?;
-        let expected = command.checked_add(1).ok_or(TransactionError {
-            progress: Progress::NotSent,
-            failure: Failure::UnexpectedFrame,
-        })?;
-        let deadline =
-            Deadline::after(self.transport.monotonic_time(), timeout).ok_or(TransactionError {
-                progress: Progress::NotSent,
-                failure: Failure::Deadline,
-            })?;
-        let remaining =
-            deadline
-                .remaining(self.transport.monotonic_time())
-                .ok_or(TransactionError {
-                    progress: Progress::NotSent,
-                    failure: Failure::Deadline,
-                })?;
+        let frame = wire::encode(command, args).map_err(|e| not_sent(Failure::Frame(e)))?;
+        let deadline = Deadline::after(self.transport.monotonic_time(), timeout)
+            .ok_or(not_sent(Failure::Deadline))?;
+        let remaining = deadline
+            .remaining(self.transport.monotonic_time())
+            .ok_or(not_sent(Failure::Deadline))?;
         // Set the failure state before starting the first externally visible effect.
         self.state = StreamState::RecoveryRequired;
         let sent = self
@@ -222,7 +254,7 @@ impl<T: Transport> Link<T> {
         let ack_deadline =
             Deadline::after(self.transport.monotonic_time(), Duration::from_millis(20))
                 .map_or(deadline, |ack| ack.min(deadline));
-        let mut pending = Vec::with_capacity(600);
+        let mut pending = Vec::with_capacity(PENDING_CAPACITY);
         let mut progress = Progress::Sent;
         loop {
             let phase_deadline = if progress == Progress::Sent {
@@ -265,23 +297,7 @@ impl<T: Transport> Link<T> {
                             failure: Failure::TrailingData,
                         });
                     }
-                    let next_state = if is_reset {
-                        if !data.is_empty() {
-                            return Err(TransactionError {
-                                progress,
-                                failure: Failure::ResetResponseLength(data.len()),
-                            });
-                        }
-                        StreamState::ResetCommitPending
-                    } else {
-                        StreamState::Ready
-                    };
-                    let response = Response {
-                        command: actual,
-                        data: data.to_vec(),
-                    };
-                    self.state = next_state;
-                    return Ok(response);
+                    return Ok(data.to_vec());
                 }
                 Frame::Ack | Frame::Data { .. } => {
                     return Err(TransactionError {
@@ -291,33 +307,6 @@ impl<T: Transport> Link<T> {
                 }
             }
         }
-    }
-
-    /// Send a host ACK without expecting another ACK. A reset response must be
-    /// committed with this ACK; the link waits 10ms before admitting commands.
-    pub fn host_ack(&mut self, timeout: Duration) -> Result<(), TransactionError<T::Error>> {
-        if !matches!(
-            self.state,
-            StreamState::Ready | StreamState::ResetCommitPending
-        ) {
-            return Err(TransactionError {
-                progress: Progress::NotSent,
-                failure: Failure::RecoveryRequired,
-            });
-        }
-        if timeout.is_zero() {
-            return Err(TransactionError {
-                progress: Progress::NotSent,
-                failure: Failure::Deadline,
-            });
-        }
-        let reset_commit = self.state == StreamState::ResetCommitPending;
-        self.send_host_ack(timeout)?;
-        if reset_commit {
-            self.wait(Duration::from_millis(10));
-        }
-        self.state = StreamState::Ready;
-        Ok(())
     }
 
     fn send_host_ack(&mut self, timeout: Duration) -> Result<(), TransactionError<T::Error>> {
@@ -343,15 +332,14 @@ impl<T: Transport> Link<T> {
 
     /// Clear pipe state, cancel an unfinished reader command with an out-of-band
     /// ACK, wait 10ms, then discard cached input again. The wait also covers an
-    /// uncertain preceding reset commit. Only reset (`18 01`) is
-    /// admitted afterwards, followed by its response and committed host ACK.
+    /// uncertain preceding reset commit. Only [`Link::reset`] is admitted
+    /// afterwards, followed by its committed host ACK.
     /// This never determines whether a preceding card operation executed.
     pub fn recover(&mut self) -> Result<(), TransactionError<T::Error>> {
         self.state = StreamState::RecoveryRequired;
-        self.transport.recover().map_err(|e| TransactionError {
-            progress: Progress::NotSent,
-            failure: Failure::Io(e),
-        })?;
+        self.transport
+            .recover()
+            .map_err(|e| not_sent(Failure::Io(e)))?;
         self.send_host_ack(Duration::from_secs(1))?;
         self.wait(Duration::from_millis(10));
         self.transport.recover().map_err(|e| TransactionError {
@@ -367,6 +355,47 @@ impl<T: Transport> Link<T> {
     }
 }
 
+/// Reset whose empty response was received but whose host ACK is not yet sent.
+/// The link admits no other operation while this value borrows it.
+#[must_use = "the reset stays uncommitted and the link unusable until commit sends the host ACK"]
+#[derive(Debug)]
+pub struct ResetCommit<'a, T: Transport> {
+    link: &'a mut Link<T>,
+}
+
+impl<T: Transport> ResetCommit<'_, T> {
+    /// Send the host ACK that commits the reset, then wait 10ms before the link
+    /// admits commands.
+    ///
+    /// # Errors
+    ///
+    /// A zero timeout sends nothing and leaves the link requiring recovery. A
+    /// failed or short ACK write leaves the commit uncertain and also requires
+    /// [`Link::recover`].
+    pub fn commit(self, timeout: Duration) -> Result<(), TransactionError<T::Error>> {
+        if timeout.is_zero() {
+            return Err(not_sent(Failure::Deadline));
+        }
+        self.link.send_host_ack(timeout)?;
+        self.link.wait(Duration::from_millis(10));
+        self.link.state = StreamState::Ready;
+        Ok(())
+    }
+}
+
+fn not_sent<E>(failure: Failure<E>) -> TransactionError<E> {
+    TransactionError {
+        progress: Progress::NotSent,
+        failure,
+    }
+}
+
+/// Bytes read per backend call; one call can hold a complete frame.
+const READ_CHUNK: usize = wire::MAX_FRAME;
+/// `pending` holds less than one frame before each read, so it never exceeds
+/// an incomplete frame plus one chunk.
+const PENDING_CAPACITY: usize = wire::MAX_FRAME - 1 + READ_CHUNK;
+
 fn next_frame<T: Transport>(
     transport: &mut T,
     pending: &mut Vec<u8>,
@@ -381,10 +410,11 @@ fn next_frame<T: Transport>(
         let remaining = deadline
             .remaining(transport.monotonic_time())
             .ok_or(Failure::Deadline)?;
-        let mut buffer = [0u8; 300];
+        let mut buffer = [0u8; READ_CHUNK];
         let n = transport
             .read(&mut buffer, remaining)
             .map_err(Failure::Io)?;
+        // Admit only bytes from a read that completed before the deadline.
         if n == 0 || deadline.remaining(transport.monotonic_time()).is_none() {
             return Err(Failure::Deadline);
         }
@@ -392,9 +422,6 @@ fn next_frame<T: Transport>(
             capacity: buffer.len(),
             reported: n,
         })?;
-        if pending.len() + n > 600 {
-            return Err(Failure::TrailingData);
-        }
         pending.extend_from_slice(bytes);
     }
 }
