@@ -35,7 +35,18 @@ pub enum Type2EmulationError<E> {
 
 impl<E: fmt::Debug> fmt::Display for Type2EmulationError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::MessageLength(length) => write!(
+                f,
+                "NDEF message of {length} bytes exceeds {MAX_TYPE2_EMULATED_NDEF_BYTES}"
+            ),
+            Self::Message(_) => f.write_str("invalid NDEF message"),
+            Self::Reader(_) => f.write_str("Type 2 emulation reader command failed"),
+            Self::Activation => f.write_str("reader activated an unsupported target mode"),
+            Self::Layout => f.write_str("malformed Type 2 emulation firmware response"),
+            Self::Status(status) => write!(f, "Type 2 emulation status {status:02X}"),
+            Self::SessionUnavailable => f.write_str("Type 2 emulation session is unavailable"),
+        }
     }
 }
 

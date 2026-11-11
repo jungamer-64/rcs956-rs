@@ -37,7 +37,21 @@ pub enum Error {
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::Truncated {
+                field,
+                minimum,
+                actual,
+            } => write!(f, "NFC-A {field} needs {minimum} bytes, got {actual}"),
+            Self::UidLength(length) => write!(f, "unsupported NFC-A UID length {length}"),
+            Self::AtsLength { declared, actual } => {
+                write!(f, "ATS declares {declared} bytes, got {actual}")
+            }
+            Self::AtsFormat(format) => write!(f, "unsupported ATS format byte {format:02X}"),
+            Self::FrameSizeIndex(index) => write!(f, "unsupported FSCI {index}"),
+            Self::FrameWaitIndex(index) => write!(f, "reserved FWI {index}"),
+            Self::GuardTimeIndex(index) => write!(f, "reserved SFGI {index}"),
+        }
     }
 }
 impl core::error::Error for Error {}

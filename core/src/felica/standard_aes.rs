@@ -105,7 +105,31 @@ pub enum Error<E> {
 
 impl<E: fmt::Debug> fmt::Display for Error<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::Nodes(count) => write!(f, "{count} authentication nodes, expected 1..=16"),
+            Self::BlockCount(count) => write!(f, "{count} blocks exceed the secure packet budget"),
+            Self::ServiceIndex(index) => {
+                write!(f, "service index {index} is outside the node list")
+            }
+            Self::PayloadLength(length) => {
+                write!(f, "secure payload of {length} bytes exceeds one packet")
+            }
+            Self::Exchange { command, .. } => {
+                write!(f, "FeliCa AES command {command:02X} exchange failed")
+            }
+            Self::CardProof => f.write_str("card did not prove the shared key"),
+            Self::Layout => f.write_str("malformed secure response"),
+            Self::Mac => f.write_str("secure response MAC mismatch"),
+            Self::TransactionNumber { sent, received } => write!(
+                f,
+                "response transaction number {received} does not follow {sent}"
+            ),
+            Self::CounterExhausted => f.write_str("transaction counter exhausted"),
+            Self::Status { first, second } => {
+                write!(f, "card status flags {first:02X} {second:02X}")
+            }
+            Self::SessionUnavailable => f.write_str("AES session was revoked"),
+        }
     }
 }
 

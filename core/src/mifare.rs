@@ -37,7 +37,15 @@ pub enum Error<E> {
 
 impl<E: fmt::Debug> fmt::Display for Error<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::UnsupportedCard => f.write_str("card has no supported MIFARE Classic layout"),
+            Self::Block(block) => write!(f, "block {block} is outside the authenticated sector"),
+            Self::AuthenticationLost => f.write_str("sector authentication was revoked"),
+            Self::Response { status, length } => {
+                write!(f, "reader status {status:02X} with {length} response bytes")
+            }
+            Self::Exchange(_) => f.write_str("MIFARE Classic exchange failed"),
+        }
     }
 }
 

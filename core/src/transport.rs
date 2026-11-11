@@ -97,7 +97,46 @@ pub struct TransactionError<E> {
 }
 impl<E: fmt::Debug> fmt::Display for TransactionError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "transaction {:?}: {:?}", self.progress, self.failure)
+        match &self.failure {
+            Failure::Frame(_) => f.write_str("invalid frame")?,
+            Failure::Io(_) => f.write_str("transport I/O failed")?,
+            Failure::RecoveryRequired => f.write_str("stream requires recovery")?,
+            Failure::Deadline => f.write_str("host deadline expired")?,
+            Failure::ShortWrite {
+                requested,
+                transferred,
+            } => write!(f, "short write of {transferred} of {requested} bytes")?,
+            Failure::ReceiveLength { capacity, reported } => {
+                write!(
+                    f,
+                    "backend reported {reported} bytes for a {capacity}-byte buffer"
+                )?;
+            }
+            Failure::Nak => f.write_str("reader returned NAK")?,
+            Failure::ReaderError => f.write_str("reader returned an error frame")?,
+            Failure::UnexpectedFrame => {
+                f.write_str("unexpected frame for the transaction phase")?
+            }
+            Failure::UnsupportedCommand(command) => {
+                write!(
+                    f,
+                    "command {command:02X} cannot be sent as an ordinary command"
+                )?;
+            }
+            Failure::ResponseCommand { expected, actual } => {
+                write!(f, "response command {actual:02X}, expected {expected:02X}")?;
+            }
+            Failure::ResetResponseLength(length) => {
+                write!(f, "reset response has {length} body bytes")?;
+            }
+            Failure::TrailingData => f.write_str("unconsumed bytes followed the response")?,
+        }
+        f.write_str(match self.progress {
+            Progress::NotSent => " before sending",
+            Progress::Sending => " while sending",
+            Progress::Sent => " before ACK",
+            Progress::Acknowledged => " after ACK",
+        })
     }
 }
 impl<E: error::Error + 'static> error::Error for TransactionError<E> {

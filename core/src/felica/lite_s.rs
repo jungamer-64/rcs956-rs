@@ -84,7 +84,29 @@ pub enum Error<E> {
 
 impl<E: fmt::Debug> fmt::Display for Error<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::UnsupportedCard(ic) => write!(f, "IC type {ic:02X} is not FeliCa Lite-S"),
+            Self::SessionUnavailable => f.write_str("Lite-S session was revoked"),
+            Self::Exchange { stage, .. } => write!(f, "Lite-S {} failed", stage_name(*stage)),
+            Self::MacMismatch(stage) => write!(f, "Lite-S {} MAC mismatch", stage_name(*stage)),
+            Self::IdentityMismatch => f.write_str("authenticated ID block has a different IDm"),
+            Self::CounterLayout => f.write_str("write counter has nonzero reserved bytes"),
+            Self::AuthenticationState(state) => {
+                write!(f, "card authentication state {state:02X}, expected 01")
+            }
+        }
+    }
+}
+
+fn stage_name(stage: Stage) -> &'static str {
+    match stage {
+        Stage::Challenge => "challenge",
+        Stage::CardProof => "card proof",
+        Stage::HostProof => "host proof",
+        Stage::ConfirmAuthentication => "authentication confirmation",
+        Stage::Read => "read",
+        Stage::ReadCounter => "counter read",
+        Stage::Write => "write; it may have been applied",
     }
 }
 

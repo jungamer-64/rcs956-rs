@@ -46,7 +46,13 @@ pub enum ParameterError {
 }
 impl fmt::Display for ParameterError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::FrameSize(size) => write!(f, "unsupported ISO-DEP frame size {size}"),
+            Self::Cid(cid) => write!(f, "CID {cid} is outside 1..=14"),
+            Self::Nad(nad) => write!(f, "reserved node address {nad:02X}"),
+            Self::NadUnsupported => f.write_str("card does not support node addressing"),
+            Self::Wait => f.write_str("block wait is zero or exceeds the FWI 14 wait"),
+        }
     }
 }
 impl error::Error for ParameterError {}
@@ -136,7 +142,35 @@ pub struct Error<E> {
 }
 impl<E: fmt::Debug> fmt::Display for Error<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        match &self.cause {
+            Cause::SessionInvalid => return f.write_str("ISO-DEP session is invalid"),
+            Cause::ActivationRequired => return f.write_str("target has no ISO-DEP activation"),
+            Cause::InputLength { actual, maximum } => {
+                return write!(f, "APDU of {actual} bytes exceeds {maximum}");
+            }
+            Cause::Preparation(_) => {
+                return f.write_str("reader setup failed before the APDU was sent");
+            }
+            Cause::Transport(_) => f.write_str("ISO-DEP transfer failed")?,
+            Cause::RecoveryExhausted(_) => f.write_str("ISO-DEP RF timeout recovery exhausted")?,
+            Cause::InvalidBlock(reason) => write!(f, "invalid ISO-DEP block: {reason}")?,
+            Cause::Deselected => f.write_str("card requested deselection")?,
+            Cause::Budget(budget) => f.write_str(match budget {
+                Budget::Frames => "ISO-DEP frame budget exhausted",
+                Budget::WaitExtensions => "ISO-DEP WTX budget exhausted",
+                Budget::Retransmissions => "ISO-DEP block retransmission budget exhausted",
+                Budget::ResponseBytes => "ISO-DEP response exceeds its limit",
+            })?,
+        }
+        let p = &self.progress;
+        write!(
+            f,
+            " after {} frames; APDU bytes attempted {}, acknowledged {}; response bytes {}",
+            p.frames,
+            p.attempted_application_bytes,
+            p.acknowledged_application_bytes,
+            p.received_application_bytes,
+        )
     }
 }
 impl<E: error::Error + 'static> error::Error for Error<E> {
@@ -168,7 +202,13 @@ pub enum PresenceError<E> {
 }
 impl<E: fmt::Debug> fmt::Display for PresenceError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        f.write_str(match self {
+            Self::SessionInvalid => "ISO-DEP session is invalid",
+            Self::Preparation(_) => "reader setup failed before the presence check",
+            Self::NoResponse(_) => "card did not answer the presence check",
+            Self::Transport(_) => "presence check transfer failed",
+            Self::InvalidBlock(_) => "presence answer is not the required R(ACK)",
+        })
     }
 }
 impl<E: error::Error + 'static> error::Error for PresenceError<E> {

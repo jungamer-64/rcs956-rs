@@ -191,7 +191,7 @@ extern "C" fn d0_entry(device: WDFDEVICE, _: WDF_DEVICE_POWER_STATE) -> NTSTATUS
             }
             Err(error) => {
                 queues.purge();
-                super::trace(format_args!("D0 initialization: {error}"));
+                super::trace(format_args!("D0 initialization: {}", super::Chain(&error)));
                 error.0
             }
         }

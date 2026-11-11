@@ -96,7 +96,44 @@ pub enum DepTransferCause<E> {
 
 impl<E: fmt::Debug> fmt::Display for DepError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::Reader(_) => f.write_str("NFC-DEP reader command failed"),
+            Self::Listen(_) => f.write_str("NFC-DEP listen did not complete"),
+            Self::GeneralBytes(length) => {
+                write!(f, "{length} general bytes do not fit the ATR")
+            }
+            Self::MessageLength(length) => write!(
+                f,
+                "NFC-DEP message of {length} bytes exceeds {MAX_DEP_MESSAGE_BYTES}"
+            ),
+            Self::SessionUnavailable => f.write_str("NFC-DEP session is unavailable"),
+            Self::Activation => f.write_str("NFC-DEP activation is unsupported or malformed"),
+            Self::Layout => f.write_str("malformed NFC-DEP firmware response"),
+            Self::Status(status) => write!(f, "NFC-DEP status {status:02X}"),
+            Self::NodeAddressUnavailable => f.write_str("peer did not accept a node address"),
+            Self::Transfer {
+                attempted,
+                accepted,
+                received,
+                cause,
+            } => {
+                f.write_str(match cause {
+                    DepTransferCause::Reader(_) => "NFC-DEP reader command failed",
+                    DepTransferCause::Status(_) => "NFC-DEP RF exchange failed",
+                    DepTransferCause::Layout => "malformed NFC-DEP firmware response",
+                    DepTransferCause::NodeAddress => "inconsistent NFC-DEP node address",
+                    DepTransferCause::Limit => "NFC-DEP message or fragment limit exceeded",
+                })?;
+                if let DepTransferCause::Status(status) = cause {
+                    write!(f, " with status {status:02X}")?;
+                }
+                write!(
+                    f,
+                    " after {attempted} bytes submitted, {accepted} accepted, {} received",
+                    received.payload.len()
+                )
+            }
+        }
     }
 }
 

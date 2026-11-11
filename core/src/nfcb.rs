@@ -60,7 +60,23 @@ pub enum Error {
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::Truncated { minimum, actual } => {
+                write!(f, "NFC-B activation needs {minimum} bytes, got {actual}")
+            }
+            Self::AttribLength { declared, actual } => {
+                write!(f, "ATTRIB response declares {declared} bytes, got {actual}")
+            }
+            Self::AtqbResponseCode(code) => write!(f, "ATQB response code {code:02X}, expected 50"),
+            Self::MissingAttrib => f.write_str("card returned no ATTRIB response"),
+            Self::FrameSizeIndex(index) => write!(f, "unsupported FSCI {index}"),
+            Self::ReaderFrameSizeIndex(index) => write!(f, "unsupported reader FSDI {index}"),
+            Self::FrameWaitIndex(index) => write!(f, "reserved FWI {index}"),
+            Self::ReservedCid => f.write_str("ATTRIB assigned reserved CID 15"),
+            Self::UnsupportedCid(cid) => {
+                write!(f, "ATTRIB assigned CID {cid} to a card without CID support")
+            }
+        }
     }
 }
 impl core::error::Error for Error {}

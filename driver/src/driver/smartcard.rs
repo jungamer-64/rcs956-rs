@@ -63,7 +63,7 @@ impl Frontend {
         self.service.control.bound(Duration::from_secs(1));
         // RF off is best-effort during D0 exit. PnP releases the USB target.
         if let Err(error) = self.reader.rf_off() {
-            super::trace(format_args!("RF shutdown: {error}"));
+            super::trace(format_args!("RF shutdown: {}", super::Chain(&error)));
         }
     }
 }
@@ -281,7 +281,7 @@ impl Service {
                     None => probe = None,
                     Some(Ok(())) => probe = Some(Instant::now() + PRESENCE_PERIOD),
                     Some(Err(error)) => {
-                        super::trace(format_args!("presence check: {error}"));
+                        super::trace(format_args!("presence check: {}", super::Chain(&error)));
                         return Next::Departed;
                     }
                 }

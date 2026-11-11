@@ -51,6 +51,21 @@ unsafe extern "system" fn driver_entry(
     }
 }
 
+/// An error followed by its source chain, for diagnostic output.
+struct Chain<'a>(&'a dyn core::error::Error);
+
+impl fmt::Display for Chain<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)?;
+        let mut cause = self.0.source();
+        while let Some(error) = cause {
+            write!(f, ": {error}")?;
+            cause = error.source();
+        }
+        Ok(())
+    }
+}
+
 fn trace(message: fmt::Arguments<'_>) {
     if let Ok(line) = CString::new(format!("rcs956-driver: {message}\n")) {
         // SAFETY: The string is nul-terminated and valid for the call.

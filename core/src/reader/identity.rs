@@ -96,7 +96,14 @@ pub enum DeviceNameError {
 
 impl fmt::Display for DeviceNameError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::Offset(offset) => write!(f, "device name offset {offset:02X} is outside 72..=BA"),
+            Self::DescriptorType(kind) => {
+                write!(f, "device name descriptor type {kind}, expected 3")
+            }
+            Self::Length(length) => write!(f, "invalid device name descriptor length {length}"),
+            Self::Utf16 => f.write_str("device name is not valid UTF-16LE"),
+        }
     }
 }
 impl error::Error for DeviceNameError {}

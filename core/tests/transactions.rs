@@ -660,3 +660,17 @@ fn read_count_beyond_capacity_is_a_backend_contract_failure() {
     ));
     assert_eq!(journal.borrow().writes, [FIRMWARE_REQUEST]);
 }
+
+#[test]
+fn transaction_errors_describe_the_failure_and_its_phase() -> Result<(), Box<dyn Error>> {
+    let (script, _) = Script::new([Read::Bytes(wire::NAK.to_vec())]);
+    let mut link = Link::new(script);
+    let error = link.command(2, &[], TIMEOUT).err().ok_or("expected NAK")?;
+    assert_eq!(error.to_string(), "reader returned NAK before ACK");
+    let error = link
+        .command(2, &[], TIMEOUT)
+        .err()
+        .ok_or("expected poison")?;
+    assert_eq!(error.to_string(), "stream requires recovery before sending");
+    Ok(())
+}

@@ -52,7 +52,25 @@ pub enum Error<E> {
 
 impl<E: fmt::Debug> fmt::Display for Error<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::Exchange(_) => f.write_str("tag exchange failed"),
+            Self::UnsupportedMapping => f.write_str("unsupported NDEF mapping"),
+            Self::ReadAccess => f.write_str("NDEF data is not readable without authentication"),
+            Self::WriteAccess => f.write_str("NDEF data is not writable without authentication"),
+            Self::WriteInProgress => f.write_str("tag reports an unfinished NDEF write"),
+            Self::Capacity {
+                requested,
+                available,
+            } => write!(f, "NDEF message of {requested} bytes exceeds {available}"),
+            Self::Layout(reason) => write!(f, "invalid NDEF layout: {reason}"),
+            Self::Address(address) => write!(f, "address {address} is outside the tag"),
+            Self::Status(status) => write!(f, "card returned status word {status:04X}"),
+            Self::Type2Nak(nak) => write!(f, "Type 2 tag returned NAK {nak:X}"),
+            Self::Type2ReaderStatus(status) => {
+                write!(f, "unexpected Type 2 reader status {status:02X}")
+            }
+            Self::MissingMessageTlv => f.write_str("tag has no NDEF message TLV"),
+        }
     }
 }
 
@@ -105,7 +123,24 @@ impl<E> WriteError<E> {
 
 impl<E: fmt::Debug> fmt::Display for WriteError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::Preparation(_) => f.write_str("NDEF write rejected before any tag update"),
+            Self::Update {
+                stage,
+                acknowledged_bytes,
+                ..
+            } => {
+                let stage = match stage {
+                    UpdateStage::Begin => "unpublishing the previous message",
+                    UpdateStage::Data => "writing the message",
+                    UpdateStage::Publish => "publishing the message",
+                };
+                write!(
+                    f,
+                    "NDEF write failed while {stage} after {acknowledged_bytes} acknowledged bytes; tag state is uncertain"
+                )
+            }
+        }
     }
 }
 

@@ -70,7 +70,26 @@ pub enum Error<E> {
 }
 impl<E: fmt::Debug> fmt::Display for Error<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::Transaction(_) => f.write_str("reader transaction failed"),
+            Self::Recovery(_) => f.write_str("reader recovery failed"),
+            Self::NotInitialized => f.write_str("reader requires initialization"),
+            Self::Response(reason) => write!(f, "malformed reader response: {reason}"),
+            Self::Configuration(_) => f.write_str("invalid reader configuration"),
+            Self::RegisterStatus(status) => write!(f, "register write returned {status:02X}"),
+            Self::RfStatus(status) => write!(f, "RF status {status:02X}"),
+            Self::FelicaRequest(_) => f.write_str("FeliCa request rejected before sending"),
+            Self::FelicaResponse(_) => {
+                f.write_str("FeliCa response failed; the command may have taken effect")
+            }
+            Self::Timeout(_) => f.write_str("invalid RF wait"),
+            Self::TypeA(_) => f.write_str("invalid NFC-A activation"),
+            Self::TypeB(_) => f.write_str("invalid NFC-B activation"),
+            Self::IsoDepParameters(_) => f.write_str("unsupported ISO-DEP parameters"),
+            Self::InputLength { maximum, actual } => {
+                write!(f, "input of {actual} bytes exceeds {maximum}")
+            }
+        }
     }
 }
 impl<E: error::Error + 'static> error::Error for Error<E> {
@@ -149,7 +168,13 @@ pub enum ConfigurationError {
 
 impl fmt::Display for ConfigurationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::Signature => f.write_str("configuration signature is absent"),
+            Self::Checksum { offset } => {
+                write!(f, "configuration checksum fails at offset {offset:02X}")
+            }
+            Self::ModelClass => f.write_str("unsupported configuration model class"),
+        }
     }
 }
 impl error::Error for ConfigurationError {}
@@ -878,7 +903,19 @@ pub enum TypeAExchangeError<E> {
 
 impl<E: fmt::Debug> fmt::Display for TypeAExchangeError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::InputLength(length) => write!(
+                f,
+                "NFC-A command of {length} bytes is outside 1..={MAX_TYPE_A_COMMAND_BYTES}"
+            ),
+            Self::SessionInvalid => f.write_str("NFC-A selection is no longer valid"),
+            Self::ResponsePending => f.write_str("an NFC-A response fragment is pending"),
+            Self::FragmentLimit => f.write_str("NFC-A response fragment limit exceeded"),
+            Self::Preparation(_) => f.write_str("reader setup failed before the card command"),
+            Self::Exchange(_) => {
+                f.write_str("NFC-A exchange failed; the command may have taken effect")
+            }
+        }
     }
 }
 

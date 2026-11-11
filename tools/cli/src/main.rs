@@ -14,7 +14,14 @@ fn main() -> std::process::ExitCode {
     match command::run() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("{error}");
+            let mut message = error.to_string();
+            let mut cause = error.source();
+            while let Some(error) = cause {
+                message.push_str(": ");
+                message.push_str(&error.to_string());
+                cause = error.source();
+            }
+            eprintln!("{message}");
             std::process::ExitCode::FAILURE
         }
     }
