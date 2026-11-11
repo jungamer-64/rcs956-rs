@@ -1,6 +1,0 @@
-[alias]
-build-usb = ["build", "--locked", "-p", "rcs956-driver", "-p", "rcs956-cli", "--features", "rcs956-driver/usb"]
-build-pcsc = ["build", "--locked", "-p", "rcs956-driver", "--features", "rcs956-driver/pcsc"]
-
-[target.'cfg(all(windows, target_env = "msvc"))']
-rustflags = ["-C", "target-feature=+crt-static"]
