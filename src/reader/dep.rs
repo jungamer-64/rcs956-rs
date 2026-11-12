@@ -1,4 +1,4 @@
-use super::{Error, Reader, ResponseTimeout, RfTimeout, State};
+use super::{Error, Parameters, Reader, ResponseTimeout, RfTimeout, State};
 use crate::transport::Transport;
 use alloc::vec::Vec;
 use core::{fmt, time::Duration};
@@ -236,11 +236,10 @@ impl<T: Transport> Reader<T> {
         let args = initiator_arguments(activation)?;
         self.initialize()?;
         self.state = State::NeedsInitialization;
-        expect_empty(self.command(
-            0x12,
-            &[u8::from(activation.node_address.is_some())],
-            SETUP_WAIT,
-        )?)?;
+        self.set_parameters(Parameters {
+            node_address: activation.node_address.is_some(),
+            ..Parameters::DEFAULT
+        })?;
         let timing = ResponseTimeout::for_request(timeout);
         expect_empty(self.command(0x32, &timing.args(), SETUP_WAIT)?)?;
         expect_empty(self.command(0x32, &[5, 0, 0, 0], SETUP_WAIT)?)?;
@@ -279,7 +278,11 @@ impl<T: Transport> Reader<T> {
             &[0x82, RESPONSE_WAIT_INDEX, 2, RESPONSE_WAIT_INDEX],
             SETUP_WAIT,
         )?)?;
-        expect_empty(self.command(0x12, &[0x08], SETUP_WAIT)?)?;
+        // ATR_RES is sent by `92` so that it carries the caller's general bytes.
+        self.set_parameters(Parameters {
+            automatic_atr_response: false,
+            ..Parameters::DEFAULT
+        })?;
         self.write_register(0x6301, 0x7b)?;
         self.write_register(0x6302, 0xb0)?;
         self.write_register(0x6303, 0xb0)?;

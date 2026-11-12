@@ -244,6 +244,7 @@ fn initialization(config: &[u8; 256]) -> Vec<Step> {
     }
     steps.extend([
         command(0x0c, &[], &[0x1c]),
+        command(0x12, &[0x1c], &[]),
         command(8, &[0x63, 0x0a, 0x40], &[0]),
         command(0x32, &[1, 0], &[]),
     ]);
@@ -2312,7 +2313,7 @@ fn passive_dep_owns_activation_and_one_response_at_a_time() -> Result<(), Box<dy
     steps.extend([
         command(8, &[0x63, 0x0b, 0x80], &[0]),
         command(0x32, &[0x82, 8, 2, 8], &[]),
-        command(0x12, &[8], &[]),
+        command(0x12, &[0x18], &[]),
         command(8, &[0x63, 1, 0x7b], &[0]),
         command(8, &[0x63, 2, 0xb0], &[0]),
         command(8, &[0x63, 3, 0xb0], &[0]),
@@ -2426,7 +2427,7 @@ fn dep_initiator_uses_meta_chaining_and_retains_partial_failure() -> Result<(), 
     let mut first = vec![0x41, 0x31];
     first.extend([0xa5; 59]);
     steps.extend([
-        command(0x12, &[1], &[]),
+        command(0x12, &[0x1d], &[]),
         command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
         command(0x32, &[5, 0, 0, 0], &[]),
         command(

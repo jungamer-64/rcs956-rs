@@ -341,6 +341,26 @@ impl ResponseTimeout {
     }
 }
 
+/// Firmware parameters written by command `12`. Bits 3 and 4 are fixed to
+/// one; bit 4 makes firmware send RATS while activating an ISO-DEP NFC-A
+/// card, so `4B` reports its ATS. Reset changes only the operating mode and
+/// leaves these parameters as last written.
+#[derive(Debug, Clone, Copy)]
+struct Parameters {
+    node_address: bool,
+    automatic_atr_response: bool,
+}
+impl Parameters {
+    const DEFAULT: Self = Self {
+        node_address: false,
+        automatic_atr_response: true,
+    };
+
+    fn byte(self) -> u8 {
+        0x18 | u8::from(self.node_address) | (u8::from(self.automatic_atr_response) << 2)
+    }
+}
+
 /// `06` arguments reading CIU_Status1 and CIU_Command.
 const RECEIVER_PROBE: [u8; 4] = [0x63, 0x37, 0x63, 0x31];
 /// CIU_Status1 bit set while the receiver is stalled so that
@@ -447,6 +467,8 @@ impl<T: Transport> Reader<T> {
 
     /// Recover the transport, reset the reader, read its configuration, and enter
     /// RF-off readiness. Failure leaves the reader uninitialized; no command replay.
+    /// Reset does not restore firmware parameters, so this rewrites the defaults
+    /// that NFC-A activation relies on after a role that changed them.
     pub fn initialize(&mut self) -> Result<ReaderInfo, Error<T::Error>> {
         self.state = State::NeedsInitialization;
         self.link.recover().map_err(Error::Recovery)?;
@@ -482,6 +504,7 @@ impl<T: Transport> Reader<T> {
             .first()
             .copied()
             .ok_or(Error::Response("reader flags length"))?;
+        self.set_parameters(Parameters::DEFAULT)?;
         self.write_register(0x630a, 0x40)?;
         self.disable_rf()?;
         let info = ReaderInfo {
@@ -518,6 +541,15 @@ impl<T: Transport> Reader<T> {
         match reply.iter().find(|status| **status != 0) {
             Some(status) => Err(Error::RegisterStatus(*status)),
             None => Ok(()),
+        }
+    }
+
+    fn set_parameters(&mut self, parameters: Parameters) -> Result<(), Error<T::Error>> {
+        let reply = self.command(0x12, &[parameters.byte()], Duration::from_secs(1))?;
+        if reply.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Response("parameter response length"))
         }
     }
 
