@@ -2317,6 +2317,7 @@ fn passive_dep_owns_activation_and_one_response_at_a_time() -> Result<(), Box<dy
         command(8, &[0x63, 1, 0x7b], &[0]),
         command(8, &[0x63, 2, 0xb0], &[0]),
         command(8, &[0x63, 3, 0xb0], &[0]),
+        command(8, &[0x63, 0x0d, 8], &[0]),
         command(
             0x8c,
             &[
@@ -2416,6 +2417,57 @@ fn failed_receiver_restart_sends_no_activation() -> Result<(), Box<dyn Error>> {
         reader.poll_type1(timeout()?),
         Err(TargetExchangeError::Preparation(ReaderError::Response(_)))
     ));
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn passive_dep_at_106_kbps_prepares_target_registers_and_restores_parameters()
+-> Result<(), Box<dyn Error>> {
+    let configuration = ab_config_image();
+    let mut steps = initialization(&configuration);
+    steps.extend([
+        command(8, &[0x63, 0x0b, 0x80], &[0]),
+        command(0x32, &[0x82, 8, 2, 8], &[]),
+        command(0x12, &[0x18], &[]),
+        command(8, &[0x63, 1, 0x7b], &[0]),
+        command(8, &[0x63, 2, 0xb0], &[0]),
+        command(8, &[0x63, 3, 0xb0], &[0]),
+        command(8, &[0x63, 0x0d, 8], &[0]),
+        command(
+            0x8c,
+            &[
+                2, 1, 1, 0x31, 0x32, 0x33, 0x40, 1, 0xfe, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0, 0,
+                0, 0, 0, 0, 0, 0, 0xff, 0xff, 1, 0xfe, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0, 0,
+            ],
+            &[
+                0, 19, 0xd4, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 0, 0, 0, 2, 0x46, 0x66,
+            ],
+        ),
+        command(8, &[0x63, 0x0d, 0], &[0]),
+        command(8, &[0x63, 1, 0x3b], &[0]),
+        command(0x92, &[], &[0]),
+    ]);
+    steps.extend(initialization(&configuration));
+    steps.extend(ab_mode(false));
+    steps.extend([idle_receiver(), command(0x4a, &[1, 0], &type_a_response(7))]);
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    let target = reader.listen_passive_dep(*b"123456", &[], timeout()?)?;
+    assert_eq!(target.initiator().rate, DepRate::Kbps106);
+    target.finish()?;
+    let card = reader.poll_type_a(timeout()?)?.ok_or("NFC-A card absent")?;
+    assert!(card.observation().ats().is_some());
+    let parameters: Vec<Vec<u8>> = journal
+        .borrow()
+        .requests
+        .iter()
+        .filter_map(|request| match request {
+            Request::Command(0x12, args) => Some(args.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(parameters, [[0x1c], [0x18], [0x1c]]);
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
 }

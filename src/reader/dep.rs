@@ -286,6 +286,8 @@ impl<T: Transport> Reader<T> {
         self.write_register(0x6301, 0x7b)?;
         self.write_register(0x6302, 0xb0)?;
         self.write_register(0x6303, 0xb0)?;
+        // Target reception setting; activation at 106 kbps clears it again.
+        self.write_register(0x630d, 0x08)?;
 
         let [a, b, c, d, e, f] = identity;
         let nfcid2 = [1, 0xfe, a, b, c, d, e, f];
@@ -298,6 +300,11 @@ impl<T: Transport> Reader<T> {
             .command(0x8c, &parameters, timeout.host_wait())
             .map_err(DepError::Listen)?;
         let initiator = parse_activation(&response)?;
+        if initiator.rate == DepRate::Kbps106 {
+            // A passive 106 kbps target needs these registers before ATR_RES.
+            self.write_register(0x630d, 0)?;
+            self.write_register(0x6301, 0x3b)?;
+        }
         expect_status(self.command(0x92, general_bytes, SETUP_WAIT)?)?;
         Ok(PassiveDepTarget {
             reader: self,
