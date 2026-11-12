@@ -341,6 +341,31 @@ impl ResponseTimeout {
     }
 }
 
+/// `06` arguments reading CIU_Status1 and CIU_Command.
+const RECEIVER_PROBE: [u8; 4] = [0x63, 0x37, 0x63, 0x31];
+/// CIU_Status1 bit set while the receiver is stalled so that
+/// InListPassiveTarget cannot send its first request.
+const RECEIVER_STALLED: u8 = 0x08;
+const CIU_COMMAND: u16 = 0x6331;
+const CIU_RECEIVE: u8 = 0x08;
+const CIU_IDLE: u8 = 0x00;
+
+/// Failure of an InListPassiveTarget activation, split at the `4A` request.
+#[derive(Debug)]
+enum ActivationError<E> {
+    /// Receiver preparation failed; no RF request was sent.
+    BeforeRequest(Error<E>),
+    /// The `4A` transaction or its response failed.
+    Request(Error<E>),
+}
+impl<E> From<ActivationError<E>> for Error<E> {
+    fn from(error: ActivationError<E>) -> Self {
+        match error {
+            ActivationError::BeforeRequest(error) | ActivationError::Request(error) => error,
+        }
+    }
+}
+
 /// RF configuration and the timer are published only after all writes succeed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RfProtocol {
@@ -473,13 +498,57 @@ impl<T: Transport> Reader<T> {
     }
 
     fn write_register(&mut self, address: u16, value: u8) -> Result<(), Error<T::Error>> {
-        let [hi, lo] = address.to_be_bytes();
-        let reply = self.command(8, &[hi, lo, value], Duration::from_secs(1))?;
-        match reply.as_slice() {
-            [0] => Ok(()),
-            [status] => Err(Error::RegisterStatus(*status)),
-            _ => Err(Error::Response("register write length")),
+        self.write_registers(&[(address, value)])
+    }
+
+    /// Write registers in order with one `08` command. The reader returns one
+    /// status per register; the first nonzero status is reported.
+    fn write_registers(&mut self, writes: &[(u16, u8)]) -> Result<(), Error<T::Error>> {
+        let args: Vec<u8> = writes
+            .iter()
+            .flat_map(|&(address, value)| {
+                let [hi, lo] = address.to_be_bytes();
+                [hi, lo, value]
+            })
+            .collect();
+        let reply = self.command(8, &args, Duration::from_secs(1))?;
+        if reply.len() != writes.len() {
+            return Err(Error::Response("register write length"));
         }
+        match reply.iter().find(|status| **status != 0) {
+            Some(status) => Err(Error::RegisterStatus(*status)),
+            None => Ok(()),
+        }
+    }
+
+    /// Send InListPassiveTarget (`4A`). The firmware can stall its receiver
+    /// so that no request is sent and the command never finds a card; a
+    /// stalled receiver is restarted (Receive, then Idle, keeping the upper
+    /// command bits) before every activation.
+    fn list_passive_target(
+        &mut self,
+        args: &[u8],
+        wait: Duration,
+    ) -> Result<Vec<u8>, ActivationError<T::Error>> {
+        self.restart_stalled_receiver()
+            .map_err(ActivationError::BeforeRequest)?;
+        self.command(0x4a, args, wait)
+            .map_err(ActivationError::Request)
+    }
+
+    fn restart_stalled_receiver(&mut self) -> Result<(), Error<T::Error>> {
+        let [status, command]: [u8; 2] = self
+            .command(6, &RECEIVER_PROBE, Duration::from_secs(1))?
+            .try_into()
+            .map_err(|_| Error::Response("receiver probe length"))?;
+        if status & RECEIVER_STALLED == 0 {
+            return Ok(());
+        }
+        let kept = command & 0xf0;
+        self.write_registers(&[
+            (CIU_COMMAND, kept | CIU_RECEIVE),
+            (CIU_COMMAND, kept | CIU_IDLE),
+        ])
     }
 
     fn configure_rf(
@@ -618,7 +687,7 @@ impl<T: Transport> Reader<T> {
         let poll = request.encode();
         let mut args = vec![1, rate.selector()];
         args.extend_from_slice(&poll[1..]);
-        let response = self.command(0x4a, &args, timeout.host_wait())?;
+        let response = self.list_passive_target(&args, timeout.host_wait())?;
         match response.as_slice() {
             [0] => Ok(None),
             [1, target, packet @ ..] if *target != 0 => {
@@ -642,7 +711,7 @@ impl<T: Transport> Reader<T> {
         timeout: RfTimeout,
     ) -> Result<Option<TypeACard<'_, T>>, Error<T::Error>> {
         self.configure_rf(RfProtocol::TypeA, timeout)?;
-        let response = self.command(0x4a, &[1, 0], timeout.host_wait())?;
+        let response = self.list_passive_target(&[1, 0], timeout.host_wait())?;
         match response.as_slice() {
             [0] => Ok(None),
             [1, target, data @ ..] if *target != 0 => {
@@ -668,7 +737,7 @@ impl<T: Transport> Reader<T> {
     ) -> Result<Option<TypeBSelection<'_, T>>, Error<T::Error>> {
         let protocol = RfProtocol::TypeB(options.profile);
         self.configure_rf(protocol, timeout)?;
-        let response = self.command(0x4a, &[1, 3, options.afi, 1], timeout.host_wait())?;
+        let response = self.list_passive_target(&[1, 3, options.afi, 1], timeout.host_wait())?;
         match response.as_slice() {
             [0] => Ok(None),
             [1, target, data @ ..] if *target != 0 => {

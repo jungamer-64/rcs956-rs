@@ -250,6 +250,11 @@ fn initialization(config: &[u8; 256]) -> Vec<Step> {
     steps
 }
 
+/// Receiver probe before InListPassiveTarget, answered with an idle receiver.
+fn idle_receiver() -> Step {
+    command(6, &[0x63, 0x37, 0x63, 0x31], &[0, 0])
+}
+
 fn mode_configuration() -> Vec<Step> {
     vec![
         command(0x1c, &[0x80, 0x63, 0], &[]),
@@ -331,6 +336,7 @@ mod lite_s {
         let mut poll = vec![1, 7, 18, 1];
         poll.extend(identity);
         steps.extend([
+            idle_receiver(),
             command(0x4a, &[1, 1, 0, 0x88, 0xb4, 0, 0], &poll),
             write(0x80, CHALLENGE, None),
             read(&[0x82, 0x90, 0x91], &[identity, COUNTER], card_mac),
@@ -391,6 +397,7 @@ mod lite_s {
         let mut steps = authentication([0; 8]);
         steps.push(command(0x32, &[1, 0], &[]));
         steps.extend(mode_configuration());
+        steps.push(idle_receiver());
         steps.push(command(0x4a, &[1, 1, 0, 0x88, 0xb4, 0, 0], &[0]));
         let (transport, journal) = Script::new(steps);
         let mut reader = Reader::new(transport);
@@ -435,6 +442,7 @@ fn standard_aes_authenticates_encrypts_and_rejects_replay() -> Result<(), Box<dy
         0xc1,
     ];
     steps.extend([
+        idle_receiver(),
         command(0x4a, &[1, 1, 0, 0x12, 0x34, 1, 0], &poll_response()),
         encrypted_command(
             &[
@@ -568,6 +576,7 @@ fn type_three_ndef_uses_the_ndef_system_and_publishes_length_last() -> Result<()
     let mut steps = initialization(&config_image());
     steps.extend(mode_configuration());
     steps.extend([
+        idle_receiver(),
         command(0x4a, &[1, 1, 0, 0x12, 0xfc, 0, 0], &poll_response()),
         type_three_attribute(attribute),
         command(
@@ -603,6 +612,7 @@ fn type_three_ndef_preserves_update_progress_and_detects_the_write_flag()
     let mut steps = initialization(&config_image());
     steps.extend(mode_configuration());
     steps.extend([
+        idle_receiver(),
         command(0x4a, &[1, 1, 0, 0x12, 0xfc, 0, 0], &poll_response()),
         type_three_attribute(attribute),
         type_three_attribute(attribute),
@@ -646,6 +656,7 @@ fn felica_424_selects_card_and_exchanges_discovery_and_write_packets() -> Result
     let mut steps = initialization(&config_image());
     steps.extend(mode_configuration());
     steps.extend([
+        idle_receiver(),
         command(0x4a, &[1, 2, 0, 0x12, 0x34, 1, 0], &poll_response()),
         command(
             0xa0,
@@ -717,6 +728,7 @@ fn felica_write_length_errors_distinguish_request_rejection_from_sent_command()
 -> Result<(), Box<dyn Error>> {
     let mut steps = initialization(&config_image());
     steps.extend(mode_configuration());
+    steps.push(idle_receiver());
     steps.push(command(
         0x4a,
         &[1, 2, 0, 0x12, 0x34, 1, 0],
@@ -767,10 +779,12 @@ fn raw_felica_exchanges_opaque_packets_after_selection() -> Result<(), Box<dyn E
     let packet = [4, 0xe0, 0x32, 0xc1];
     let raw_response = [0, 3, 0xa0, 0x12];
     steps.extend([
+        idle_receiver(),
         command(0x4a, &[1, 2, 0, 0x12, 0x34, 1, 0], &poll_response()),
         command(0xa0, &[0xc8, 0, 4, 0xe0, 0x32, 0xc1], &raw_response),
         command(0xa0, &[0xc8, 0, 4, 0xe0, 0x32, 0xc1], &[0, 5, 1]),
     ]);
+    steps.push(idle_receiver());
     steps.push(command(0x4a, &[1, 1, 0, 0x12, 0x34, 1, 0], &[0]));
     let (transport, journal) = Script::new(steps);
     let mut reader = Reader::new(transport);
@@ -823,9 +837,11 @@ fn polling_read_and_rf_off_keep_identity_and_configuration_boundaries() -> Resul
 {
     let mut steps = initialization(&config_image());
     steps.extend(mode_configuration());
+    steps.push(idle_receiver());
     steps.push(command(0x4a, &[1, 1, 0, 0x12, 0x34, 1, 0], &[0]));
     // The second poll reuses the successfully applied RF mode. A request-data
     // field can be absent even when request code 1 was sent.
+    steps.push(idle_receiver());
     steps.push(command(
         0x4a,
         &[1, 1, 0, 0x12, 0x34, 1, 0],
@@ -842,6 +858,7 @@ fn polling_read_and_rf_off_keep_identity_and_configuration_boundaries() -> Resul
     steps.push(command(0x32, &[1, 0], &[]));
     // RF off invalidates the mode. A later poll must reapply all settings.
     steps.extend(mode_configuration());
+    steps.push(idle_receiver());
     steps.push(command(0x4a, &[1, 1, 0, 0x12, 0x34, 1, 0], &[0]));
     let (script, journal) = Script::new(steps);
     let mut reader = Reader::new(script);
@@ -984,6 +1001,7 @@ fn recovery_rf_status_revokes_the_selected_cards_operation_authority() -> Result
 {
     let mut steps = initialization(&config_image());
     steps.extend(mode_configuration());
+    steps.push(idle_receiver());
     steps.push(command(
         0x4a,
         &[1, 1, 0, 0x12, 0x34, 1, 0],
@@ -1020,9 +1038,11 @@ fn recovery_rf_status_revokes_the_selected_cards_operation_authority() -> Result
 fn changing_rf_wait_updates_reader_timer_without_reapplying_mode() -> Result<(), Box<dyn Error>> {
     let mut steps = initialization(&config_image());
     steps.extend(mode_configuration());
+    steps.push(idle_receiver());
     steps.push(command(0x4a, &[1, 1, 0, 0x12, 0x34, 1, 0], &[0]));
     // 1500ms rounds to 2000ms in 1C, whose parameter is (2000-10)/10=199.
     steps.push(command(0x1c, &[0x80, 0xc7, 0], &[]));
+    steps.push(idle_receiver());
     steps.push(command(
         0x4a,
         &[1, 1, 0, 0x12, 0x34, 1, 0],
@@ -1037,6 +1057,7 @@ fn changing_rf_wait_updates_reader_timer_without_reapplying_mode() -> Result<(),
     reply.extend_from_slice(&[0x5a; 16]);
     steps.push(command(0xa0, &args, &reply));
     steps.push(command(0x1c, &[0x80, 0x63, 0], &[]));
+    steps.push(idle_receiver());
     steps.push(command(0x4a, &[1, 1, 0, 0x12, 0x34, 1, 0], &[0]));
     let (script, journal) = Script::new(steps);
     let mut reader = Reader::new(script);
@@ -1072,6 +1093,7 @@ fn changing_rf_wait_updates_reader_timer_without_reapplying_mode() -> Result<(),
 fn failed_timer_change_revokes_preceding_mode() -> Result<(), Box<dyn Error>> {
     let mut steps = initialization(&config_image());
     steps.extend(mode_configuration());
+    steps.push(idle_receiver());
     steps.push(command(0x4a, &[1, 1, 0, 0x12, 0x34, 1, 0], &[0]));
     steps.push(Step {
         request: Request::Command(0x1c, vec![0x80, 0xc7, 0]),
@@ -1107,6 +1129,7 @@ fn failed_timer_change_revokes_preceding_mode() -> Result<(), Box<dyn Error>> {
 fn rf_error_0b_settles_before_a_following_exchange() -> Result<(), Box<dyn Error>> {
     let mut steps = initialization(&config_image());
     steps.extend(mode_configuration());
+    steps.push(idle_receiver());
     steps.push(command(
         0x4a,
         &[1, 1, 0, 0x12, 0x34, 1, 0],
@@ -1203,6 +1226,7 @@ fn poll_iso_dep(
 fn type_b_exchange_steps(activation: &[u8]) -> Vec<Step> {
     let mut steps = initialization(&ab_config_image());
     steps.extend(ab_mode(true));
+    steps.push(idle_receiver());
     steps.push(command(0x4a, &[1, 3, 0, 1], activation));
     steps.push(command(8, &[0x63, 3, 0x8b], &[0]));
     steps.push(command(0x32, &[2, 0x0b, 0x0b, 0x10], &[]));
@@ -1275,6 +1299,7 @@ fn type_b_rf_timeout_budget_preserves_uncertain_progress() -> Result<(), Box<dyn
 fn type_a_exchange_timeout_is_independent_of_the_polling_wait() -> Result<(), Box<dyn Error>> {
     let mut steps = initialization(&ab_config_image());
     steps.extend(ab_mode(false));
+    steps.push(idle_receiver());
     steps.push(command(
         0x4a,
         &[1, 0],
@@ -1302,6 +1327,7 @@ fn raw_type_a_recovers_pending_fragments_before_sending_another_command()
 -> Result<(), Box<dyn Error>> {
     let mut steps = initialization(&ab_config_image());
     steps.extend(ab_mode(false));
+    steps.push(idle_receiver());
     steps.push(command(
         0x4a,
         &[1, 0],
@@ -1375,6 +1401,7 @@ fn incomplete_raw_type_a_response_requires_reader_recovery() -> Result<(), Box<d
         let mut steps = initialization(&ab_config_image());
         steps.extend(ab_mode(false));
         steps.extend([
+            idle_receiver(),
             command(0x4a, &[1, 0], &type_a_response(7)),
             command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
             command(0x40, &[7, 0xa4], &[0x40, 0x11]),
@@ -1384,6 +1411,7 @@ fn incomplete_raw_type_a_response_requires_reader_recovery() -> Result<(), Box<d
         }
         steps.extend(initialization(&ab_config_image()));
         steps.extend(ab_mode(false));
+        steps.push(idle_receiver());
         steps.push(command(0x4a, &[1, 0], &[0]));
         let (script, journal) = Script::new(steps);
         let mut reader = Reader::new(script);
@@ -1424,6 +1452,7 @@ fn raw_type_a_stops_collecting_at_the_fragment_limit() -> Result<(), Box<dyn Err
     let mut steps = initialization(&ab_config_image());
     steps.extend(ab_mode(false));
     steps.extend([
+        idle_receiver(),
         command(0x4a, &[1, 0], &type_a_response(7)),
         command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
         command(0x40, &[7, 0xa4], &[0x40]),
@@ -1462,6 +1491,7 @@ fn failed_field_cycle_does_not_grant_a_new_typed_selection() -> Result<(), Box<d
     let mut steps = initialization(&ab_config_image());
     steps.extend(ab_mode(false));
     steps.extend([
+        idle_receiver(),
         command(0x4a, &[1, 0], &type_a_response(7)),
         command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
         command(0x40, &[7, 0xa4], &[0]),
@@ -1525,10 +1555,13 @@ fn protocol_changes_reapply_rf_settings_and_absence_is_not_activation() -> Resul
 {
     let mut steps = initialization(&ab_config_image());
     steps.extend(ab_mode(false));
+    steps.push(idle_receiver());
     steps.push(command(0x4a, &[1, 0], &[0]));
     steps.extend(ab_mode(true));
+    steps.push(idle_receiver());
     steps.push(command(0x4a, &[1, 3, 0, 1], &[0]));
     steps.extend(mode_configuration());
+    steps.push(idle_receiver());
     steps.push(command(0x4a, &[1, 1, 0, 0x12, 0x34, 1, 0], &[0]));
     let (script, journal) = Script::new(steps);
     let mut reader = Reader::new(script);
@@ -1552,6 +1585,7 @@ fn protocol_changes_reapply_rf_settings_and_absence_is_not_activation() -> Resul
 fn type_b_activation_register_failure_revokes_readiness() -> Result<(), Box<dyn Error>> {
     let mut steps = initialization(&ab_config_image());
     steps.extend(ab_mode(true));
+    steps.push(idle_receiver());
     steps.push(command(0x4a, &[1, 3, 0, 1], &type_b_response()));
     steps.push(command(8, &[0x63, 3, 0x8b], &[1]));
     let (script, journal) = Script::new(steps);
@@ -1790,6 +1824,7 @@ fn partial_type_b_timing_setup_preserves_zero_apdu_progress_and_requires_reset()
     for lose_timer in [false, true] {
         let mut steps = initialization(&ab_config_image());
         steps.extend(ab_mode(true));
+        steps.push(idle_receiver());
         steps.push(command(0x4a, &[1, 3, 0, 1], &type_b_response()));
         steps.push(command(8, &[0x63, 3, 0x8b], &[0]));
         let failure = if lose_timer {
@@ -1804,6 +1839,7 @@ fn partial_type_b_timing_setup_preserves_zero_apdu_progress_and_requires_reset()
         });
         steps.extend(initialization(&ab_config_image()));
         steps.extend(ab_mode(true));
+        steps.push(idle_receiver());
         steps.push(command(0x4a, &[1, 3, 0, 1], &type_b_response()));
         steps.push(command(8, &[0x63, 3, 0x8b], &[0]));
         steps.push(command(0x32, &[2, 0x0b, 0x0b, 0x10], &[]));
@@ -1865,6 +1901,7 @@ fn type_b_timing_cache_survives_reselection_and_tracks_cross_protocol_changes()
 -> Result<(), Box<dyn Error>> {
     let mut steps = initialization(&ab_config_image());
     steps.extend(ab_mode(true));
+    steps.push(idle_receiver());
     steps.push(command(0x4a, &[1, 3, 0, 1], &type_b_response()));
     steps.push(command(8, &[0x63, 3, 0x8b], &[0]));
     steps.push(command(0x32, &[2, 0x0b, 0x0b, 0x10], &[]));
@@ -1873,15 +1910,18 @@ fn type_b_timing_cache_survives_reselection_and_tracks_cross_protocol_changes()
     // Polling restores its own timer without reapplying the unchanged RF mode.
     // The APDU then restores 1C while retaining the successful selector.
     steps.push(command(0x1c, &[0x80, 0x63, 0], &[]));
+    steps.push(idle_receiver());
     steps.push(command(0x4a, &[1, 3, 0, 1], &type_b_response()));
     steps.push(command(8, &[0x63, 3, 0x8b], &[0]));
     steps.push(command(0x1c, &[0x80, 0x8f, 1], &[]));
     steps.push(command(0xa0, &[11, 0, 2, 0xb0], &[0, 2, 0xab, 0x90, 0]));
     steps.extend(ab_mode(false));
+    steps.push(idle_receiver());
     steps.push(command(0x4a, &[1, 0], &type_a_response(7)));
     steps.push(command(0x32, &[2, 0x0b, 0x0b, 0x0e], &[]));
     steps.push(command(0x40, &[7, 0xa4], &[0, 0x90, 0]));
     steps.extend(ab_mode(true));
+    steps.push(idle_receiver());
     steps.push(command(0x4a, &[1, 3, 0, 1], &type_b_response()));
     steps.push(command(8, &[0x63, 3, 0x8b], &[0]));
     steps.push(command(0x32, &[2, 0x0b, 0x0b, 0x10], &[]));
@@ -1927,6 +1967,7 @@ fn type_b_fwi_boundaries_keep_the_apdu_timer_independent_of_a0_wait() -> Result<
         response[13] = fwi << 4;
         let mut steps = initialization(&ab_config_image());
         steps.extend(ab_mode(true));
+        steps.push(idle_receiver());
         steps.push(command(0x4a, &[1, 3, 0, 1], &response));
         steps.push(command(8, &[0x63, 3, 0x8b], &[0]));
         steps.push(command(0x32, &[2, 0x0b, 0x0b, 0x10], &[]));
@@ -1968,6 +2009,7 @@ fn alternate_type_b_profile_exchanges_a_proprietary_target_command() -> Result<(
         ),
         command(0x32, &[0x0c, 0xa1, 0xa2, 0xa3], &[]),
         command(8, &[0x63, 0x0d, 0], &[0]),
+        idle_receiver(),
         command(0x4a, &[1, 3, 0x12, 1], &response),
         command(8, &[0x63, 3, 0x8b], &[0]),
         command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
@@ -2007,6 +2049,7 @@ fn type_b_frame_response_that_cannot_complete_revokes_the_selection() -> Result<
         let mut steps = initialization(&ab_config_image());
         steps.extend(ab_mode(true));
         steps.extend([
+            idle_receiver(),
             command(0x4a, &[1, 3, 0, 1], &response),
             command(8, &[0x63, 3, 0x8b], &[0]),
             command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
@@ -2046,6 +2089,7 @@ fn type_a_apdu_continuation_sends_no_second_application_command() -> Result<(), 
     let mut steps = initialization(&ab_config_image());
     steps.extend(ab_mode(false));
     steps.extend([
+        idle_receiver(),
         command(0x4a, &[1, 0], &type_a_response(7)),
         command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
         command(0x40, &[7, 0xa4], &[0x40, 0x11]),
@@ -2091,6 +2135,7 @@ fn mifare_classic_authority_is_limited_to_the_authenticated_sector() -> Result<(
     let mut read_response = vec![0];
     read_response.extend([0x44; 16]);
     steps.extend([
+        idle_receiver(),
         command(0x4a, &[1, 0], &[1, 7, 4, 0, 0x18, 7, 1, 2, 3, 4, 5, 6, 7]),
         command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
         command(0x40, &[7, 0x61, 129, 1, 2, 3, 4, 5, 6, 4, 5, 6, 7], &[0]),
@@ -2136,6 +2181,7 @@ fn type_one_ndef_uses_rid_rall_and_byte_writes() -> Result<(), Box<dyn Error>> {
     reply.extend(memory);
     let read = [7, 0, 0, 0, 1, 2, 3, 4];
     steps.extend([
+        idle_receiver(),
         command(0x4a, &[1, 4], &[1, 7, 0, 0x0c, 1, 2, 3, 4]),
         command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
         command(
@@ -2185,6 +2231,7 @@ fn type_one_pending_fragment_requires_reinitialization() -> Result<(), Box<dyn E
         let mut steps = initialization(&configuration);
         steps.extend(ab_mode(false));
         steps.extend([
+            idle_receiver(),
             command(0x4a, &[1, 4], &[1, 7, 0, 0x0c, 1, 2, 3, 4]),
             command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
             command(
@@ -2196,6 +2243,7 @@ fn type_one_pending_fragment_requires_reinitialization() -> Result<(), Box<dyn E
         ]);
         steps.extend(initialization(&configuration));
         steps.extend(ab_mode(false));
+        steps.push(idle_receiver());
         steps.push(command(0x4a, &[1, 0], &type_a_response(7)));
 
         let (script, journal) = Script::new(steps);
@@ -2230,6 +2278,7 @@ fn type_one_dynamic_memory_is_rejected_before_read_or_write() -> Result<(), Box<
     let mut steps = initialization(&ab_config_image());
     steps.extend(ab_mode(false));
     steps.extend([
+        idle_receiver(),
         command(0x4a, &[1, 4], &[1, 7, 0, 0x0c, 1, 2, 3, 4]),
         command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
         command(
@@ -2317,6 +2366,55 @@ fn passive_dep_owns_activation_and_one_response_at_a_time() -> Result<(), Box<dy
         Err(DepError::SessionUnavailable)
     ));
     target.finish()?;
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn stalled_receiver_is_restarted_before_activation() -> Result<(), Box<dyn Error>> {
+    let mut steps = initialization(&config_image());
+    steps.extend(mode_configuration());
+    steps.extend([
+        command(6, &[0x63, 0x37, 0x63, 0x31], &[0x08, 0x2c]),
+        command(8, &[0x63, 0x31, 0x28, 0x63, 0x31, 0x20], &[0, 0]),
+        command(0x4a, &[1, 1, 0, 0x12, 0x34, 1, 0], &[0]),
+        idle_receiver(),
+        command(0x4a, &[1, 1, 0, 0x12, 0x34, 1, 0], &[0]),
+    ]);
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    for _ in 0..2 {
+        assert!(
+            reader
+                .poll_felica(BitRate::Kbps212, poll_request()?, timeout()?)?
+                .is_none()
+        );
+    }
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn failed_receiver_restart_sends_no_activation() -> Result<(), Box<dyn Error>> {
+    let mut steps = initialization(&ab_config_image());
+    steps.extend(ab_mode(false));
+    steps.extend([
+        command(6, &[0x63, 0x37, 0x63, 0x31], &[0x08, 0]),
+        command(8, &[0x63, 0x31, 0x08, 0x63, 0x31, 0], &[0, 5]),
+        command(6, &[0x63, 0x37, 0x63, 0x31], &[0]),
+    ]);
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    assert!(matches!(
+        reader.poll_type_a(timeout()?),
+        Err(ReaderError::RegisterStatus(5))
+    ));
+    assert!(matches!(
+        reader.poll_type1(timeout()?),
+        Err(TargetExchangeError::Preparation(ReaderError::Response(_)))
+    ));
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
 }
@@ -2434,6 +2532,7 @@ fn type_two_ndef_read_skips_reserved_bytes_in_the_message() -> Result<(), Box<dy
     let mut steps = initialization(&ab_config_image());
     steps.extend(ab_mode(false));
     steps.extend([
+        idle_receiver(),
         command(0x4a, &[1, 0], &[1, 7, 4, 0, 0, 7, 1, 2, 3, 4, 5, 6, 7]),
         command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
         command(
@@ -2469,6 +2568,7 @@ fn type_two_before_sector_select() -> Vec<Step> {
     steps.extend(ab_mode(false));
     let selection = &[1, 7, 4, 0, 0, 7, 1, 2, 3, 4, 5, 6, 7];
     steps.extend([
+        idle_receiver(),
         command(0x4a, &[1, 0], selection),
         command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
         command(
@@ -2503,6 +2603,7 @@ fn type_two_ndef_switches_sectors_and_resets_the_field_before_reselection()
         command(0x32, &[1, 0], &[]),
     ]);
     steps.extend(ab_mode(false));
+    steps.push(idle_receiver());
     steps.push(command(0x4a, &[1, 0], &[0]));
     let (script, journal) = Script::new(steps);
     let mut reader = Reader::new(script);
@@ -2540,6 +2641,7 @@ fn type_two_ndef_write_preserves_reserved_bytes_and_publishes_length_last()
     let mut steps = initialization(&ab_config_image());
     steps.extend(ab_mode(false));
     steps.extend([
+        idle_receiver(),
         command(0x4a, &[1, 0], &[1, 7, 4, 0, 0, 7, 1, 2, 3, 4, 5, 6, 7]),
         command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
         command(
@@ -2581,6 +2683,7 @@ fn type_two_ndef_write_stops_on_nak_without_publishing() -> Result<(), Box<dyn E
     let mut steps = initialization(&ab_config_image());
     steps.extend(ab_mode(false));
     steps.extend([
+        idle_receiver(),
         command(0x4a, &[1, 0], &[1, 7, 4, 0, 0, 7, 1, 2, 3, 4, 5, 6, 7]),
         command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
         command(
@@ -2619,6 +2722,7 @@ fn typed_type_two_read_reselects_after_raw_sector_change() -> Result<(), Box<dyn
     let activation = [1, 7, 4, 0, 0, 7, 1, 2, 3, 4, 5, 6, 7];
     steps.extend(ab_mode(false));
     steps.extend([
+        idle_receiver(),
         command(0x4a, &[1, 0], &activation),
         command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
         command(0x40, &[7, 0xc2, 0xff], &[0]),
@@ -2628,6 +2732,7 @@ fn typed_type_two_read_reselects_after_raw_sector_change() -> Result<(), Box<dyn
     ]);
     steps.extend(ab_mode(false));
     steps.extend([
+        idle_receiver(),
         command(0x4a, &[1, 0], &activation),
         command(
             0x40,
@@ -2668,6 +2773,7 @@ fn type_four_ndef_read_selects_files_and_checks_apdu_status() -> Result<(), Box<
     steps.extend(ab_mode(false));
     let select = [7, 0, 0xa4, 4, 0, 7, 0xd2, 0x76, 0, 0, 0x85, 1, 1, 0];
     steps.extend([
+        idle_receiver(),
         command(0x4a, &[1, 0], &type_a_response(7)),
         command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
         command(0x40, &select, &[0, 0x90, 0]),
@@ -2730,6 +2836,7 @@ fn type_four_ndef_write_checks_access_and_capacity_then_publishes_nlen()
     let mut steps = initialization(&ab_config_image());
     steps.extend(ab_mode(false));
     steps.extend([
+        idle_receiver(),
         command(0x4a, &[1, 0], &type_a_response(7)),
         command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
     ]);
@@ -2791,6 +2898,7 @@ fn type_four_extended_ndef_uses_offset_objects_and_publishes_enlen() -> Result<(
     let mut steps = initialization(&ab_config_image());
     steps.extend(ab_mode(false));
     steps.extend([
+        idle_receiver(),
         command(0x4a, &[1, 0], &type_a_response(7)),
         command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
     ]);
@@ -2873,6 +2981,7 @@ fn type_four_rejects_reserved_ndef_file_identifiers_before_selecting_them()
     let mut steps = initialization(&ab_config_image());
     steps.extend(ab_mode(false));
     steps.extend([
+        idle_receiver(),
         command(0x4a, &[1, 0], &type_a_response(7)),
         command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
     ]);
@@ -2957,6 +3066,7 @@ fn type_a_timeout_applies_the_official_500ms_selector_before_exchange() -> Resul
 {
     let mut steps = initialization(&ab_config_image());
     steps.extend(ab_mode(false));
+    steps.push(idle_receiver());
     steps.push(command(0x4a, &[1, 0], &type_a_response(7)));
     steps.push(command(0x32, &[2, 0x0b, 0x0b, 0x0e], &[]));
     steps.push(command(0x40, &[7, 0, 0xa4, 4, 0], &[0, 0x90, 0]));
@@ -2977,6 +3087,7 @@ fn type_a_quantized_timer_and_selector_cache_have_independent_lifetimes()
     let mut setup = ab_mode(false);
     setup[0] = command(0x1c, &[0x80, 0xc7, 0], &[]);
     steps.extend(setup);
+    steps.push(idle_receiver());
     steps.push(command(0x4a, &[1, 0], &type_a_response(7)));
     steps.push(command(0x32, &[2, 0x0b, 0x0b, 0x10], &[]));
     steps.push(command(0x1c, &[0x80, 0x8f, 1], &[]));
@@ -2985,22 +3096,26 @@ fn type_a_quantized_timer_and_selector_cache_have_independent_lifetimes()
     // Selection uses its requested wait, then command40 restores the effective
     // quantized timer. The successfully applied 32/02 selector is still valid.
     steps.push(command(0x1c, &[0x80, 0xc7, 0], &[]));
+    steps.push(idle_receiver());
     steps.push(command(0x4a, &[1, 0], &type_a_response(9)));
     steps.push(command(0x1c, &[0x80, 0x8f, 1], &[]));
     steps.push(command(0x40, &[9, 0xa4], &[0, 0x90, 0]));
     // A different timing step changes 32/02. RF-off retains that independent
     // setting; reset must invalidate it even if the next requested step matches.
     steps.push(command(0x1c, &[0x80, 0x63, 0], &[]));
+    steps.push(idle_receiver());
     steps.push(command(0x4a, &[1, 0], &type_a_response(5)));
     steps.push(command(0x32, &[2, 0x0b, 0x0b, 0x0e], &[]));
     steps.push(command(0x40, &[5, 0xa4], &[0, 0x90, 0]));
     steps.push(command(0x32, &[1, 0], &[]));
     steps.extend(ab_mode(false));
+    steps.push(idle_receiver());
     steps.push(command(0x4a, &[1, 0], &type_a_response(6)));
     steps.push(command(0x40, &[6, 0xa4], &[0, 0x90, 0]));
     // Reset revokes the selector; a later activation must program it again.
     steps.extend(initialization(&ab_config_image()));
     steps.extend(ab_mode(false));
+    steps.push(idle_receiver());
     steps.push(command(0x4a, &[1, 0], &type_a_response(3)));
     steps.push(command(0x32, &[2, 0x0b, 0x0b, 0x0e], &[]));
     steps.push(command(0x40, &[3, 0xa4], &[0, 0x90, 0]));
@@ -3043,6 +3158,7 @@ fn type_a_failures_distinguish_timing_setup_from_card_exchange() -> Result<(), B
         let mut setup = ab_mode(false);
         setup[0] = command(0x1c, &[0x80, 0xc7, 0], &[]);
         steps.extend(setup);
+        steps.push(idle_receiver());
         steps.push(command(0x4a, &[1, 0], &type_a_response(7)));
         let selector = [2, 0x0b, 0x0b, 0x10];
         let timer = [0x80, 0x8f, 1];

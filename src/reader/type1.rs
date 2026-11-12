@@ -1,4 +1,6 @@
-use super::{Error, Reader, ResponseTimeout, RfProtocol, RfTimeout, TargetExchangeError};
+use super::{
+    ActivationError, Error, Reader, ResponseTimeout, RfProtocol, RfTimeout, TargetExchangeError,
+};
 use crate::transport::Transport;
 use alloc::vec::Vec;
 
@@ -25,8 +27,11 @@ impl<T: Transport> Reader<T> {
         self.configure_rf(RfProtocol::TypeA, timeout)
             .map_err(TargetExchangeError::Preparation)?;
         let selection = self
-            .command(0x4a, &[1, 4], timeout.host_wait())
-            .map_err(TargetExchangeError::Exchange)?;
+            .list_passive_target(&[1, 4], timeout.host_wait())
+            .map_err(|error| match error {
+                ActivationError::BeforeRequest(error) => TargetExchangeError::Preparation(error),
+                ActivationError::Request(error) => TargetExchangeError::Exchange(error),
+            })?;
         let target = match selection.as_slice() {
             [0] => return Ok(None),
             [1, target, _, _, _, _, _, _] if *target != 0 => *target,
