@@ -401,6 +401,10 @@ impl<T: Transport> Link<T> {
     pub(crate) fn wait(&mut self, duration: Duration) {
         self.transport.wait(duration);
     }
+
+    pub(crate) fn now(&self) -> Duration {
+        self.transport.monotonic_time()
+    }
 }
 
 /// Reset whose empty response was received but whose host ACK is not yet sent.

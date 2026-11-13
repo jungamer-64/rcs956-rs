@@ -21,7 +21,7 @@ cargo check --locked --lib --all-features --target x86_64-unknown-none
 
 失敗した初期化を成功状態として公開しない。カードhandleはreaderの排他的borrowを保持し、選択・raw交換・認証の権限はそのborrowとRF状態より長く残らない。raw交換や認証へ移るとtyped handleは消費され、その前提は回復しない。
 
-どの操作も自動で再送しない。送信前の拒否や準備失敗と、送信後の失敗を区別し、送信後の失敗ではカードへの効果が不明になり得るため、確認済みのprogressをerrorに残す。transport失敗後にはRF readinessが失効する。readerへの`initialize`は明示的な再同期であり、失敗したカード操作の再実行や結果照合ではない。
+どの操作も自動で再送しない。例外はFALPの再送で、protocol自体が順序番号で重複を排除する欠落blockの再要求と、応答のない送信切替blockの再送だけを行う。送信前の拒否や準備失敗と、送信後の失敗を区別し、送信後の失敗ではカードへの効果が不明になり得るため、確認済みのprogressをerrorに残す。transport失敗後にはRF readinessが失効する。readerへの`initialize`は明示的な再同期であり、失敗したカード操作の再実行や結果照合ではない。
 
 回復ではpipeの状態整理とhost ACKによる未完了commandの中断を行い、その後はresetだけを許可する。USB pipe resetだけをfirmware commandの中断として扱わない。中断前のカード操作の結果不明はcallerに残る。
 

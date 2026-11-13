@@ -3,13 +3,15 @@
 //! These model command/response contracts, not physical device operation.
 
 use rcs956::{
+    falp::{Profile, Reason},
     felica::{BitRate, BlockWrite, CardError, Idm, PollRequest, ServiceEntry},
     isodep, mifare, ndef,
     nfcb::{PollOptions, RfProfile},
     reader::{
         ConfigurationError, DepActivation, DepError, DepMode, DepRate, DepTransferCause,
-        Error as ReaderError, MAX_DEP_MESSAGE_BYTES, Reader, RfTimeout, TargetExchangeError,
-        TimeoutRange, Type2EmulationError, Type2Event, TypeBCard, TypeBSelection,
+        Error as ReaderError, FalpAccepted, FalpConnect, FalpError, FalpLink, FalpListen, FalpTurn,
+        FelicaCard, MAX_DEP_MESSAGE_BYTES, Reader, RfTimeout, TargetExchangeError, TimeoutRange,
+        TransferCause, Type2EmulationError, Type2Event, TypeBCard, TypeBSelection,
     },
     transport::{Progress, TransactionError, Transport},
     wire::{self, Direction, Frame},
@@ -3412,5 +3414,330 @@ fn type_a_failures_distinguish_timing_setup_from_card_exchange() -> Result<(), B
         assert_eq!(journal.borrow().requests.len(), count);
         assert_eq!(journal.borrow().remaining, 0);
     }
+    Ok(())
+}
+
+// FALP fixtures, built from the packet layout independently of the crate.
+const FALP_PROCESSING: [u8; 8] = [0, 0x10, 0, 5, 0, 6, 0, 7];
+const INITIATOR_PORT: [u8; 2] = [0x34, 0x12];
+const TARGET_PORT: [u8; 2] = [0x78, 0x56];
+/// One-second waits encoded as half-millisecond ticks.
+const SECOND: [u8; 2] = [0xd0, 0x07];
+/// Speed1 receive timeout between two Speed1 readers at 424 kbps: 143 ms.
+const RECEIVE_WAIT: [u8; 2] = [0x1e, 0x01];
+/// The same timeout after a burst without data adds the peer's 200 ms
+/// direction switch: 343 ms.
+const SWITCH_WAIT: [u8; 2] = [0xae, 0x02];
+/// Wait for the next block while the peer holds the turn: 3000 ms.
+const DATA_WAIT: [u8; 2] = [0x70, 0x17];
+
+fn falp_packet(pdu: &[u8]) -> Vec<u8> {
+    let mut packet = vec![u8::try_from(pdu.len() + 1).unwrap_or(0)];
+    packet.extend_from_slice(pdu);
+    packet
+}
+
+fn falp_envelope(kind: u8, flag: u8, message: &[u8]) -> Vec<u8> {
+    let mut pdu = vec![kind, TARGET_PORT[0], TARGET_PORT[1], flag];
+    pdu.push(u8::try_from(message.len()).unwrap_or(0));
+    pdu.extend_from_slice(message);
+    falp_packet(&pdu)
+}
+
+fn falp_data(message: &[u8]) -> Vec<u8> {
+    falp_envelope(0xbc, 1, message)
+}
+
+fn falp_farewell(reason: u16) -> Vec<u8> {
+    let [high, low] = reason.to_be_bytes();
+    falp_envelope(0xae, 0, &[7, 0, 0, high, low])
+}
+
+/// Speed1 parameters from 08 to 2C; `rf` adds the RF overhead and rate.
+fn speed1_fields(rf: bool) -> Vec<u8> {
+    let mut fields = vec![1, 0, 0, 0xf9, 0, 0, 0x0d, 0xac];
+    if rf {
+        fields.extend([11, 0, 6, 0x77, 0x46]);
+    }
+    fields.extend([14, 8, 0, 3, 0x84, 0]);
+    for value in [20_000u32, 100_000, 20_000, 100_000, 200_000] {
+        fields.extend(value.to_be_bytes());
+    }
+    fields.extend([0; 5]);
+    fields
+}
+
+fn handshake_message(application: &[u8]) -> Vec<u8> {
+    let mut message = vec![0, 0, 0, u8::try_from(application.len()).unwrap_or(0)];
+    message.extend_from_slice(application);
+    message.extend(speed1_fields(true));
+    message
+}
+
+fn response_message() -> Vec<u8> {
+    let mut message = vec![1, 0, 0];
+    message.extend(speed1_fields(false));
+    message
+}
+
+fn with_ticks(ticks: [u8; 2], packet: &[u8]) -> Vec<u8> {
+    [ticks.as_slice(), packet].concat()
+}
+
+fn rf_frame(packet: &[u8]) -> Vec<u8> {
+    [&[0], packet].concat()
+}
+
+fn answer(idm: [u8; 8]) -> Vec<u8> {
+    let mut pdu = vec![0xab];
+    pdu.extend(idm);
+    pdu.extend([0, 0, 1]);
+    pdu.extend(TARGET_PORT);
+    falp_packet(&pdu)
+}
+
+fn propose(idm: [u8; 8], port: [u8; 2]) -> Vec<u8> {
+    let mut pdu = vec![0xaa];
+    pdu.extend(idm);
+    pdu.extend(port);
+    pdu.extend([0x4c, 4, 0, 0]);
+    falp_packet(&pdu)
+}
+
+fn connected_initiator() -> Vec<Step> {
+    let mut steps = initialization(&config_image());
+    steps.extend(mode_configuration());
+    steps.extend([
+        idle_receiver(),
+        command(0x4a, &[1, 2, 0, 0x12, 0x34, 1, 0], &poll_response()),
+        command(6, &FALP_PROCESSING, &[0, 0, 0, 0]),
+        command(
+            0xa0,
+            &with_ticks(SECOND, &propose(IDENTITY, INITIATOR_PORT)),
+            &rf_frame(&answer(IDENTITY)),
+        ),
+        command(
+            0xa0,
+            &with_ticks(SECOND, &falp_data(&handshake_message(b"A"))),
+            &rf_frame(&falp_data(&response_message())),
+        ),
+    ]);
+    steps
+}
+
+fn falp_connect(
+    card: FelicaCard<'_, Script>,
+) -> Result<FalpLink<'_, Script>, FalpError<io::Error>> {
+    card.connect_falp(FalpConnect {
+        profile: Profile::Speed1,
+        application: b"A",
+        port: 0x1234,
+        propose_timeout: Duration::from_secs(1),
+        handshake_timeout: Duration::from_secs(1),
+    })
+}
+
+fn sent(packet: &[u8]) -> Step {
+    command(0xa0, &with_ticks([0, 0], packet), &[1])
+}
+
+fn received(wait: [u8; 2], message: &[u8]) -> Step {
+    command(0xa0, &wait, &rf_frame(&falp_data(message)))
+}
+
+#[test]
+fn falp_initiator_connects_exchanges_turns_and_closes() -> Result<(), Box<dyn Error>> {
+    let mut steps = connected_initiator();
+    steps.extend([
+        sent(&falp_data(&[3, 0, 0, b'h', b'i'])),
+        received(RECEIVE_WAIT, &[3, 0, 0, b'y', b'o']),
+        // An unanswered switch is sent again before the peer's empty turn.
+        sent(&falp_data(&[3, 0, 1])),
+        command(0xa0, &SWITCH_WAIT, &[1]),
+        sent(&falp_data(&[3, 0, 1])),
+        received(SWITCH_WAIT, &[3, 0, 1]),
+        sent(&falp_farewell(0)),
+    ]);
+    steps.extend(initialization(&config_image()));
+    let (transport, journal) = Script::new(steps);
+    let mut reader = Reader::new(transport);
+    reader.initialize()?;
+    let card = reader
+        .poll_felica(BitRate::Kbps424, poll_request()?, timeout()?)?
+        .ok_or("expected FALP target")?;
+    let mut link = falp_connect(card)?;
+    assert_eq!(
+        link.exchange(b"hi")?,
+        FalpTurn::Exchanged {
+            sent: 2,
+            received: b"yo".to_vec()
+        }
+    );
+    assert_eq!(
+        link.exchange(&[])?,
+        FalpTurn::Exchanged {
+            sent: 0,
+            received: Vec::new()
+        }
+    );
+    link.close()?;
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn falp_initiator_requests_a_lost_block_before_delivering_in_order() -> Result<(), Box<dyn Error>> {
+    let mut steps = connected_initiator();
+    steps.extend([
+        sent(&falp_data(&[3, 0, 0])),
+        received(SWITCH_WAIT, &[2, 0, 0, b'a']),
+        received(DATA_WAIT, &[3, 0, 2, b'c']),
+        sent(&falp_data(&[5, 0, 1])),
+        received(RECEIVE_WAIT, &[6, 0, 1, b'b']),
+    ]);
+    let (transport, journal) = Script::new(steps);
+    let mut reader = Reader::new(transport);
+    reader.initialize()?;
+    let card = reader
+        .poll_felica(BitRate::Kbps424, poll_request()?, timeout()?)?
+        .ok_or("expected FALP target")?;
+    let mut link = falp_connect(card)?;
+    assert_eq!(
+        link.exchange(&[])?,
+        FalpTurn::Exchanged {
+            sent: 0,
+            received: b"abc".to_vec()
+        }
+    );
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn falp_initiator_reports_a_window_violation_after_sending_farewell() -> Result<(), Box<dyn Error>>
+{
+    let mut steps = connected_initiator();
+    steps.extend([
+        sent(&falp_data(&[3, 0, 0, b'x'])),
+        received(RECEIVE_WAIT, &[2, 0x10, 0, b'a']),
+        sent(&falp_farewell(0x101)),
+    ]);
+    let (transport, journal) = Script::new(steps);
+    let mut reader = Reader::new(transport);
+    reader.initialize()?;
+    let card = reader
+        .poll_felica(BitRate::Kbps424, poll_request()?, timeout()?)?
+        .ok_or("expected FALP target")?;
+    let mut link = falp_connect(card)?;
+    assert!(matches!(
+        link.exchange(b"x"),
+        Err(FalpError::Transfer {
+            sent: 1,
+            delivered: false,
+            cause: TransferCause::Violation(Reason::WINDOW),
+            ..
+        })
+    ));
+    assert!(matches!(link.exchange(&[]), Err(FalpError::Unavailable)));
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn falp_peer_farewell_ends_the_turn_with_its_reason() -> Result<(), Box<dyn Error>> {
+    let mut steps = connected_initiator();
+    steps.extend([
+        sent(&falp_data(&[3, 0, 0])),
+        command(0xa0, &SWITCH_WAIT, &rf_frame(&falp_farewell(0x104))),
+    ]);
+    let (transport, journal) = Script::new(steps);
+    let mut reader = Reader::new(transport);
+    reader.initialize()?;
+    let card = reader
+        .poll_felica(BitRate::Kbps424, poll_request()?, timeout()?)?
+        .ok_or("expected FALP target")?;
+    let mut link = falp_connect(card)?;
+    assert_eq!(
+        link.exchange(&[])?,
+        FalpTurn::Closed {
+            sent: 0,
+            delivered: false,
+            received: Vec::new(),
+            reason: Some(Reason::LOSS)
+        }
+    );
+    assert!(matches!(link.exchange(&[]), Err(FalpError::Unavailable)));
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+const TARGET_IDM: [u8; 8] = [2, 0xfe, 1, 2, 3, 4, 5, 6];
+
+fn falp_listen_steps(application: &[u8]) -> Vec<Step> {
+    let mut steps = initialization(&config_image());
+    steps.push(command(6, &FALP_PROCESSING, &[0, 0, 0, 0]));
+    let mut args = vec![0, 0, 1, 1, 2, 3, 0];
+    args.extend(TARGET_IDM);
+    args.extend([0, 0x22, 3, 3, 3, 3, 3, 3, 0xfe, 0xe2]);
+    args.extend([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 0x55]);
+    steps.push(command(
+        0x8c,
+        &args,
+        &[[0x22].as_slice(), &propose(TARGET_IDM, TARGET_PORT)].concat(),
+    ));
+    steps.push(command(
+        0xa0,
+        &with_ticks(SECOND, &answer(TARGET_IDM)),
+        &rf_frame(&falp_data(&handshake_message(application))),
+    ));
+    steps
+}
+
+fn falp_listen(
+    reader: &mut Reader<Script>,
+) -> Result<FalpAccepted<'_, Script>, FalpError<io::Error>> {
+    reader.listen_falp(
+        FalpListen {
+            profile: Profile::Speed1,
+            identity: [1, 2, 3, 4, 5, 6],
+            applications: &[b"A"],
+            handshake_timeout: Duration::from_secs(1),
+        },
+        RfTimeout::new(Duration::from_secs(1)).map_err(|_| FalpError::TimeoutRange)?,
+    )
+}
+
+#[test]
+fn falp_target_accepts_handshake_and_receives_the_first_burst() -> Result<(), Box<dyn Error>> {
+    let mut steps = falp_listen_steps(b"A");
+    steps.extend([
+        command(0x90, &falp_data(&response_message()), &[0]),
+        command(0x88, &[], &rf_frame(&falp_data(&[3, 0, 0, b'h', b'i']))),
+    ]);
+    let (transport, journal) = Script::new(steps);
+    let mut reader = Reader::new(transport);
+    let accepted = falp_listen(&mut reader)?;
+    assert_eq!(
+        accepted.turn,
+        FalpTurn::Exchanged {
+            sent: 0,
+            received: b"hi".to_vec()
+        }
+    );
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn falp_target_rejects_an_unregistered_application_with_a_farewell() -> Result<(), Box<dyn Error>> {
+    let mut steps = falp_listen_steps(b"B");
+    steps.push(command(0x90, &falp_farewell(0x105), &[0]));
+    let (transport, journal) = Script::new(steps);
+    let mut reader = Reader::new(transport);
+    assert!(matches!(
+        falp_listen(&mut reader),
+        Err(FalpError::Violation(Reason::APPLICATION))
+    ));
+    assert_eq!(journal.borrow().remaining, 0);
     Ok(())
 }

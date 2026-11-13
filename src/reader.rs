@@ -1,6 +1,7 @@
 //! Reader configuration and lifetime-bound NFC card access.
 
 mod dep;
+mod falp;
 mod identity;
 mod type1;
 mod type2_target;
@@ -8,6 +9,9 @@ mod type2_target;
 pub use dep::{
     DepActivation, DepError, DepInitiator, DepLink, DepMessage, DepMode, DepPeer, DepRate,
     DepRequest, DepTransferCause, MAX_DEP_MESSAGE_BYTES, PassiveDepTarget,
+};
+pub use falp::{
+    FalpAccepted, FalpConnect, FalpError, FalpLink, FalpListen, FalpTurn, TransferCause,
 };
 pub use identity::{DeviceNameError, Model, Product};
 pub use type1::Type1Tag;
@@ -736,6 +740,7 @@ impl<T: Transport> Reader<T> {
                     observation,
                     target: *target,
                     timeout,
+                    rate,
                 }))
             }
             _ => Err(Error::Response("poll target count/layout")),
@@ -1445,6 +1450,7 @@ pub struct FelicaCard<'a, T: Transport> {
     observation: PollResponse,
     target: u8,
     timeout: RfTimeout,
+    rate: BitRate,
 }
 impl<'a, T: Transport> FelicaCard<'a, T> {
     #[cfg(any(feature = "felica-lite-s", feature = "felica-standard-aes"))]
