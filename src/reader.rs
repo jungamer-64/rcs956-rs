@@ -583,6 +583,9 @@ impl<T: Transport> Reader<T> {
             .map_err(ActivationError::Request)
     }
 
+    /// Reading the probe changes nothing. Once the restart writes begin, a
+    /// failure can leave the receiver in an unknown command state, so only
+    /// both completed writes keep the configured mode published.
     fn restart_stalled_receiver(&mut self) -> Result<(), Error<T::Error>> {
         let [status, command]: [u8; 2] = self
             .command(6, &RECEIVER_PROBE, Duration::from_secs(1))?
@@ -591,11 +594,17 @@ impl<T: Transport> Reader<T> {
         if status & RECEIVER_STALLED == 0 {
             return Ok(());
         }
+        let ready = mem::replace(&mut self.state, State::NeedsInitialization);
+        if matches!(ready, State::NeedsInitialization) {
+            return Err(Error::NotInitialized);
+        }
         let kept = command & 0xf0;
         self.write_registers(&[
             (CIU_COMMAND, kept | CIU_RECEIVE),
             (CIU_COMMAND, kept | CIU_IDLE),
-        ])
+        ])?;
+        self.state = ready;
+        Ok(())
     }
 
     fn configure_rf(

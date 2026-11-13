@@ -2526,20 +2526,26 @@ fn failed_receiver_restart_sends_no_activation() -> Result<(), Box<dyn Error>> {
     let mut steps = initialization(&ab_config_image());
     steps.extend(ab_mode(false));
     steps.extend([
+        command(6, &[0x63, 0x37, 0x63, 0x31], &[0]),
         command(6, &[0x63, 0x37, 0x63, 0x31], &[0x08, 0]),
         command(8, &[0x63, 0x31, 0x08, 0x63, 0x31, 0], &[0, 5]),
-        command(6, &[0x63, 0x37, 0x63, 0x31], &[0]),
     ]);
     let (script, journal) = Script::new(steps);
     let mut reader = Reader::new(script);
     reader.initialize()?;
+    // A malformed probe wrote nothing, so the configured mode stays usable.
+    assert!(matches!(
+        reader.poll_type1(timeout()?),
+        Err(TargetExchangeError::Preparation(ReaderError::Response(_)))
+    ));
+    // A partially applied restart leaves the receiver state unknown.
     assert!(matches!(
         reader.poll_type_a(timeout()?),
         Err(ReaderError::RegisterStatus(5))
     ));
     assert!(matches!(
-        reader.poll_type1(timeout()?),
-        Err(TargetExchangeError::Preparation(ReaderError::Response(_)))
+        reader.poll_type_a(timeout()?),
+        Err(ReaderError::NotInitialized)
     ));
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
