@@ -13,7 +13,7 @@ use rcs956::{
         FelicaCard, MAX_DEP_MESSAGE_BYTES, Reader, RfTimeout, TargetExchangeError, TimeoutRange,
         TransferCause, Type2EmulationError, Type2Event, TypeBCard, TypeBSelection,
     },
-    transport::{Progress, TransactionError, Transport},
+    transport::{Failure, Progress, TransactionError, Transport},
     wire::{self, Direction, Frame},
 };
 use std::{cell::RefCell, collections::VecDeque, error::Error, io, rc::Rc, time::Duration};
@@ -31,6 +31,8 @@ enum Request {
 enum Answer {
     Data(Vec<u8>),
     LostAfterAck,
+    /// Response data that completes the given time after the ACK.
+    Late(Duration, Vec<u8>),
 }
 
 #[derive(Debug)]
@@ -49,6 +51,7 @@ fn command(cc: u8, args: &[u8], data: &[u8]) -> Step {
 #[derive(Debug)]
 enum Input {
     Bytes(Vec<u8>),
+    Late(Duration, Vec<u8>),
     Timeout,
 }
 
@@ -164,6 +167,14 @@ impl Transport for Script {
                     self.input.push_back(Input::Bytes(wire::ACK.to_vec()));
                     self.input.push_back(Input::Timeout);
                 }
+                Answer::Late(delay, data) => {
+                    let response_cc = cc.checked_add(1).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "response command overflow")
+                    })?;
+                    self.input.push_back(Input::Bytes(wire::ACK.to_vec()));
+                    self.input
+                        .push_back(Input::Late(delay, reader_response(response_cc, &data)?));
+                }
             },
         }
         Ok(bytes.len())
@@ -181,6 +192,11 @@ impl Transport for Script {
                 buffer[..bytes.len()].copy_from_slice(&bytes);
                 self.journal.borrow_mut().last_read_completed = Some(self.elapsed);
                 Ok(bytes.len())
+            }
+            Some(Input::Late(delay, bytes)) => {
+                self.elapsed += delay;
+                self.input.push_front(Input::Bytes(bytes));
+                self.read(buffer, timeout)
             }
             Some(Input::Timeout) => Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -1377,7 +1393,8 @@ fn type_b_rf_timeout_budget_preserves_uncertain_progress() -> Result<(), Box<dyn
 }
 
 #[test]
-fn type_a_exchange_timeout_is_independent_of_the_polling_wait() -> Result<(), Box<dyn Error>> {
+fn type_a_apdu_wait_follows_the_ats_frame_wait_not_the_exchange_timeout()
+-> Result<(), Box<dyn Error>> {
     let mut steps = initialization(&ab_config_image());
     steps.extend(ab_mode(false));
     steps.push(idle_receiver());
@@ -1386,8 +1403,9 @@ fn type_a_exchange_timeout_is_independent_of_the_polling_wait() -> Result<(), Bo
         &[1, 0],
         &[1, 7, 4, 0, 0x20, 4, 1, 2, 3, 4, 3, 0x20, 0x40],
     ));
-    steps.push(command(0x32, &[2, 0x0b, 0x0b, 0x10], &[]));
-    steps.push(command(0x1c, &[0x80, 0x8f, 1], &[]));
+    // The reader runs ISO-DEP: 4 FWT (FWI 4) + 2 FWT (FWI 14) = 9.92 s, so
+    // the 1C timer rounds up to 10 s and no 32/02 selector is programmed.
+    steps.push(command(0x1c, &[0x80, 0xe7, 3], &[]));
     steps.push(command(0x40, &[7, 0, 0xa4, 4, 0], &[0, 0x90, 0]));
     steps.push(command(0x40, &[7, 0, 0xb0, 0, 0], &[0, 0x6a, 0x82]));
     let (script, journal) = Script::new(steps);
@@ -2045,13 +2063,14 @@ fn type_b_timing_cache_survives_reselection_and_tracks_cross_protocol_changes()
     steps.extend(ab_mode(false));
     steps.push(idle_receiver());
     steps.push(command(0x4a, &[1, 0], &type_a_response(7)));
-    steps.push(command(0x32, &[2, 0x0b, 0x0b, 0x0e], &[]));
+    // The reader-run NFC-A ISO-DEP exchange programs only its own 1C bound,
+    // so the NFC-B selector stays applied across the protocol change.
+    steps.push(command(0x1c, &[0x80, 0xe7, 3], &[]));
     steps.push(command(0x40, &[7, 0xa4], &[0, 0x90, 0]));
     steps.extend(ab_mode(true));
     steps.push(idle_receiver());
     steps.push(command(0x4a, &[1, 3, 0, 1], &type_b_response()));
     steps.push(command(8, &[0x63, 3, 0x8b], &[0]));
-    steps.push(command(0x32, &[2, 0x0b, 0x0b, 0x10], &[]));
     steps.push(command(0x1c, &[0x80, 0x8f, 1], &[]));
     steps.push(command(0xa0, &[11, 0, 2, 0xa4], &[0, 2, 0x90, 0]));
     let (script, journal) = Script::new(steps);
@@ -2218,7 +2237,7 @@ fn type_a_apdu_continuation_sends_no_second_application_command() -> Result<(), 
     steps.extend([
         idle_receiver(),
         command(0x4a, &[1, 0], &type_a_response(7)),
-        command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
+        command(0x1c, &[0x80, 0xe7, 3], &[]),
         command(0x40, &[7, 0xa4], &[0x40, 0x11]),
         command(0x40, &[7], &[0, 0x22, 0x90, 0]),
         command(0x40, &[7, 0xb0], &[0x40, 0x33]),
@@ -3071,7 +3090,7 @@ fn type_four_ndef_read_selects_files_and_checks_apdu_status() -> Result<(), Box<
     steps.extend([
         idle_receiver(),
         command(0x4a, &[1, 0], &type_a_response(7)),
-        command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
+        command(0x1c, &[0x80, 0xe7, 3], &[]),
         command(0x40, &select, &[0, 0x90, 0]),
         command(0x40, &[7, 0, 0xa4, 0, 0x0c, 2, 0xe1, 3], &[0, 0x90, 0]),
         command(
@@ -3134,7 +3153,7 @@ fn type_four_ndef_write_checks_access_and_capacity_then_publishes_nlen()
     steps.extend([
         idle_receiver(),
         command(0x4a, &[1, 0], &type_a_response(7)),
-        command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
+        command(0x1c, &[0x80, 0xe7, 3], &[]),
     ]);
     steps.extend(type_four_file_selection(0xff));
     steps.extend(type_four_file_selection(0));
@@ -3196,7 +3215,7 @@ fn type_four_extended_ndef_uses_offset_objects_and_publishes_enlen() -> Result<(
     steps.extend([
         idle_receiver(),
         command(0x4a, &[1, 0], &type_a_response(7)),
-        command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
+        command(0x1c, &[0x80, 0xe7, 3], &[]),
     ]);
     steps.extend(select_extended());
     steps.push(command(
@@ -3279,7 +3298,7 @@ fn type_four_rejects_reserved_ndef_file_identifiers_before_selecting_them()
     steps.extend([
         idle_receiver(),
         command(0x4a, &[1, 0], &type_a_response(7)),
-        command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
+        command(0x1c, &[0x80, 0xe7, 3], &[]),
     ]);
     let reserved_ids = [
         [0xe1, 3], // The Capability Container itself.
@@ -3370,35 +3389,89 @@ fn type_a_timeout_applies_the_official_500ms_selector_before_exchange() -> Resul
     let mut reader = Reader::new(script);
     reader.initialize()?;
     let wait = RfTimeout::new(Duration::from_millis(500))?;
-    let mut card = reader.poll_type_a(wait)?.ok_or("expected NFC-A card")?;
-    assert_eq!(card.exchange_apdu(&[0, 0xa4, 4, 0])?, [0x90, 0]);
+    let mut card = reader
+        .poll_type_a(wait)?
+        .ok_or("expected NFC-A card")?
+        .into_raw();
+    assert_eq!(card.exchange(&[0, 0xa4, 4, 0])?.data, [0x90, 0]);
     assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn type_a_apdu_host_wait_covers_the_reader_iso_dep_bound() -> Result<(), Box<dyn Error>> {
+    // FWI 12: 4 FWT + 2 FWT (FWI 14) = 14.85 s; the host adds one second.
+    let mut activation = type_a_response(7);
+    activation[12] = 0xc0;
+    for (delay, completes) in [
+        (Duration::from_secs(12), true),
+        (Duration::from_secs(16), false),
+    ] {
+        let mut steps = initialization(&ab_config_image());
+        steps.extend(ab_mode(false));
+        steps.push(idle_receiver());
+        steps.push(command(0x4a, &[1, 0], &activation));
+        steps.push(command(0x1c, &[0x80, 0xdb, 5], &[]));
+        steps.push(Step {
+            request: Request::Command(0x40, vec![7, 0, 0xa4, 4, 0]),
+            answer: Answer::Late(delay, vec![0, 0x90, 0]),
+        });
+        let (script, journal) = Script::new(steps);
+        let mut reader = Reader::new(script);
+        reader.initialize()?;
+        let mut card = reader
+            .poll_type_a(timeout()?)?
+            .ok_or("expected NFC-A card")?;
+        assert_eq!(card.observation().ats().map(|ats| ats.fwi()), Some(12));
+        let result = card.exchange_apdu(&[0, 0xa4, 4, 0]);
+        if completes {
+            assert_eq!(result?, [0x90, 0]);
+        } else {
+            assert!(matches!(
+                result,
+                Err(isodep::Error {
+                    cause: isodep::Cause::Transport(ReaderError::Transaction(TransactionError {
+                        progress: Progress::Acknowledged,
+                        failure: Failure::Deadline,
+                    })),
+                    ..
+                })
+            ));
+        }
+        assert_eq!(journal.borrow().remaining, 0);
+    }
     Ok(())
 }
 
 #[test]
 fn type_a_quantized_timer_and_selector_cache_have_independent_lifetimes()
 -> Result<(), Box<dyn Error>> {
+    let two_second_mode = || {
+        let mut setup = ab_mode(false);
+        setup[0] = command(0x1c, &[0x80, 0xc7, 0], &[]);
+        setup
+    };
     let mut steps = initialization(&ab_config_image());
-    let mut setup = ab_mode(false);
-    setup[0] = command(0x1c, &[0x80, 0xc7, 0], &[]);
-    steps.extend(setup);
+    steps.extend(two_second_mode());
     steps.push(idle_receiver());
     steps.push(command(0x4a, &[1, 0], &type_a_response(7)));
     steps.push(command(0x32, &[2, 0x0b, 0x0b, 0x10], &[]));
     steps.push(command(0x1c, &[0x80, 0x8f, 1], &[]));
     steps.push(command(0x40, &[7, 0xa4], &[0, 0x90, 0]));
     steps.push(command(0x40, &[7, 0xb0], &[0, 0x90, 0]));
-    // Selection uses its requested wait, then command40 restores the effective
-    // quantized timer. The successfully applied 32/02 selector is still valid.
-    steps.push(command(0x1c, &[0x80, 0xc7, 0], &[]));
+    // Selecting after raw commands cycles the field and restores the polling
+    // timer. The raw command then restores the effective quantized timer; the
+    // successfully applied 32/02 selector is still valid.
+    steps.push(command(0x32, &[1, 0], &[]));
+    steps.extend(two_second_mode());
     steps.push(idle_receiver());
     steps.push(command(0x4a, &[1, 0], &type_a_response(9)));
     steps.push(command(0x1c, &[0x80, 0x8f, 1], &[]));
     steps.push(command(0x40, &[9, 0xa4], &[0, 0x90, 0]));
     // A different timing step changes 32/02. RF-off retains that independent
     // setting; reset must invalidate it even if the next requested step matches.
-    steps.push(command(0x1c, &[0x80, 0x63, 0], &[]));
+    steps.push(command(0x32, &[1, 0], &[]));
+    steps.extend(ab_mode(false));
     steps.push(idle_receiver());
     steps.push(command(0x4a, &[1, 0], &type_a_response(5)));
     steps.push(command(0x32, &[2, 0x0b, 0x0b, 0x0e], &[]));
@@ -3420,29 +3493,36 @@ fn type_a_quantized_timer_and_selector_cache_have_independent_lifetimes()
     reader.initialize()?;
     let wait = RfTimeout::new(Duration::from_secs(2))?;
     {
-        let mut card = reader.poll_type_a(wait)?.ok_or("expected NFC-A card")?;
-        card.exchange_apdu(&[0xa4])?;
-        card.exchange_apdu(&[0xb0])?;
+        let mut card = reader
+            .poll_type_a(wait)?
+            .ok_or("expected NFC-A card")?
+            .into_raw();
+        card.exchange(&[0xa4])?;
+        card.exchange(&[0xb0])?;
     }
     reader
         .poll_type_a(wait)?
         .ok_or("expected NFC-A card")?
-        .exchange_apdu(&[0xa4])?;
+        .into_raw()
+        .exchange(&[0xa4])?;
     let short_wait = RfTimeout::new(Duration::from_millis(500))?;
     reader
         .poll_type_a(short_wait)?
         .ok_or("expected NFC-A card")?
-        .exchange_apdu(&[0xa4])?;
+        .into_raw()
+        .exchange(&[0xa4])?;
     reader.rf_off()?;
     reader
         .poll_type_a(short_wait)?
         .ok_or("expected NFC-A card")?
-        .exchange_apdu(&[0xa4])?;
+        .into_raw()
+        .exchange(&[0xa4])?;
     reader.initialize()?;
     reader
-        .poll_type_a(RfTimeout::new(Duration::from_millis(500))?)?
+        .poll_type_a(short_wait)?
         .ok_or("expected NFC-A card")?
-        .exchange_apdu(&[0xa4])?;
+        .into_raw()
+        .exchange(&[0xa4])?;
     assert_eq!(journal.borrow().remaining, 0);
     Ok(())
 }

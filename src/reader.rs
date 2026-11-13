@@ -347,6 +347,33 @@ impl ResponseTimeout {
     }
 }
 
+/// Card response bound of one `40` exchange and how the reader enforces it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetWait {
+    /// The reader transceives the data once within the `32/02` step.
+    Step(ResponseTimeout),
+    /// The reader runs ISO-DEP itself: block retransmission and WTX follow
+    /// the card's FWT, and `32/02` does not shorten or extend them.
+    IsoDep(Duration),
+}
+impl TargetWait {
+    /// Bound of an exchange with an ISO-DEP target whose frame waiting time
+    /// is `fwt`. The reader gave up on a silent ISO-DEP NFC-B target after
+    /// about 4.4 FWT, so four FWT cover retransmission and two maximal FWT
+    /// (FWI 14) leave room for WTX.
+    fn iso_dep(fwt: Duration) -> Self {
+        Self::IsoDep(fwt * 4 + isodep::frame_wait(14) * 2)
+    }
+
+    /// Host deadline: the card bound plus the margin of every reader command.
+    fn host_wait(self) -> Duration {
+        match self {
+            Self::Step(timeout) => timeout.host_wait(),
+            Self::IsoDep(bound) => bound + Duration::from_secs(1),
+        }
+    }
+}
+
 /// Firmware parameters written by command `12`. Bits 3 and 4 are fixed to
 /// one; bit 4 makes firmware send RATS while activating an ISO-DEP NFC-A
 /// card, so `4B` reports its ATS. Reset changes only the operating mode and
@@ -680,9 +707,13 @@ impl<T: Transport> Reader<T> {
     fn prepare_exchange_timing(
         &mut self,
         protocol: RfProtocol,
-        timeout: ResponseTimeout,
+        wait: TargetWait,
     ) -> Result<(), Error<T::Error>> {
-        let desired_timer = ReaderTimer::for_rf_timeout(RfTimeout::new(timeout.wait())?);
+        let (step, rf_wait) = match wait {
+            TargetWait::Step(timeout) => (Some(timeout), timeout.wait()),
+            TargetWait::IsoDep(bound) => (None, bound),
+        };
+        let desired_timer = ReaderTimer::for_rf_timeout(RfTimeout::new(rf_wait)?);
         let (info, applied_timer, applied_timeout, selection) = match &self.state {
             State::Ready {
                 rf:
@@ -691,11 +722,11 @@ impl<T: Transport> Reader<T> {
                         timer,
                         ..
                     },
-                response_timeout: Some(applied),
+                response_timeout,
                 ..
             } if *applied_protocol == protocol
-                && *applied == timeout
-                && *timer == desired_timer =>
+                && *timer == desired_timer
+                && step.is_none_or(|timeout| *response_timeout == Some(timeout)) =>
             {
                 return Ok(());
             }
@@ -714,7 +745,9 @@ impl<T: Transport> Reader<T> {
         // Do not publish a partial pair. Even if 32/02 succeeds, failure of 1C
         // requires explicit initialization before another card command is sent.
         self.state = State::NeedsInitialization;
-        if applied_timeout != Some(timeout) {
+        if let Some(timeout) = step
+            && applied_timeout != Some(timeout)
+        {
             self.command(0x32, &timeout.args(), Duration::from_secs(1))?;
         }
         if applied_timer != desired_timer {
@@ -727,7 +760,7 @@ impl<T: Transport> Reader<T> {
                 timer: desired_timer,
                 selection,
             },
-            response_timeout: Some(timeout),
+            response_timeout: step.or(applied_timeout),
         };
         Ok(())
     }
@@ -922,12 +955,12 @@ impl<T: Transport> Reader<T> {
         &mut self,
         target: u8,
         data: &[u8],
-        timeout: ResponseTimeout,
+        wait: TargetWait,
     ) -> Result<TargetResponse, Error<T::Error>> {
         let mut args = Vec::with_capacity(data.len() + 1);
         args.push(target);
         args.extend_from_slice(data);
-        let response = self.command(0x40, &args, timeout.host_wait())?;
+        let response = self.command(0x40, &args, wait.host_wait())?;
         let status = response
             .first()
             .copied()
@@ -939,7 +972,7 @@ impl<T: Transport> Reader<T> {
     fn prepare_target_exchange(
         &mut self,
         protocol: RfProtocol,
-        timeout: ResponseTimeout,
+        wait: TargetWait,
     ) -> Result<(), TargetExchangeError<T::Error>> {
         if !matches!(
             self.state,
@@ -950,7 +983,7 @@ impl<T: Transport> Reader<T> {
         ) {
             return Err(TargetExchangeError::SessionInvalid);
         }
-        self.prepare_exchange_timing(protocol, timeout)
+        self.prepare_exchange_timing(protocol, wait)
             .map_err(TargetExchangeError::Preparation)
     }
 
@@ -962,8 +995,9 @@ impl<T: Transport> Reader<T> {
         data: &[u8],
         timeout: ResponseTimeout,
     ) -> Result<TargetResponse, TargetExchangeError<T::Error>> {
-        self.prepare_target_exchange(protocol, timeout)?;
-        let response = self.exchange_target(target, data, timeout);
+        let wait = TargetWait::Step(timeout);
+        self.prepare_target_exchange(protocol, wait)?;
+        let response = self.exchange_target(target, data, wait);
         // These commands cannot collect a pending fragment. A missing status
         // also leaves the continuation state unknown.
         if match &response {
@@ -1129,11 +1163,13 @@ impl<'a, T: Transport> TypeACard<'a, T> {
     pub fn maximum_apdu_bytes(&self) -> usize {
         MAX_TYPE_A_COMMAND_BYTES
     }
-    /// Replace the card response wait of later exchanges through this
-    /// selection, including [`Self::into_raw`]. It starts as the polling
-    /// timeout, so a caller polling with a short wait can grant card commands
-    /// a longer one. The `32/02` step rounding and `1C` timer of `40` exchanges
-    /// apply unchanged.
+    /// Replace the card response wait of later card commands that the reader
+    /// transceives directly, including those of [`Self::into_raw`]. It starts
+    /// as the polling timeout, so a caller polling with a short wait can grant
+    /// card commands a longer one. The `32/02` step rounding and `1C` timer of
+    /// `40` exchanges apply unchanged. [`Self::exchange_apdu`] does not use it:
+    /// the reader runs ISO-DEP for those exchanges, and their bound follows
+    /// the ATS frame waiting time.
     pub fn set_exchange_timeout(&mut self, timeout: RfTimeout) {
         self.timeout = timeout;
     }
@@ -1162,7 +1198,9 @@ impl<'a, T: Transport> TypeACard<'a, T> {
     /// Exchange one ISO-DEP APDU and collect reader-reported continuation
     /// fragments. Requires completed activation with ATS. The APDU is sent
     /// once. Failure after submission returns any accumulated response and
-    /// invalidates the selection before another command can be sent.
+    /// invalidates the selection before another command can be sent. Each
+    /// fragment may take four ATS frame waiting times plus about 9.9 s for
+    /// WTX before the host abandons it as a deadline.
     pub fn exchange_apdu(
         &mut self,
         apdu: &[u8],
@@ -1171,20 +1209,18 @@ impl<'a, T: Transport> TypeACard<'a, T> {
         let mut progress = isodep::Progress::default();
         let mut output = Vec::new();
         let result = (|| {
-            if !self.observation.supports_iso_dep() || self.observation.ats().is_none() {
-                return Err(isodep::Cause::ActivationRequired);
-            }
+            let ats = match self.observation.ats() {
+                Some(ats) if self.observation.supports_iso_dep() => ats,
+                _ => return Err(isodep::Cause::ActivationRequired),
+            };
             if apdu.is_empty() || apdu.len() > MAX_TYPE_A_COMMAND_BYTES {
                 return Err(isodep::Cause::InputLength {
                     actual: apdu.len(),
                     maximum: MAX_TYPE_A_COMMAND_BYTES,
                 });
             }
-            let timeout = ResponseTimeout::for_request(self.timeout);
-            match self
-                .reader
-                .prepare_target_exchange(RfProtocol::TypeA, timeout)
-            {
+            let wait = TargetWait::iso_dep(ats.frame_wait());
+            match self.reader.prepare_target_exchange(RfProtocol::TypeA, wait) {
                 Ok(()) => {}
                 Err(TargetExchangeError::Preparation(error)) => {
                     return Err(isodep::Cause::Preparation(error));
@@ -1193,7 +1229,7 @@ impl<'a, T: Transport> TypeACard<'a, T> {
             }
             progress.attempted_application_bytes = apdu.len();
             progress.frames = 1;
-            let mut response = match self.reader.exchange_target(self.target, apdu, timeout) {
+            let mut response = match self.reader.exchange_target(self.target, apdu, wait) {
                 Ok(response) => {
                     progress.acknowledged_application_bytes = apdu.len();
                     response
@@ -1218,7 +1254,7 @@ impl<'a, T: Transport> TypeACard<'a, T> {
                 progress.frames += 1;
                 response = self
                     .reader
-                    .exchange_target(self.target, &[], timeout)
+                    .exchange_target(self.target, &[], wait)
                     .map_err(isodep::Cause::Transport)?;
             }
         })();
@@ -1272,7 +1308,7 @@ impl<T: Transport> RawTypeACard<'_, T> {
             } => {}
             _ => self
                 .reader
-                .prepare_target_exchange(RfProtocol::TypeA, self.timeout)?,
+                .prepare_target_exchange(RfProtocol::TypeA, TargetWait::Step(self.timeout))?,
         }
         // Record loss of typed selection before the first raw transfer. This
         // survives release of the handle and errors that leave the link usable.
@@ -1312,7 +1348,9 @@ impl<T: Transport> RawTypeACard<'_, T> {
         data: &[u8],
         frames: usize,
     ) -> Result<TargetResponse, TargetExchangeError<T::Error>> {
-        let result = self.reader.exchange_target(self.target, data, self.timeout);
+        let result = self
+            .reader
+            .exchange_target(self.target, data, TargetWait::Step(self.timeout));
         match &result {
             Ok(response) => {
                 let next = if response.status & TARGET_MORE_INFORMATION != 0 {
@@ -1367,7 +1405,8 @@ impl<T: Transport> TypeBCard<'_, T> {
         // One fixed 3280 ms selector and its 1C timer cover every block of the
         // APDU. A0 keeps its independent FWI/WTX wait; individual blocks do
         // not reprogram 1C.
-        let setup = reader.prepare_exchange_timing(protocol, ResponseTimeout::Ms3280);
+        let setup =
+            reader.prepare_exchange_timing(protocol, TargetWait::Step(ResponseTimeout::Ms3280));
         exchange.exchange(
             setup,
             |error| matches!(error, Error::RfStatus(status) if status & 0x3f == 1),
@@ -1386,7 +1425,8 @@ impl<T: Transport> TypeBCard<'_, T> {
         let reader = &mut self.target.reader;
         let protocol = RfProtocol::TypeB(self.target.profile);
         let check = self.session.admit_presence_check()?;
-        let setup = reader.prepare_exchange_timing(protocol, ResponseTimeout::Ms3280);
+        let setup =
+            reader.prepare_exchange_timing(protocol, TargetWait::Step(ResponseTimeout::Ms3280));
         check.run(
             setup,
             |error| matches!(error, Error::RfStatus(status) if status & 0x3f == 1),
