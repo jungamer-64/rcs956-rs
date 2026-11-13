@@ -1501,6 +1501,20 @@ impl<'a, T: Transport> FelicaCard<'a, T> {
         felica::write_response(&response, idm).map_err(Error::FelicaResponse)
     }
 
+    /// Confirm that the selected card still answers at its IDm, using Request
+    /// Response. Returns the card's current mode byte; the command changes no
+    /// card state. An absent card surfaces as the RF timeout
+    /// [`Error::RfStatus`], a different card as [`Error::FelicaResponse`].
+    pub fn request_response(&mut self) -> Result<u8, Error<T::Error>> {
+        match self.exchange_command(0x04, &[], 0x05)?.as_slice() {
+            [mode] => Ok(*mode),
+            payload => Err(Error::FelicaResponse(CardError::Length {
+                expected: 11,
+                actual: payload.len() + 10,
+            })),
+        }
+    }
+
     /// Request the system codes exposed by this card. Card products can omit this command.
     pub fn request_system_codes(&mut self) -> Result<Vec<u16>, Error<T::Error>> {
         let idm = self.observation.idm;

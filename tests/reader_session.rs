@@ -776,6 +776,56 @@ fn felica_write_length_errors_distinguish_request_rejection_from_sent_command()
 }
 
 #[test]
+fn felica_request_response_reports_mode_and_distinguishes_absence() -> Result<(), Box<dyn Error>> {
+    let mut steps = initialization(&config_image());
+    steps.extend(mode_configuration());
+    let mut args = vec![0xc8, 0, 10, 0x04];
+    args.extend(IDENTITY);
+    let answer = |mode: &[u8]| {
+        let mut reply = vec![0, u8::try_from(10 + mode.len()).unwrap_or(0), 0x05];
+        reply.extend(IDENTITY);
+        reply.extend_from_slice(mode);
+        reply
+    };
+    let mut other = answer(&[0]);
+    other[3] = 9;
+    steps.extend([
+        idle_receiver(),
+        command(0x4a, &[1, 2, 0, 0x12, 0x34, 1, 0], &poll_response()),
+        command(0xa0, &args, &answer(&[2])),
+        command(0xa0, &args, &answer(&[])),
+        command(0xa0, &args, &other),
+        command(0xa0, &args, &[1]),
+    ]);
+    let (transport, journal) = Script::new(steps);
+    let mut reader = Reader::new(transport);
+    reader.initialize()?;
+    let mut card = reader
+        .poll_felica(BitRate::Kbps424, poll_request()?, timeout()?)?
+        .ok_or("expected FeliCa card")?;
+    assert_eq!(card.request_response()?, 2);
+    assert!(matches!(
+        card.request_response(),
+        Err(ReaderError::FelicaResponse(CardError::Length {
+            expected: 11,
+            actual: 10
+        }))
+    ));
+    assert!(matches!(
+        card.request_response(),
+        Err(ReaderError::FelicaResponse(
+            CardError::IdentityMismatch { .. }
+        ))
+    ));
+    assert!(matches!(
+        card.request_response(),
+        Err(ReaderError::RfStatus(1))
+    ));
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
 fn raw_felica_exchanges_opaque_packets_after_selection() -> Result<(), Box<dyn Error>> {
     let mut steps = initialization(&config_image());
     steps.extend(mode_configuration());
