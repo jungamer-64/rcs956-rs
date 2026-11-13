@@ -419,6 +419,10 @@ enum RawTypeAResponse {
 enum RfSelection {
     Ordinary,
     Type2Sector(NonZeroU8),
+    /// Firmware activated a target that this crate rejected without granting
+    /// a handle. Such a card can ignore the next request, so the next
+    /// selection cycles the RF field first.
+    RejectedActivation,
     #[cfg(any(feature = "felica-lite-s", feature = "felica-standard-aes"))]
     FelicaAuthentication,
 }
@@ -734,7 +738,13 @@ impl<T: Transport> Reader<T> {
         match response.as_slice() {
             [0] => Ok(None),
             [1, target, packet @ ..] if *target != 0 => {
-                let observation = PollResponse::parse(packet).map_err(Error::FelicaResponse)?;
+                let observation = match PollResponse::parse(packet) {
+                    Ok(observation) => observation,
+                    Err(error) => {
+                        self.record_rejected_activation();
+                        return Err(Error::FelicaResponse(error));
+                    }
+                };
                 Ok(Some(FelicaCard {
                     reader: self,
                     observation,
@@ -743,7 +753,10 @@ impl<T: Transport> Reader<T> {
                     rate,
                 }))
             }
-            _ => Err(Error::Response("poll target count/layout")),
+            _ => {
+                self.record_rejected_activation();
+                Err(Error::Response("poll target count/layout"))
+            }
         }
     }
 
@@ -759,7 +772,13 @@ impl<T: Transport> Reader<T> {
         match response.as_slice() {
             [0] => Ok(None),
             [1, target, data @ ..] if *target != 0 => {
-                let observation = nfca::Observation::parse(data).map_err(Error::TypeA)?;
+                let observation = match nfca::Observation::parse(data) {
+                    Ok(observation) => observation,
+                    Err(error) => {
+                        self.record_rejected_activation();
+                        return Err(Error::TypeA(error));
+                    }
+                };
                 Ok(Some(TypeACard {
                     reader: self,
                     observation,
@@ -767,7 +786,10 @@ impl<T: Transport> Reader<T> {
                     timeout,
                 }))
             }
-            _ => Err(Error::Response("NFC-A target count/layout")),
+            _ => {
+                self.record_rejected_activation();
+                Err(Error::Response("NFC-A target count/layout"))
+            }
         }
     }
 
@@ -785,30 +807,12 @@ impl<T: Transport> Reader<T> {
         match response.as_slice() {
             [0] => Ok(None),
             [1, target, data @ ..] if *target != 0 => {
-                let observation = nfcb::Observation::parse(data).map_err(Error::TypeB)?;
-                if options.node_address.is_some()
-                    && !(observation.supports_iso_dep() && observation.nad_supported())
-                {
-                    return Err(Error::IsoDepParameters(
-                        isodep::ParameterError::NadUnsupported,
-                    ));
-                }
-                let session = if observation.supports_iso_dep() {
-                    let cid = match observation.cid() {
-                        0 => None,
-                        cid => Some(cid),
-                    };
-                    let session = isodep::Session::new(
-                        observation.frame_size(),
-                        cid,
-                        isodep::block_frame_wait(observation.fwi()),
-                        observation.maximum_command_bytes(),
-                        options.node_address,
-                    )
-                    .map_err(Error::IsoDepParameters)?;
-                    Some(session)
-                } else {
-                    None
+                let (observation, session) = match type_b_activation(data, options) {
+                    Ok(activation) => activation,
+                    Err(error) => {
+                        self.record_rejected_activation();
+                        return Err(error);
+                    }
                 };
                 self.apply_type_b_receiver()?;
                 let target = TypeBTarget {
@@ -822,7 +826,22 @@ impl<T: Transport> Reader<T> {
                     None => TypeBSelection::Frame(TypeBFrameCard { target, timeout }),
                 }))
             }
-            _ => Err(Error::Response("NFC-B target count/layout")),
+            _ => {
+                self.record_rejected_activation();
+                Err(Error::Response("NFC-B target count/layout"))
+            }
+        }
+    }
+
+    /// Record that firmware activated a target which this crate rejected.
+    /// The next selection cycles the RF field before its request.
+    fn record_rejected_activation(&mut self) {
+        if let State::Ready {
+            rf: RfMode::Configured { selection, .. },
+            ..
+        } = &mut self.state
+        {
+            *selection = RfSelection::RejectedActivation;
         }
     }
 
@@ -1430,6 +1449,37 @@ impl<T: Transport> TypeBFrameCard<'_, T> {
             .reader
             .exchange_single_response(protocol, self.target.number, data, timeout)
     }
+}
+
+/// Validate NFC-B activation data and the ISO-DEP session it grants.
+fn type_b_activation<E>(
+    data: &[u8],
+    options: nfcb::PollOptions,
+) -> Result<(nfcb::Observation, Option<isodep::Session>), Error<E>> {
+    let observation = nfcb::Observation::parse(data).map_err(Error::TypeB)?;
+    if options.node_address.is_some()
+        && !(observation.supports_iso_dep() && observation.nad_supported())
+    {
+        return Err(Error::IsoDepParameters(
+            isodep::ParameterError::NadUnsupported,
+        ));
+    }
+    if !observation.supports_iso_dep() {
+        return Ok((observation, None));
+    }
+    let cid = match observation.cid() {
+        0 => None,
+        cid => Some(cid),
+    };
+    let session = isodep::Session::new(
+        observation.frame_size(),
+        cid,
+        isodep::block_frame_wait(observation.fwi()),
+        observation.maximum_command_bytes(),
+        options.node_address,
+    )
+    .map_err(Error::IsoDepParameters)?;
+    Ok((observation, Some(session)))
 }
 
 /// Reject an empty or oversized card command before any reader setup.

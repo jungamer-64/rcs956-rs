@@ -1660,6 +1660,52 @@ fn protocol_changes_reapply_rf_settings_and_absence_is_not_activation() -> Resul
 }
 
 #[test]
+fn rejected_activation_cycles_the_field_before_the_next_selection() -> Result<(), Box<dyn Error>> {
+    let mut steps = initialization(&ab_config_image());
+    steps.extend(ab_mode(false));
+    steps.push(idle_receiver());
+    // The ATS declares TB but ends before it.
+    steps.push(command(
+        0x4a,
+        &[1, 0],
+        &[1, 1, 0, 4, 0x20, 4, 1, 2, 3, 4, 2, 0x25],
+    ));
+    steps.push(command(0x32, &[1, 0], &[]));
+    steps.extend(ab_mode(true));
+    steps.push(idle_receiver());
+    // The card does not advertise the requested node address.
+    steps.push(command(0x4a, &[1, 3, 0, 1], &type_b_response()));
+    steps.push(command(0x32, &[1, 0], &[]));
+    steps.extend(ab_mode(true));
+    steps.push(idle_receiver());
+    steps.push(command(0x4a, &[1, 3, 0, 1], &[0]));
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    assert!(matches!(
+        reader.poll_type_a(timeout()?),
+        Err(ReaderError::TypeA(_))
+    ));
+    let addressed = PollOptions {
+        node_address: Some(isodep::NodeAddress::from_byte(0x12)?),
+        ..PollOptions::default()
+    };
+    assert!(matches!(
+        reader.poll_type_b(addressed, timeout()?),
+        Err(ReaderError::IsoDepParameters(
+            isodep::ParameterError::NadUnsupported
+        ))
+    ));
+    assert!(
+        reader
+            .poll_type_b(PollOptions::default(), timeout()?)?
+            .is_none()
+    );
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
 fn type_b_activation_register_failure_revokes_readiness() -> Result<(), Box<dyn Error>> {
     let mut steps = initialization(&ab_config_image());
     steps.extend(ab_mode(true));

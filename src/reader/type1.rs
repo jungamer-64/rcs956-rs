@@ -35,11 +35,21 @@ impl<T: Transport> Reader<T> {
         let target = match selection.as_slice() {
             [0] => return Ok(None),
             [1, target, _, _, _, _, _, _] if *target != 0 => *target,
-            _ => return Err(response_error("Type 1 selection layout")),
+            _ => {
+                self.record_rejected_activation();
+                return Err(response_error("Type 1 selection layout"));
+            }
         };
         let timeout = ResponseTimeout::for_request(timeout);
-        let identity = type1_exchange(self, target, timeout, &[0x78, 0, 0, 0, 0, 0, 0])?;
+        let identity = match type1_exchange(self, target, timeout, &[0x78, 0, 0, 0, 0, 0, 0]) {
+            Ok(identity) => identity,
+            Err(error) => {
+                self.record_rejected_activation();
+                return Err(error);
+            }
+        };
         let [hr0, hr1, a, b, c, d] = identity.as_slice() else {
+            self.record_rejected_activation();
             return Err(response_error("Type 1 RID layout"));
         };
         Ok(Some(Type1Tag {
