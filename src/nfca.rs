@@ -2,6 +2,7 @@
 //!
 //! Parsing begins after the reader's target number. UID bytes remain in wire
 //! order, and ATS retains its own inclusive length byte without RF CRC bytes.
+use crate::isodep::FrameSize;
 use alloc::vec::Vec;
 use core::{fmt, time::Duration};
 
@@ -28,8 +29,6 @@ pub enum Error {
     },
     /// The format byte contains an unsupported format bit.
     AtsFormat(u8),
-    /// FSCI lies outside the supported standard-frame range `0..=8`.
-    FrameSizeIndex(u8),
     /// FWI contains the reserved value 15.
     FrameWaitIndex(u8),
     /// SFGI contains the reserved value 15.
@@ -48,7 +47,6 @@ impl fmt::Display for Error {
                 write!(f, "ATS declares {declared} bytes, got {actual}")
             }
             Self::AtsFormat(format) => write!(f, "unsupported ATS format byte {format:02X}"),
-            Self::FrameSizeIndex(index) => write!(f, "unsupported FSCI {index}"),
             Self::FrameWaitIndex(index) => write!(f, "reserved FWI {index}"),
             Self::GuardTimeIndex(index) => write!(f, "reserved SFGI {index}"),
         }
@@ -63,17 +61,16 @@ impl core::error::Error for Error {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ats {
     bytes: Vec<u8>,
-    frame_size: u16,
     fwi: u8,
     sfgi: u8,
     tc: Option<u8>,
     historical_start: usize,
 }
 impl Ats {
-    /// Validate TL, optional TA/TB/TC bytes, and standard-frame timing indices.
+    /// Validate TL, optional TA/TB/TC bytes, and timing indices.
     ///
     /// RC-S956 selection accepts at most 62 ATS bytes. RF CRC bytes are absent.
-    /// FWI/SFGI value 15 and FSCI above 8 are rejected rather than reinterpreted.
+    /// FWI/SFGI value 15 is rejected rather than reinterpreted.
     pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let declared = bytes.first().copied().map_or(0, usize::from);
         if bytes.is_empty() || bytes.len() > 62 || declared != bytes.len() {
@@ -86,8 +83,6 @@ impl Ats {
         if format & 0x80 != 0 {
             return Err(Error::AtsFormat(format));
         }
-        let fsci = format & 0x0f;
-        let frame_size = crate::isodep::frame_size(fsci).ok_or(Error::FrameSizeIndex(fsci))?;
         let mut cursor = bytes.len().min(2);
         let mut interfaces = [None; 3];
         for (index, mask) in [0x10, 0x20, 0x40].into_iter().enumerate() {
@@ -112,7 +107,6 @@ impl Ats {
         }
         Ok(Self {
             bytes: bytes.to_vec(),
-            frame_size,
             fwi,
             sfgi,
             tc: interfaces[2],
@@ -124,9 +118,9 @@ impl Ats {
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
-    /// Maximum standard frame size the card advertises, including protocol overhead.
+    /// Maximum frame size the card advertises, including protocol overhead.
     pub fn frame_size(&self) -> u16 {
-        self.frame_size
+        FrameSize::from_index(self.fsci()).bytes()
     }
     /// Standard frame-size code; 2 is the default when T0 is absent.
     pub fn fsci(&self) -> u8 {
@@ -261,6 +255,9 @@ mod tests {
         assert_eq!(ats.fwi(), 4);
         assert!(!ats.cid_supported());
         assert_eq!(Ats::parse(&[3, 0x25, 0x80])?.fwi(), 8);
+        // FSCI above 8 advertises a larger card buffer; D-F read as C.
+        assert_eq!(Ats::parse(&[2, 0x09])?.frame_size(), 512);
+        assert_eq!(Ats::parse(&[2, 0x0f])?.frame_size(), 4096);
         Ok(())
     }
 
@@ -281,10 +278,6 @@ mod tests {
         assert!(matches!(
             Ats::parse(&[3, 0x05]),
             Err(Error::AtsLength { .. })
-        ));
-        assert!(matches!(
-            Ats::parse(&[2, 0x09]),
-            Err(Error::FrameSizeIndex(9))
         ));
         assert!(matches!(
             Ats::parse(&[3, 0x25, 0xf0]),

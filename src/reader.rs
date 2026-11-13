@@ -1483,7 +1483,7 @@ fn type_b_activation<E>(
         cid => Some(cid),
     };
     let session = isodep::Session::new(
-        observation.frame_size(),
+        observation.card_frame_size(),
         cid,
         isodep::block_frame_wait(observation.fwi()),
         observation.maximum_command_bytes(),

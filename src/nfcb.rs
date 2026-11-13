@@ -2,6 +2,7 @@
 //!
 //! Parsing begins after the target number and requires the 12-byte ATQB without
 //! CRC, followed by the ATTRIB response length and complete ATTRIB response.
+use crate::isodep::FrameSize;
 use alloc::vec::Vec;
 use core::{fmt, time::Duration};
 
@@ -47,8 +48,6 @@ pub enum Error {
     AtqbResponseCode(u8),
     /// A selected card did not return the mandatory MBLI/CID response byte.
     MissingAttrib,
-    /// FSCI lies outside the supported standard-frame range `0..=8`.
-    FrameSizeIndex(u8),
     /// FWI contains the reserved value 15.
     FrameWaitIndex(u8),
     /// ATTRIB assigns reserved CID 15.
@@ -67,7 +66,6 @@ impl fmt::Display for Error {
             }
             Self::AtqbResponseCode(code) => write!(f, "ATQB response code {code:02X}, expected 50"),
             Self::MissingAttrib => f.write_str("card returned no ATTRIB response"),
-            Self::FrameSizeIndex(index) => write!(f, "unsupported FSCI {index}"),
             Self::FrameWaitIndex(index) => write!(f, "reserved FWI {index}"),
             Self::ReservedCid => f.write_str("ATTRIB assigned reserved CID 15"),
             Self::UnsupportedCid(cid) => {
@@ -86,14 +84,13 @@ impl core::error::Error for Error {}
 pub struct Observation {
     atqb: [u8; 12],
     attrib: Vec<u8>,
-    frame_size: u16,
 }
 impl Observation {
     /// Parse ATQB, the reader's length byte, and its exact ATTRIB response tail.
     ///
     /// CRC bytes are absent. A completed ATTRIB needs its MBLI/CID byte; a
-    /// nonzero CID additionally requires advertised CID support. FWI15 and
-    /// FSCI above8 are outside this standard-frame profile and are rejected.
+    /// nonzero CID additionally requires advertised CID support. FWI 15 is
+    /// reserved and rejected.
     pub fn parse(data: &[u8]) -> Result<Self, Error> {
         if data.len() < 13 {
             return Err(Error::Truncated {
@@ -114,8 +111,6 @@ impl Observation {
         if declared == 0 {
             return Err(Error::MissingAttrib);
         }
-        let fsci = data[10] >> 4;
-        let frame_size = crate::isodep::frame_size(fsci).ok_or(Error::FrameSizeIndex(fsci))?;
         let fwi = data[11] >> 4;
         if fwi == 15 {
             return Err(Error::FrameWaitIndex(fwi));
@@ -132,7 +127,6 @@ impl Observation {
         Ok(Self {
             atqb,
             attrib: data[13..].to_vec(),
-            frame_size,
         })
     }
     /// Original 12-byte ATQB without CRC.
@@ -164,7 +158,10 @@ impl Observation {
     }
     /// Maximum card frame size including protocol overhead and CRC.
     pub fn frame_size(&self) -> u16 {
-        self.frame_size
+        self.card_frame_size().bytes()
+    }
+    pub(crate) fn card_frame_size(&self) -> FrameSize {
+        FrameSize::from_index(self.fsci())
     }
     /// Standard maximum-card-frame-size code from ATQB.
     pub fn fsci(&self) -> u8 {
@@ -199,7 +196,7 @@ impl Observation {
     pub fn maximum_command_bytes(&self) -> Option<usize> {
         match self.mbli() {
             0 => None,
-            mbli => Some(usize::from(self.frame_size) << (mbli - 1)),
+            mbli => Some(usize::from(self.frame_size()) << (mbli - 1)),
         }
     }
 }
@@ -237,6 +234,22 @@ mod tests {
         assert!(!observation.supports_iso_dep());
         assert!(!observation.cid_supported());
         assert_eq!(observation.cid(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn large_and_rfu_frame_size_indices_scale_the_card_buffer() -> Result<(), Error> {
+        let mut data = CARD;
+        data[13] = 0x21;
+        for (fsci, frame_size) in [(9, 512), (0x0c, 4096), (0x0f, 4096)] {
+            data[10] = fsci << 4 | 1;
+            let observation = Observation::parse(&data)?;
+            assert_eq!(observation.frame_size(), frame_size);
+            assert_eq!(
+                observation.maximum_command_bytes(),
+                Some(usize::from(frame_size) * 2)
+            );
+        }
         Ok(())
     }
 
@@ -280,12 +293,6 @@ mod tests {
         assert!(matches!(
             Observation::parse(&bad),
             Err(Error::FrameWaitIndex(15))
-        ));
-        bad = CARD;
-        bad[10] = 0x91;
-        assert!(matches!(
-            Observation::parse(&bad),
-            Err(Error::FrameSizeIndex(9))
         ));
         bad = CARD;
         bad[13] = 0x1f;
