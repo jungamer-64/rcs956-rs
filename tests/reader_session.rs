@@ -2881,6 +2881,45 @@ fn type_two_ndef_write_preserves_reserved_bytes_and_publishes_length_last()
 }
 
 #[test]
+fn type_two_capacity_ends_at_the_data_area_including_reserved_bytes() -> Result<(), Box<dyn Error>>
+{
+    let mut steps = initialization(&ab_config_image());
+    steps.extend(ab_mode(false));
+    steps.extend([
+        idle_receiver(),
+        command(0x4a, &[1, 0], &[1, 7, 4, 0, 0, 7, 1, 2, 3, 4, 5, 6, 7]),
+        command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
+        // A 48-byte data area spans bytes 16..64 and reserves byte 26.
+        command(
+            0x40,
+            &[7, 0x30, 0],
+            &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xe1, 0x10, 6, 0],
+        ),
+        command(
+            0x40,
+            &[7, 0x30, 4],
+            &[
+                0, 2, 3, 0x62, 1, 2, 3, 4, 0x11, 0x22, 0x33, 0xff, 0x44, 0xfe, 0, 0, 0,
+            ],
+        ),
+    ]);
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    reader.initialize()?;
+    let mut card = reader.poll_type_a(timeout()?)?.ok_or("Type 2 tag absent")?;
+    // Bytes 23..64 hold 41 addresses, one of them reserved.
+    assert!(matches!(
+        card.write_type2_ndef(&[0; 41]),
+        Err(ndef::WriteError::Preparation(ndef::Error::Capacity {
+            requested: 41,
+            available: 40,
+        }))
+    ));
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
 fn type_two_ndef_write_stops_on_nak_without_publishing() -> Result<(), Box<dyn Error>> {
     let mut steps = initialization(&ab_config_image());
     steps.extend(ab_mode(false));

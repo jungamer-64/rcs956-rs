@@ -54,8 +54,11 @@ struct Type2Data<'card, 'reader, T: Transport> {
     card: &'card mut TypeACard<'reader, T>,
     cached_start: usize,
     cache: [u8; 16],
+    /// Next address to map; excluded ranges are skipped when it is consumed.
     address: usize,
-    remaining: usize,
+    /// End of the CC-declared data area. Lock and reserved bytes inside it
+    /// occupy addresses without holding TLV data.
+    end: usize,
     excluded: Vec<Range<usize>>,
     writable: bool,
 }
@@ -110,14 +113,14 @@ impl<'card, 'reader, T: Transport> Type2Data<'card, 'reader, T> {
             cached_start: 0,
             cache: header,
             address: 16,
-            remaining: usize::from(size) * 8,
+            end: 16 + usize::from(size) * 8,
             excluded: Vec::new(),
             writable: access & 0x0f == 0,
         })
     }
 
     fn find_message(&mut self) -> Result<bool, Type2Error<T::Error>> {
-        while self.remaining != 0 {
+        while self.remaining() != 0 {
             let tag = self.byte()?;
             match tag {
                 0 => continue,
@@ -165,16 +168,13 @@ impl<'card, 'reader, T: Transport> Type2Data<'card, 'reader, T> {
             }
             length => usize::from(length),
         };
-        if length > self.remaining {
+        if length > self.remaining() {
             return Err(Error::Layout("Type 2 TLV exceeds data area"));
         }
         Ok(length)
     }
 
     fn next_address(&mut self) -> Result<usize, Type2Error<T::Error>> {
-        if self.remaining == 0 {
-            return Err(Error::Layout("Type 2 data area exhausted"));
-        }
         while let Some(range) = self
             .excluded
             .iter()
@@ -182,11 +182,30 @@ impl<'card, 'reader, T: Transport> Type2Data<'card, 'reader, T> {
         {
             self.address = range.end;
         }
+        if self.address >= self.end {
+            return Err(Error::Layout("Type 2 data area exhausted"));
+        }
         let address = self.address;
         Type2Page::containing(address)?;
-        self.remaining -= 1;
         self.address += 1;
         Ok(address)
+    }
+
+    /// TLV bytes left before the data area ends, excluding lock and reserved
+    /// bytes. Accepted control ranges do not overlap one another.
+    fn remaining(&self) -> usize {
+        let start = self.address.min(self.end);
+        let excluded: usize = self
+            .excluded
+            .iter()
+            .map(|range| {
+                range
+                    .end
+                    .min(self.end)
+                    .saturating_sub(range.start.max(start))
+            })
+            .sum();
+        self.end - start - excluded
     }
 
     fn window(&mut self, address: usize) -> Result<&[u8; 16], Type2Error<T::Error>> {
@@ -210,9 +229,9 @@ impl<'card, 'reader, T: Transport> Type2Data<'card, 'reader, T> {
         if !self.find_message()? {
             return Err(Error::MissingMessageTlv);
         }
-        let position = (self.address, self.remaining);
+        let position = self.address;
         self.tlv_length()?;
-        (self.address, self.remaining) = position;
+        self.address = position;
 
         let address = self.next_address()?;
         let length_page = Type2Page::containing(address)?;
@@ -220,10 +239,8 @@ impl<'card, 'reader, T: Transport> Type2Data<'card, 'reader, T> {
         let mut unpublished = self.page(length_page)?;
         unpublished[length_index] = 0;
 
-        let available = self
-            .remaining
-            .saturating_sub(2)
-            .max(self.remaining.min(254));
+        let remaining = self.remaining();
+        let available = remaining.saturating_sub(2).max(remaining.min(254));
         if message.len() > available {
             return Err(Error::Capacity {
                 requested: message.len(),
@@ -249,7 +266,7 @@ impl<'card, 'reader, T: Transport> Type2Data<'card, 'reader, T> {
         for &byte in message {
             self.patch_byte(&mut data, byte, 1)?;
         }
-        if self.remaining != 0 {
+        if self.remaining() != 0 {
             self.patch_byte(&mut data, 0xfe, 0)?;
         }
         // The length page can also hold payload or the rest of the extended
