@@ -839,6 +839,9 @@ fn raw_felica_exchanges_opaque_packets_after_selection() -> Result<(), Box<dyn E
         command(0xa0, &[0xc8, 0, 4, 0xe0, 0x32, 0xc1], &raw_response),
         command(0xa0, &[0xc8, 0, 4, 0xe0, 0x32, 0xc1], &[0, 5, 1]),
     ]);
+    // Raw packets can leave card state that Polling does not clear.
+    steps.push(command(0x32, &[1, 0], &[]));
+    steps.extend(mode_configuration());
     steps.push(idle_receiver());
     steps.push(command(0x4a, &[1, 1, 0, 0x12, 0x34, 1, 0], &[0]));
     let (transport, journal) = Script::new(steps);

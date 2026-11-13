@@ -141,7 +141,7 @@ impl<'a, T: Transport> FelicaCard<'a, T> {
             return Err(Error::UnsupportedCard(identity.pmm[1]));
         }
         let keys = SessionKeys::derive(card_key, challenge);
-        self.begin_felica_authentication();
+        self.begin_authentication();
         write(
             &mut self,
             Stage::Challenge,

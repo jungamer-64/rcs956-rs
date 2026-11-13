@@ -421,12 +421,12 @@ enum RawTypeAResponse {
 enum RfSelection {
     Ordinary,
     Type2Sector(NonZeroU8),
-    /// Firmware activated a target that this crate rejected without granting
-    /// a handle. Such a card can ignore the next request, so the next
-    /// selection cycles the RF field first.
-    RejectedActivation,
-    #[cfg(any(feature = "felica-lite-s", feature = "felica-standard-aes"))]
-    FelicaAuthentication,
+    /// The card can hold state that the next selection request does not
+    /// clear, so that selection cycles the RF field first. Firmware may have
+    /// activated a target that this crate rejected without granting a handle,
+    /// which can then ignore the next request; or raw packets or
+    /// authentication changed the card outside the typed operations.
+    FieldCycleRequired,
 }
 
 #[derive(Debug)]
@@ -752,7 +752,7 @@ impl<T: Transport> Reader<T> {
                 let observation = match PollResponse::parse(packet) {
                     Ok(observation) => observation,
                     Err(error) => {
-                        self.record_rejected_activation();
+                        self.require_field_cycle();
                         return Err(Error::FelicaResponse(error));
                     }
                 };
@@ -765,7 +765,7 @@ impl<T: Transport> Reader<T> {
                 }))
             }
             _ => {
-                self.record_rejected_activation();
+                self.require_field_cycle();
                 Err(Error::Response("poll target count/layout"))
             }
         }
@@ -786,7 +786,7 @@ impl<T: Transport> Reader<T> {
                 let observation = match nfca::Observation::parse(data) {
                     Ok(observation) => observation,
                     Err(error) => {
-                        self.record_rejected_activation();
+                        self.require_field_cycle();
                         return Err(Error::TypeA(error));
                     }
                 };
@@ -798,7 +798,7 @@ impl<T: Transport> Reader<T> {
                 }))
             }
             _ => {
-                self.record_rejected_activation();
+                self.require_field_cycle();
                 Err(Error::Response("NFC-A target count/layout"))
             }
         }
@@ -821,7 +821,7 @@ impl<T: Transport> Reader<T> {
                 let (observation, session) = match type_b_activation(data, options) {
                     Ok(activation) => activation,
                     Err(error) => {
-                        self.record_rejected_activation();
+                        self.require_field_cycle();
                         return Err(error);
                     }
                 };
@@ -838,21 +838,20 @@ impl<T: Transport> Reader<T> {
                 }))
             }
             _ => {
-                self.record_rejected_activation();
+                self.require_field_cycle();
                 Err(Error::Response("NFC-B target count/layout"))
             }
         }
     }
 
-    /// Record that firmware activated a target which this crate rejected.
-    /// The next selection cycles the RF field before its request.
-    fn record_rejected_activation(&mut self) {
+    /// Make the next selection cycle the RF field before its request.
+    fn require_field_cycle(&mut self) {
         if let State::Ready {
             rf: RfMode::Configured { selection, .. },
             ..
         } = &mut self.state
         {
-            *selection = RfSelection::RejectedActivation;
+            *selection = RfSelection::FieldCycleRequired;
         }
     }
 
@@ -1514,15 +1513,10 @@ pub struct FelicaCard<'a, T: Transport> {
     rate: BitRate,
 }
 impl<'a, T: Transport> FelicaCard<'a, T> {
+    /// Authentication changes card state that a new Polling does not clear.
     #[cfg(any(feature = "felica-lite-s", feature = "felica-standard-aes"))]
-    pub(crate) fn begin_felica_authentication(&mut self) {
-        if let State::Ready {
-            rf: RfMode::Configured { selection, .. },
-            ..
-        } = &mut self.reader.state
-        {
-            *selection = RfSelection::FelicaAuthentication;
-        }
+    pub(crate) fn begin_authentication(&mut self) {
+        self.reader.require_field_cycle();
     }
 
     /// Polling information. IDm is a session address, not a universal persistent ID.
@@ -1600,10 +1594,11 @@ impl<'a, T: Transport> FelicaCard<'a, T> {
         felica::service_entry(&response, idm).map_err(Error::FelicaResponse)
     }
 
-    /// Send a caller-supplied FeliCa command with the selected IDm. `parameters`
+    /// Send a crate-owned FeliCa command with the selected IDm. `parameters`
     /// starts after IDm. Returns the payload after checking the length, response
-    /// code and IDm. The caller owns command semantics and any cryptography.
-    pub fn exchange_command(
+    /// code and IDm. A command that changes card state outside the typed
+    /// operations must first require a field cycle, as authentication does.
+    pub(crate) fn exchange_command(
         &mut self,
         command: u8,
         parameters: &[u8],
@@ -1625,8 +1620,10 @@ impl<'a, T: Transport> FelicaCard<'a, T> {
 
     /// Consume the selected card's typed command authority to send opaque
     /// packets at its negotiated FeliCa rate. Packets can affect addressing
-    /// or card state, so the original identity is no longer an authority.
+    /// or card state, so the original identity is no longer an authority,
+    /// and the next selection cycles the RF field first.
     pub fn into_raw(self) -> RawFelicaCard<'a, T> {
+        self.reader.require_field_cycle();
         RawFelicaCard {
             reader: self.reader,
             timeout: self.timeout,

@@ -36,7 +36,7 @@ impl<T: Transport> Reader<T> {
             [0] => return Ok(None),
             [1, target, _, _, _, _, _, _] if *target != 0 => *target,
             _ => {
-                self.record_rejected_activation();
+                self.require_field_cycle();
                 return Err(response_error("Type 1 selection layout"));
             }
         };
@@ -44,12 +44,12 @@ impl<T: Transport> Reader<T> {
         let identity = match type1_exchange(self, target, timeout, &[0x78, 0, 0, 0, 0, 0, 0]) {
             Ok(identity) => identity,
             Err(error) => {
-                self.record_rejected_activation();
+                self.require_field_cycle();
                 return Err(error);
             }
         };
         let [hr0, hr1, a, b, c, d] = identity.as_slice() else {
-            self.record_rejected_activation();
+            self.require_field_cycle();
             return Err(response_error("Type 1 RID layout"));
         };
         Ok(Some(Type1Tag {

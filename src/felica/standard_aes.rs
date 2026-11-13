@@ -193,7 +193,7 @@ impl<'a, T: Transport> FelicaCard<'a, T> {
             parameters.extend(node.code.to_le_bytes());
         }
         parameters.extend(proof);
-        self.begin_felica_authentication();
+        self.begin_authentication();
         let first = self
             .exchange_command(0x40, &parameters, 0x41)
             .map_err(|cause| Error::Exchange {
