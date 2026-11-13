@@ -469,7 +469,9 @@ impl<T: Transport> Reader<T> {
     /// RF-off readiness. Failure leaves the reader uninitialized; no command replay.
     /// Reset restores neither firmware parameters nor the `63 0D` reception
     /// setting, so this rewrites the defaults that NFC-A activation and every
-    /// 106 kbps role rely on after a target role that changed them.
+    /// 106 kbps role rely on after a target role that changed them. It also
+    /// sets the firmware's RF retry count (`32 04`) to zero, so that a mute or
+    /// failed exchange never resends card data behind the caller.
     pub fn initialize(&mut self) -> Result<ReaderInfo, Error<T::Error>> {
         self.state = State::NeedsInitialization;
         self.link.recover().map_err(Error::Recovery)?;
@@ -506,6 +508,9 @@ impl<T: Transport> Reader<T> {
             .copied()
             .ok_or(Error::Response("reader flags length"))?;
         self.set_parameters(Parameters::DEFAULT)?;
+        if !self.command(0x32, &[4, 0], wait)?.is_empty() {
+            return Err(Error::Response("RF retry response length"));
+        }
         self.write_register(0x630a, 0x40)?;
         self.write_register(0x630d, 0)?;
         self.disable_rf()?;

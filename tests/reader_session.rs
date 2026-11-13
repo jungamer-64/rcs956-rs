@@ -245,6 +245,7 @@ fn initialization(config: &[u8; 256]) -> Vec<Step> {
     steps.extend([
         command(0x0c, &[], &[0x1c]),
         command(0x12, &[0x1c], &[]),
+        command(0x32, &[4, 0], &[]),
         command(8, &[0x63, 0x0a, 0x40], &[0]),
         command(8, &[0x63, 0x0d, 0], &[0]),
         command(0x32, &[1, 0], &[]),
@@ -966,6 +967,29 @@ fn invalid_configuration_checksum_is_not_published() -> Result<(), Box<dyn Error
         Err(ReaderError::Configuration(ConfigurationError::Checksum {
             offset: 0x40
         }))
+    ));
+    assert!(matches!(
+        reader.poll_felica(BitRate::Kbps212, poll_request()?, timeout()?),
+        Err(ReaderError::NotInitialized)
+    ));
+    assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn rejected_rf_retry_setting_is_not_published() -> Result<(), Box<dyn Error>> {
+    let mut steps = initialization(&config_image());
+    let retry = steps
+        .iter()
+        .position(|s| s.request == Request::Command(0x32, vec![4, 0]))
+        .ok_or("missing RF retry setting")?;
+    steps.truncate(retry + 1);
+    steps[retry].answer = Answer::Data(vec![0]);
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    assert!(matches!(
+        reader.initialize(),
+        Err(ReaderError::Response("RF retry response length"))
     ));
     assert!(matches!(
         reader.poll_felica(BitRate::Kbps212, poll_request()?, timeout()?),
