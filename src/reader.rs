@@ -40,7 +40,9 @@ const TARGET_MORE_INFORMATION: u8 = 0x40;
 /// Failures of reader initialization, RF configuration, or card exchange.
 #[derive(Debug)]
 pub enum Error<E> {
-    /// Host transport transaction failed; the stream must be reinitialized.
+    /// Host transport transaction failed. Unless its progress is
+    /// [`Progress::NotSent`] and the stream was usable, the reader must be
+    /// reinitialized.
     Transaction(TransactionError<E>),
     /// Recovery failed, preserving the phase of its out-of-band ACK transfer.
     Recovery(TransactionError<E>),
@@ -1363,9 +1365,9 @@ impl<T: Transport> TypeBCard<'_, T> {
         let reader = &mut self.target.reader;
         let protocol = RfProtocol::TypeB(self.target.profile);
         let exchange = self.session.prepare(apdu)?;
-        // The APDU guard requests at least 9896 ms, saturating 32/02 to its
-        // 3280 ms step. A0 keeps its independent FWI/WTX wait; individual
-        // blocks do not reprogram 1C.
+        // One fixed 3280 ms selector and its 1C timer cover every block of the
+        // APDU. A0 keeps its independent FWI/WTX wait; individual blocks do
+        // not reprogram 1C.
         let setup = reader.prepare_exchange_timing(protocol, ResponseTimeout::Ms3280);
         exchange.exchange(
             setup,
