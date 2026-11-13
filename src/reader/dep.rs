@@ -286,7 +286,8 @@ impl<T: Transport> Reader<T> {
         self.write_register(0x6301, 0x7b)?;
         self.write_register(0x6302, 0xb0)?;
         self.write_register(0x6303, 0xb0)?;
-        // Target reception setting; activation at 106 kbps clears it again.
+        // Target reception setting; activation at 106 kbps clears it again,
+        // and initialization restores it for every later role.
         self.write_register(0x630d, 0x08)?;
 
         let [a, b, c, d, e, f] = identity;

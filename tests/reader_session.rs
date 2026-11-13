@@ -246,6 +246,7 @@ fn initialization(config: &[u8; 256]) -> Vec<Step> {
         command(0x0c, &[], &[0x1c]),
         command(0x12, &[0x1c], &[]),
         command(8, &[0x63, 0x0a, 0x40], &[0]),
+        command(8, &[0x63, 0x0d, 0], &[0]),
         command(0x32, &[1, 0], &[]),
     ]);
     steps
@@ -2471,6 +2472,76 @@ fn passive_dep_at_106_kbps_prepares_target_registers_and_restores_parameters()
         .collect();
     assert_eq!(parameters, [[0x1c], [0x18], [0x1c]]);
     assert_eq!(journal.borrow().remaining, 0);
+    Ok(())
+}
+
+#[test]
+fn initialization_restores_reception_setting_left_by_a_212_kbps_target()
+-> Result<(), Box<dyn Error>> {
+    let configuration = ab_config_image();
+    let mut steps = initialization(&configuration);
+    steps.extend([
+        command(8, &[0x63, 0x0b, 0x80], &[0]),
+        command(0x32, &[0x82, 8, 2, 8], &[]),
+        command(0x12, &[0x18], &[]),
+        command(8, &[0x63, 1, 0x7b], &[0]),
+        command(8, &[0x63, 2, 0xb0], &[0]),
+        command(8, &[0x63, 3, 0xb0], &[0]),
+        command(8, &[0x63, 0x0d, 8], &[0]),
+        command(
+            0x8c,
+            &[
+                2, 1, 1, 0x31, 0x32, 0x33, 0x40, 1, 0xfe, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0xff,
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1, 0xfe, 0x31, 0x32, 0x33,
+                0x34, 0x35, 0x36, 0, 0,
+            ],
+            &[0x10, 17, 0xd4, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 0, 0, 0, 0],
+        ),
+        command(0x92, &[], &[0]),
+    ]);
+    // Finishing the 212 kbps target, then the initiator's own initialization.
+    steps.extend(initialization(&configuration));
+    steps.extend(initialization(&configuration));
+    steps.extend([
+        command(0x12, &[0x1c], &[]),
+        command(0x32, &[2, 0x0b, 0x0b, 0x0b], &[]),
+        command(0x32, &[5, 0, 0, 0], &[]),
+        command(
+            0x56,
+            &[0, 0, 0],
+            &[0, 1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 0, 0, 0, 8, 0],
+        ),
+    ]);
+    let (script, journal) = Script::new(steps);
+    let mut reader = Reader::new(script);
+    let target = reader.listen_passive_dep(*b"123456", &[], timeout()?)?;
+    assert_eq!(target.initiator().rate, DepRate::Kbps212);
+    target.finish()?;
+    reader.activate_dep(
+        DepActivation {
+            mode: DepMode::Passive,
+            rate: DepRate::Kbps106,
+            nfcid3: None,
+            general_bytes: &[],
+            node_address: None,
+        },
+        timeout()?,
+    )?;
+    let journal = journal.borrow();
+    let activation = journal
+        .requests
+        .iter()
+        .position(|request| matches!(request, Request::Command(0x56, _)))
+        .ok_or("NFC-DEP activation not sent")?;
+    let reception = journal.requests[..activation]
+        .iter()
+        .rev()
+        .find_map(|request| match request {
+            Request::Command(8, args) if args.starts_with(&[0x63, 0x0d]) => Some(args.clone()),
+            _ => None,
+        });
+    assert_eq!(reception, Some(vec![0x63, 0x0d, 0]));
+    assert_eq!(journal.remaining, 0);
     Ok(())
 }
 

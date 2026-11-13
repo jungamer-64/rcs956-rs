@@ -467,8 +467,9 @@ impl<T: Transport> Reader<T> {
 
     /// Recover the transport, reset the reader, read its configuration, and enter
     /// RF-off readiness. Failure leaves the reader uninitialized; no command replay.
-    /// Reset does not restore firmware parameters, so this rewrites the defaults
-    /// that NFC-A activation relies on after a role that changed them.
+    /// Reset restores neither firmware parameters nor the `63 0D` reception
+    /// setting, so this rewrites the defaults that NFC-A activation and every
+    /// 106 kbps role rely on after a target role that changed them.
     pub fn initialize(&mut self) -> Result<ReaderInfo, Error<T::Error>> {
         self.state = State::NeedsInitialization;
         self.link.recover().map_err(Error::Recovery)?;
@@ -506,6 +507,7 @@ impl<T: Transport> Reader<T> {
             .ok_or(Error::Response("reader flags length"))?;
         self.set_parameters(Parameters::DEFAULT)?;
         self.write_register(0x630a, 0x40)?;
+        self.write_register(0x630d, 0)?;
         self.disable_rf()?;
         let info = ReaderInfo {
             firmware,
