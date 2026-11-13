@@ -294,7 +294,8 @@ impl<T: Transport> Reader<T> {
         let mut parameters = [0; 35];
         parameters[..7].copy_from_slice(&[2, 1, 1, a, b, c, 0x40]);
         parameters[7..15].copy_from_slice(&nfcid2);
-        parameters[23..25].copy_from_slice(&[0xff, 0xff]);
+        // PAD and RFU of the 212/424 kbps parameters are all FF.
+        parameters[15..25].fill(0xff);
         parameters[25..33].copy_from_slice(&nfcid2);
         let response = self
             .command(0x8c, &parameters, timeout.host_wait())
